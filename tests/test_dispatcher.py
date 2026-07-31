@@ -109,3 +109,34 @@ def test_graphql_failure_never_becomes_empty_graph() -> None:
     with patch.object(MOD.subprocess, "run", return_value=failed):
         with pytest.raises(MOD.ControlPlaneUnavailable):
             MOD.gql_query("query { viewer { login } }")
+
+
+
+def test_shared_bot_merged_pr_routes_by_linked_issue_project() -> None:
+    merged_pr = {
+        "author": {"login": "everything-bot-engineer"},
+        "body": "Resolves #11",
+        "mergedAt": "2026-07-31T00:00:00Z",
+    }
+    session = MOD.resolve_pr_session(
+        merged_pr,
+        proj_map={11: 3},
+        projects=[{"number": 3, "owner": "engineer"}],
+        sm={"engineer": "eng", "strategist": "strategy"},
+        assignee_map={"everything-bot-engineer": "strategist"},
+    )
+    assert session == "eng"
+
+
+def test_linked_pr_lookup_failure_fails_closed() -> None:
+    failed = SimpleNamespace(returncode=1, stdout="", stderr="network down")
+    with patch.object(MOD.subprocess, "run", return_value=failed):
+        with pytest.raises(MOD.ControlPlaneUnavailable):
+            MOD.check_linked_pr(
+                "owner/repo",
+                7,
+                assignee_map={},
+                sm={},
+                proj_map={},
+                projects=[],
+            )
