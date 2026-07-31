@@ -1,36 +1,58 @@
 # Bot Dispatcher
 
-Generic Research OS dispatcher: GitHub Issue Graph + Project Status routing, config-driven, multi-repo.
+No-agent GitHub notification relay for PI-managed Codex sessions.
+
+## Boundary
+
+The dispatcher observes GitHub and delivers notifications. It does not decide
+roadmap, mutate Issue Graph or Project Status, merge PRs, close Issues, or
+authorize deployment. PI owns those decisions.
 
 ## Architecture
 
-- `dispatcher.py` — generic engine, `--repo <name>` selects config
-- `dispatcher.yaml` — per-repo config: projects, owner roles, session names
-- `*-dispatcher.sh` — thin wrappers per repo (cron no_agent, every 1m)
+- `dispatcher.py` — generic engine; `--repo <name>` selects configuration
+- `dispatcher.yaml` — Project-to-owner and owner-to-session mapping
+- `bj-dispatcher.sh` / `pt-dispatcher.sh` — repo-local cron entry points
+- `~/.local/state/bot-dispatcher/` — delivery/dedup state by default
 
-## Capabilities
+## Signals
 
-| Feature | How it works |
-|---------|-------------|
-| Project Status changes | Issue moves column -> notify owner session (Project -> Owner Role -> session) |
-| Issue Graph routing | blockedBy/blocking/parent/subIssues. Status change of X notifies graph stakeholders' owners |
-| `[TO: ...]` forwarding | Scans issue/PR comments for `[TO: Role]` -> forwards to matching session |
-| PR monitoring | New PR -> PI. Draft->Ready -> PI. Review change -> author. Merged -> author receipt |
-| Milestone tracking | Progress + overdue warnings to PI |
-| Per-tick dedup | One message per session per tick (queue then flush) |
+| Signal | Destination |
+|---|---|
+| Issue becomes Ready | Project owner session |
+| Issue or PR enters Review | PI or linked Issue owner, depending on review state |
+| Issue Graph stakeholder changes | Related Issue owners |
+| `[TO: Role]` comment | Mapped role session |
+| New PR / Draft→Ready | PI |
+| PR review change / merge | Linked Issue owner or author fallback |
+| Milestone risk | PI |
 
-## Setup for a new repo
+Multiple events for one session are combined into one digest per tick. Delivery
+state is committed only after all digests are accepted; a failed tick retains
+the prior state so events are retried.
 
-1. Add a section to `dispatcher.yaml` (projects with node IDs, owner roles, session_map)
-2. Create `<name>-dispatcher.sh` wrapper: `exec .../dispatcher.py --repo <name>`
-3. Register cron job: no_agent, every 1m, deliver local
-4. Ensure agent-deck sessions exist (PI, Engineer, Strategy, Data per repo)
+## Run
 
-## Owner resolution
+```bash
+python3 -m pip install -r requirements.txt
+./bj-dispatcher.sh
+./pt-dispatcher.sh
+```
 
-Issue -> Project membership -> Project's `owner` role -> `session_map[role]` -> session.
+Configuration defaults to the repository's `dispatcher.yaml`. Override with
+`BOT_DISPATCHER_CONFIG`. State defaults to
+`~/.local/state/bot-dispatcher`; override with
+`BOT_DISPATCHER_STATE_DIR`.
 
-## Notes
+## Tests
 
-- Issue Graph is the control-plane source of truth (see AGENTS.md in algotradinglife/beijing-lot)
-- PI owns graph edges and routing decisions; dispatcher is execution-only
+```bash
+python3 -m pip install -r requirements-dev.txt
+pytest -q
+```
+
+## Governance
+
+GitHub Issue Graph is the dependency source of truth. Project membership
+determines functional ownership. When Graph or Project reads fail, lifecycle
+routing fails closed. See `AGENTS.md`.
