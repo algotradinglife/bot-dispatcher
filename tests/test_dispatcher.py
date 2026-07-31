@@ -3,8 +3,9 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
 from unittest.mock import patch
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,7 +63,7 @@ def test_conflicting_project_membership_fails_closed() -> None:
         {"number": 7, "project_num": 2, "is_pr": False},
     ]
     with patch.object(MOD, "get_project_items", return_value=items):
-        with unittest.TestCase().assertRaises(MOD.ControlPlaneUnavailable):
+        with pytest.raises(MOD.ControlPlaneUnavailable):
             MOD.build_issue_proj_map({})
 
 
@@ -106,5 +107,5 @@ def test_delivery_failure_is_reported_for_retry() -> None:
 def test_graphql_failure_never_becomes_empty_graph() -> None:
     failed = SimpleNamespace(returncode=1, stdout="", stderr="network down")
     with patch.object(MOD.subprocess, "run", return_value=failed):
-        with unittest.TestCase().assertRaises(MOD.ControlPlaneUnavailable):
+        with pytest.raises(MOD.ControlPlaneUnavailable):
             MOD.gql_query("query { viewer { login } }")
