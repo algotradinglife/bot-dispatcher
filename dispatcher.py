@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generic Research OS Dispatcher — no_agent, read-only.
-Reads repo config from ~/.hermes/config/dispatcher.yaml.
+Reads repo-local dispatcher.yaml unless BOT_DISPATCHER_CONFIG is set.
 Usage: dispatcher.py --repo <repo_name>
 
 Routes based on GitHub Issue Graph (blockedBy/blocking/parent/subIssues)
@@ -350,30 +350,6 @@ def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
     return None
 
 
-def check_linked_pr(repo, issue_num, assignee_map, sm):
-    r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "open",
-                        "--json", "number,title,author,reviewDecision,body",
-                        "--jq", "."],
-                       capture_output=True, text=True, timeout=10)
-    if r.returncode != 0:
-        return None
-    try:
-        for pr in json.loads(r.stdout):
-            if re.search(r"(?i)(?:close[sd]?|fix(?:es)?|resolve[sd]?)\s*#%d\b" % issue_num, pr.get("body", "")):
-                if pr.get("reviewDecision") == "CHANGES_REQUESTED":
-                    s = resolve_assignee_session(pr["author"]["login"], assignee_map, sm)
-                    if s:
-                        pu = "https://github.com/%s/pull/%d" % (repo, pr["number"])
-                        msg = format_goal(
-                            title="PR #%d needs changes — Issue #%d auto-blocked" % (pr["number"], issue_num),
-                            body="PR #%d (%s) has CHANGES_REQUESTED by PI. Please address the findings." % (pr["number"], pr["title"]),
-                            url=pu)
-                        return (s, msg, pr["number"])
-    except Exception:
-        pass
-    return None
-
-
 def flush_goals(output):
     """Send one digest per session while retaining every queued event."""
     pending = output.pop("_pending", {})
@@ -445,8 +421,10 @@ def main():
                                      "--json", "title", "--jq", ".title"],
                                     capture_output=True, text=True, timeout=10)
             if ir.returncode != 0:
-                new_state[sk] = cur_s
-                continue
+                raise ControlPlaneUnavailable(
+                    "Unable to read title for %s #%d" %
+                    ("PR" if item.get("is_pr") else "Issue", issue_num)
+                )
             title = ir.stdout.strip()
             url = ("https://github.com/%s/pull/%d" if item.get("is_pr") else "https://github.com/%s/issues/%d") % (repo, issue_num)
             owner = resolve_owner(pn, projects, sm)
@@ -537,8 +515,6 @@ def main():
             notify_graph_stakeholders(repo, issue_num, title, cur_s, url, proj_map, projects, sm, output, prefix)
 
             new_state[sk] = cur_s
-            if cur_s in ("Ready", "In Progress"):
-                new_state["bjproject:%d:%d:since" % (pn, issue_num)] = time.time()
 
     except Exception as e:
         output["_pending"] = {}
