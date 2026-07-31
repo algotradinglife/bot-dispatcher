@@ -24,10 +24,18 @@ except ImportError:
     print("ERROR: PyYAML required. pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-BASE = Path.home() / ".hermes"
-CONFIG_FILE = BASE / "config" / "dispatcher.yaml"
-STATE_DIR = Path(os.environ.get("HERMES_CRON_OUTPUT", BASE / "cron" / "output"))
-STALE_TIMEOUT = 3600
+REPO_ROOT = Path(__file__).resolve().parent
+CONFIG_FILE = Path(os.environ.get("BOT_DISPATCHER_CONFIG", REPO_ROOT / "dispatcher.yaml"))
+STATE_DIR = Path(os.environ.get(
+    "BOT_DISPATCHER_STATE_DIR",
+    Path.home() / ".local" / "state" / "bot-dispatcher",
+))
+GRAPH_PAGE_SIZE = 100
+
+
+class ControlPlaneUnavailable(RuntimeError):
+    """Raised when GitHub cannot provide authoritative routing state."""
+
 
 
 def load_config(repo_name):
@@ -97,19 +105,11 @@ def format_goal(title, body, url):
     return "%s\n\n%s\n\n---\n%s" % (title, body, url)
 
 
-def post_github_feedback(repo, num, session_name, target, author, success, error=None):
-    if success:
-        body = "🤖 **Dispatched** to `%s` for `%s` from @%s.\n\nSession has received the goal." % (session_name, target, author)
-    else:
-        body = "⚠️ **Dispatch failed** to `%s` for `%s` from @%s.\n\nError: `%s`\n\nManual re-dispatch may be needed." % (session_name, target, author, error or "")
-    tmp = Path("/tmp/dispatcher_feedback_%d.md" % num)
-    tmp.write_text(body)
-    subprocess.run(["gh", "issue", "comment", str(num), "--repo", repo, "--body-file", str(tmp)],
-                   capture_output=True, text=True, timeout=15)
-    try:
-        tmp.unlink()
-    except Exception:
-        pass
+def queue_goal(output, session, message):
+    """Retain every event; one session digest is emitted per tick."""
+    if not session:
+        return
+    output.setdefault("_pending", {}).setdefault(session, []).append(message)
 
 
 def load_state(state_file):
@@ -130,27 +130,59 @@ def gql_query(query):
     r = subprocess.run(["gh", "api", "graphql", "-f", "query=%s" % query],
                        capture_output=True, text=True, timeout=20)
     if r.returncode != 0:
-        return None
+        raise ControlPlaneUnavailable("GitHub GraphQL failed: %s" % r.stderr.strip()[:160])
     try:
-        return json.loads(r.stdout)
-    except Exception:
-        return None
+        payload = json.loads(r.stdout)
+    except Exception as exc:
+        raise ControlPlaneUnavailable("GitHub GraphQL returned invalid JSON") from exc
+    if payload.get("errors"):
+        raise ControlPlaneUnavailable("GitHub GraphQL errors: %s" % str(payload["errors"])[:160])
+    return payload
+
+
+def _issue_relation(repo, issue_num, relation):
+    owner, name = repo.split("/", 1)
+    numbers = set()
+    cursor = None
+    while True:
+        after = "null" if cursor is None else json.dumps(cursor)
+        query = (
+            'query { repository(owner:%s, name:%s) { issue(number:%d) { '
+            '%s(first:%d, after:%s) { nodes { number } '
+            'pageInfo { hasNextPage endCursor } } } } }'
+        ) % (json.dumps(owner), json.dumps(name), issue_num, relation,
+             GRAPH_PAGE_SIZE, after)
+        data = gql_query(query)
+        issue = data.get("data", {}).get("repository", {}).get("issue")
+        if issue is None:
+            raise ControlPlaneUnavailable("Issue #%d unavailable from GitHub Graph" % issue_num)
+        connection = issue.get(relation)
+        if not isinstance(connection, dict):
+            raise ControlPlaneUnavailable("Issue #%d relation %s unavailable" % (issue_num, relation))
+        numbers.update(node["number"] for node in connection.get("nodes", []) if node)
+        page = connection.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            return numbers
+        cursor = page.get("endCursor")
+        if not cursor:
+            raise ControlPlaneUnavailable("Issue Graph pagination cursor missing")
 
 
 def get_issue_graph(repo, issue_num):
-    q = ('query { repository(owner:"%s", name:"%s") { issue(number: %d) { number parent { number } '
-         'blockedBy(first: 20) { nodes { number } } blocking(first: 20) { nodes { number } } '
-         'subIssues(first: 20) { nodes { number } } } } }') % (
-        repo.split("/")[0], repo.split("/")[1], issue_num)
-    data = gql_query(q)
-    iss = data and data.get("data", {}).get("repository", {}).get("issue")
-    if not iss:
-        return {"parent": None, "blocked_by": set(), "blocking": set(), "sub_issues": set()}
+    owner, name = repo.split("/", 1)
+    query = (
+        'query { repository(owner:%s, name:%s) { issue(number:%d) '
+        '{ number parent { number } } } }'
+    ) % (json.dumps(owner), json.dumps(name), issue_num)
+    data = gql_query(query)
+    issue = data.get("data", {}).get("repository", {}).get("issue")
+    if issue is None:
+        raise ControlPlaneUnavailable("Issue #%d unavailable from GitHub Graph" % issue_num)
     return {
-        "parent": iss.get("parent", {}).get("number") if iss.get("parent") else None,
-        "blocked_by": {n["number"] for n in (iss.get("blockedBy", {}) or {}).get("nodes", []) if n},
-        "blocking": {n["number"] for n in (iss.get("blocking", {}) or {}).get("nodes", []) if n},
-        "sub_issues": {n["number"] for n in (iss.get("subIssues", {}) or {}).get("nodes", []) if n},
+        "parent": issue.get("parent", {}).get("number") if issue.get("parent") else None,
+        "blocked_by": _issue_relation(repo, issue_num, "blockedBy"),
+        "blocking": _issue_relation(repo, issue_num, "blocking"),
+        "sub_issues": _issue_relation(repo, issue_num, "subIssues"),
     }
 
 
@@ -158,7 +190,15 @@ def build_issue_proj_map(cfg):
     items = get_project_items(cfg)
     mm = {}
     for item in items:
-        mm[item["number"]] = item["project_num"]
+        if item.get("is_pr"):
+            continue
+        number = item["number"]
+        project_num = item["project_num"]
+        if number in mm and mm[number] != project_num:
+            raise ControlPlaneUnavailable(
+                "Issue #%d has conflicting configured Project memberships" % number
+            )
+        mm[number] = project_num
     return mm, items
 
 
@@ -202,42 +242,112 @@ def notify_graph_stakeholders(repo, issue_num, title, cur_s, url, proj_map, proj
         msg = format_goal("Issue #%d → %s — affects #%d (%s)" % (issue_num, cur_s, other_num, rel_str),
                           "Status change of #%d (%s) to **%s** affects this issue (%s).\n\nPlease review accordingly."
                           % (issue_num, title, cur_s, rel_str), other_url)
-        if session not in output.setdefault("_pending", {}):
-            output["_pending"][session] = msg
+        queue_goal(output, session, msg)
 
 
 def get_project_items(cfg):
-    """Fetch items from all configured projects. Includes both Issues and PRs."""
-    projects = cfg.get("projects", [])
+    """Fetch all items from configured Projects with cursor pagination."""
     result = []
-    for proj in projects:
+    for proj in cfg.get("projects", []):
         pn = proj["number"]
         pid = proj["node"]
-        data = gql_query(
-            '{node(id:"' + pid + '"){... on ProjectV2{items(first:50){nodes{id content{__typename ... on Issue{number title} '
-            '... on PullRequest{number title}} fieldValues(first:20){nodes{__typename ... on ProjectV2ItemFieldSingleSelectValue{name '
-            'field{... on ProjectV2SingleSelectField{name}}}}}}}}}}')
-        if not data:
-            continue
-        for node in (data.get("data", {}).get("node", {}).get("items", []) or {}).get("nodes", []):
-            c = node.get("content")
-            if not c:
-                continue
-            issue_num = c.get("number")
-            if not issue_num:
-                continue
-            is_pr = c.get("__typename") == "PullRequest"
-            status = "Inbox"
-            for fv in node.get("fieldValues", {}).get("nodes", []):
-                if not isinstance(fv, dict) or fv.get("__typename") != "ProjectV2ItemFieldSingleSelectValue":
+        cursor = None
+        while True:
+            after = "null" if cursor is None else json.dumps(cursor)
+            query = (
+                '{node(id:%s){... on ProjectV2{items(first:%d,after:%s){'
+                'nodes{id content{__typename ... on Issue{number title} '
+                '... on PullRequest{number title}} fieldValues(first:20){nodes{'
+                '__typename ... on ProjectV2ItemFieldSingleSelectValue{name '
+                'field{... on ProjectV2SingleSelectField{name}}}}}} '
+                'pageInfo{hasNextPage endCursor}}}}}'
+            ) % (json.dumps(pid), GRAPH_PAGE_SIZE, after)
+            data = gql_query(query)
+            project = data.get("data", {}).get("node")
+            if not isinstance(project, dict):
+                raise ControlPlaneUnavailable("Project #%d unavailable" % pn)
+            connection = project.get("items")
+            if not isinstance(connection, dict):
+                raise ControlPlaneUnavailable("Project #%d items unavailable" % pn)
+            for node in connection.get("nodes", []):
+                content = node.get("content")
+                if not content or not content.get("number"):
                     continue
-                if fv.get("field") and isinstance(fv["field"], dict) and fv["field"].get("name") == "Status":
-                    status = fv.get("name", "Inbox")
-                    break
-            result.append({"number": issue_num, "status": status, "project_num": pn,
-                           "project_name": proj.get("name", str(pn)), "_item_id": node["id"],
-                           "is_pr": is_pr})
+                status = "Inbox"
+                for value in node.get("fieldValues", {}).get("nodes", []):
+                    if not isinstance(value, dict):
+                        continue
+                    field = value.get("field")
+                    if (value.get("__typename") == "ProjectV2ItemFieldSingleSelectValue"
+                            and isinstance(field, dict) and field.get("name") == "Status"):
+                        status = value.get("name", "Inbox")
+                        break
+                result.append({
+                    "number": content["number"],
+                    "status": status,
+                    "project_num": pn,
+                    "project_name": proj.get("name", str(pn)),
+                    "_item_id": node["id"],
+                    "is_pr": content.get("__typename") == "PullRequest",
+                })
+            page = connection.get("pageInfo") or {}
+            if not page.get("hasNextPage"):
+                break
+            cursor = page.get("endCursor")
+            if not cursor:
+                raise ControlPlaneUnavailable("Project #%d pagination cursor missing" % pn)
     return result
+
+
+def linked_issue_numbers(body):
+    return {
+        int(value)
+        for value in re.findall(
+            r"(?i)(?:close[sd]?|fix(?:es)?|resolve[sd]?)\s+#(\d+)",
+            body or "",
+        )
+    }
+
+
+def resolve_pr_session(pr, proj_map, projects, sm, assignee_map):
+    """Prefer linked Issue Project ownership over ambiguous shared bot authorship."""
+    linked = linked_issue_numbers(pr.get("body", ""))
+    sessions = {
+        find_owner_for_issue(number, proj_map, projects, sm)
+        for number in linked
+    }
+    sessions.discard(None)
+    if len(sessions) == 1:
+        return next(iter(sessions))
+    if linked:
+        return None
+    author = pr.get("author", {})
+    login = author.get("login", "") if isinstance(author, dict) else str(author)
+    return resolve_assignee_session(login, assignee_map, sm)
+
+
+def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
+    r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "open",
+                        "--json", "number,title,author,reviewDecision,body",
+                        "--jq", "."],
+                       capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        raise ControlPlaneUnavailable("Unable to list linked PRs")
+    for pr in json.loads(r.stdout):
+        if issue_num not in linked_issue_numbers(pr.get("body", "")):
+            continue
+        if pr.get("reviewDecision") == "CHANGES_REQUESTED":
+            session = resolve_pr_session(pr, proj_map, projects, sm, assignee_map)
+            if session:
+                url = "https://github.com/%s/pull/%d" % (repo, pr["number"])
+                message = format_goal(
+                    title="PR #%d needs changes — Issue #%d" % (pr["number"], issue_num),
+                    body="PR #%d (%s) has CHANGES_REQUESTED by PI. Please address the findings."
+                         % (pr["number"], pr["title"]),
+                    url=url,
+                )
+                return session, message, pr["number"]
+    return None
 
 
 def check_linked_pr(repo, issue_num, assignee_map, sm):
@@ -264,15 +374,30 @@ def check_linked_pr(repo, issue_num, assignee_map, sm):
     return None
 
 
-def flush_goals(output, prefix, prev_state, new_state):
-    """Send one message per session. Only the first queued per session is dispatched."""
+def flush_goals(output):
+    """Send one digest per session while retaining every queued event."""
     pending = output.pop("_pending", {})
-    for session, msg in pending.items():
-        r = subprocess.run(["agent-deck", "session", "send", session, "--no-wait", msg],
-                           capture_output=True, text=True, timeout=30)
-        result = "ok" if r.returncode == 0 else "FAILED: %s" % r.stderr.strip()[:80]
-        output["actions"].append({"node": "goal:%s" % session, "state": "sent", "session": session,
-                                  "reason": "goal", "sent": msg[:80], "result": result})
+    all_success = True
+    for session, messages in pending.items():
+        if isinstance(messages, str):
+            messages = [messages]
+        digest = "\n\n==============================\n\n".join(messages)
+        result = subprocess.run(
+            ["agent-deck", "session", "send", session, "--no-wait", digest],
+            capture_output=True, text=True, timeout=30,
+        )
+        success = result.returncode == 0
+        all_success = all_success and success
+        outcome = "ok" if success else "FAILED: %s" % result.stderr.strip()[:160]
+        output["actions"].append({
+            "node": "goal:%s" % session,
+            "state": "sent" if success else "pending_retry",
+            "session": session,
+            "reason": "goal_digest",
+            "event_count": len(messages),
+            "result": outcome,
+        })
+    return all_success
 
 
 def main():
@@ -338,8 +463,7 @@ def main():
                         msg = format_goal("PR #%d is in REVIEW — %s" % (issue_num, title),
                                           "Project: %s\nPlease review and merge." % item.get("project_name", str(pn)), url)
                         reason = "pr_review_ready"
-                        if session not in output["_pending"]:
-                            output["_pending"][session] = msg
+                        queue_goal(output, session, msg)
                         output["actions"].append({"node": sk, "state": cur_s, "session": session, "reason": reason,
                                                   "prev_status": prev_s, "sent": msg[:80], "result": "queued"})
                 new_state[sk] = cur_s
@@ -354,7 +478,7 @@ def main():
                     reason = "issue_ready"
 
             elif cur_s == "Blocked":
-                lp = check_linked_pr(repo, issue_num, assignee_map, sm)
+                lp = check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects)
                 if lp:
                     session, msg, _ = lp
                     reason = "pr_changes_needed"
@@ -378,7 +502,7 @@ def main():
                         if linked_pr:
                             pu = "https://github.com/%s/pull/%d" % (repo, linked_pr["number"])
                             if linked_pr.get("reviewDecision") == "CHANGES_REQUESTED":
-                                s = resolve_assignee_session(linked_pr["author"]["login"], assignee_map, sm)
+                                s = resolve_pr_session(linked_pr, proj_map, projects, sm, assignee_map)
                                 if s:
                                     session = s
                                     msg = format_goal("PR #%d needs changes — Issue #%d in Review" % (linked_pr["number"], issue_num),
@@ -405,11 +529,9 @@ def main():
                     reason = "issue_done"
 
             if session and msg:
-                if session not in output["_pending"]:
-                    output["_pending"][session] = msg
+                queue_goal(output, session, msg)
                 output["actions"].append({"node": sk, "state": cur_s, "session": session, "reason": reason,
                                           "prev_status": prev_s, "sent": msg[:80], "result": "queued"})
-                post_github_feedback(repo, issue_num, session, cur_s, "project", True)
 
             # Notify graph stakeholders
             notify_graph_stakeholders(repo, issue_num, title, cur_s, url, proj_map, projects, sm, output, prefix)
@@ -418,25 +540,10 @@ def main():
             if cur_s in ("Ready", "In Progress"):
                 new_state["bjproject:%d:%d:since" % (pn, issue_num)] = time.time()
 
-        # 1b. Stale card detection (warnings only)
-        now = time.time()
-        for key in list(prev_state):
-            if not key.startswith("bjproject:") or not key.endswith(":since"):
-                continue
-            parts = key.split(":")
-            pn = int(parts[1])
-            inum = int(parts[2])
-            sk = "bjproject:%d:%d:status" % (pn, inum)
-            cur_s = new_state.get(sk, prev_state.get(sk, "Inbox"))
-            if cur_s not in ("Ready", "In Progress"):
-                continue
-            since = prev_state.get(key, 0)
-            if since and (now - since) > STALE_TIMEOUT:
-                new_state[sk] = "Blocked"
-                output["warnings"].append("%s Issue #%d stale in %s >1h — auto-Blocked" % (prefix, inum, cur_s))
-
     except Exception as e:
-        output["warnings"].append("%s project scan: %s" % (prefix, str(e)[:80]))
+        output["_pending"] = {}
+        new_state = dict(prev_state)
+        output["warnings"].append("%s control plane unavailable: %s" % (prefix, str(e)[:160]))
 
     # ── 2. Issue comments [TO: ...] fallback ──
     try:
@@ -473,15 +580,12 @@ def main():
                                 bp += "…"
                             url = "https://github.com/%s/issues/%d" % (repo, num)
                             msg = format_goal("[TO: %s] from @%s on Issue #%d — %s" % (target, author, num, title), bp, url)
-                            if tsession not in output["_pending"]:
-                                output["_pending"][tsession] = msg
+                            queue_goal(output, tsession, msg)
                             new_state[ck] = "forwarded"
                             output["actions"].append({"node": ck, "state": "forwarded", "session": tsession, "reason": "to_directive",
                                                       "target": target, "sent": msg[:80], "result": "queued"})
                         except Exception:
                             pass
-                    if output["actions"]:
-                        save_state(state_file, dict(new_state))
                 except Exception:
                     pass
     except Exception as e:
@@ -510,8 +614,7 @@ def main():
                     msg = format_goal("PR #%d is now READY FOR REVIEW — %s" % (pn, pr["title"]),
                                       "Author: @%s\nThe PR was moved from Draft to Ready.\nBranch: %s" % (author, pr.get("headRefName", "")), pu)
                     pi_session = sm.get("pi")
-                    if pi_session and pi_session not in output["_pending"]:
-                        output["_pending"][pi_session] = msg
+                    queue_goal(output, pi_session, msg)
                     output["actions"].append({"node": dk, "state": "ready", "session": sm.get("pi"),
                                               "reason": "pr_draft_ready", "sent": msg[:80], "result": "queued"})
                 new_state[dk] = is_draft
@@ -521,23 +624,10 @@ def main():
                     msg = format_goal("New PR #%d: %s by @%s" % (pn, pr["title"], author),
                                       "Status: %s\nBranch: %s" % (pr.get("mergeStateStatus", "unknown"), pr["headRefName"]), pu)
                     pi_session = sm.get("pi")
-                    if pi_session and pi_session not in output["_pending"]:
-                        output["_pending"][pi_session] = msg
+                    queue_goal(output, pi_session, msg)
                     output["actions"].append({"node": pk, "state": "open", "session": sm.get("pi"), "reason": "new_pr",
                                               "sent": msg[:80], "result": "queued"})
                     new_state[pk] = "open"
-
-                    m = re.search(r"(?i)(?:close[sd]?|fix(?:es)?|resolve[sd]?)\s+#(\d+)", pr.get("body", ""))
-                    if m:
-                        li = int(m.group(1))
-                        for proj in projects:
-                            lsk = "bjproject:%d:%d:status" % (proj["number"], li)
-                            cur = prev_state.get(lsk, "")
-                            if cur == "In Progress":
-                                new_state[lsk] = "Review"
-                                output["actions"].append({"node": lsk, "state": "Review",
-                                                          "reason": "pr_created_auto_review",
-                                                          "prev_status": cur, "linked_pr": pn})
 
                 # 3b. Review state changes
                 try:
@@ -549,7 +639,7 @@ def main():
                         rk = "prreview:%d" % pn
                         pd = prev_state.get(rk)
                         if decision and (not pd or pd != decision):
-                            asession = resolve_assignee_session(author, assignee_map, sm)
+                            asession = resolve_pr_session(pr, proj_map, projects, sm, assignee_map)
                             if asession:
                                 if decision == "APPROVED":
                                     reason = "pr_approved"
@@ -564,30 +654,15 @@ def main():
                                     t = "PR #%d review updated — %s" % (pn, pr["title"])
                                     b = "Review state: %s" % decision
                                 msg = format_goal(t, b, pu)
-                                if asession not in output["_pending"]:
-                                    output["_pending"][asession] = msg
+                                queue_goal(output, asession, msg)
                                 output["actions"].append({"node": rk, "state": decision, "session": asession, "reason": reason,
                                                           "sent": msg[:80], "result": "queued"})
-                                post_github_feedback(repo, pn, asession, decision, author, True)
-
-                                if decision == "CHANGES_REQUESTED":
-                                    m = re.search(r"(?i)(?:close[sd]?|fix(?:es)?|resolve[sd]?)\s+#(\d+)", pr.get("body", ""))
-                                    if m:
-                                        li = int(m.group(1))
-                                        for proj in projects:
-                                            lsk = "bjproject:%d:%d:status" % (proj["number"], li)
-                                            if prev_state.get(lsk, "") in ("Ready", "In Progress"):
-                                                new_state[lsk] = "Blocked"
-                                                output["actions"].append({"node": lsk, "state": "Blocked",
-                                                                          "session": asession, "reason": "pr_auto_blocked_issue",
-                                                                          "prev_status": prev_state.get(lsk, "?"), "linked_pr": pn})
 
                             elif author != "hh1985":
                                 msg = format_goal("PR #%d review: %s — unclear who should act" % (pn, decision),
                                                   "PR by @%s has review '%s' but @%s is not mapped." % (author, decision, author), pu)
                                 pi_session = sm.get("pi")
-                                if pi_session and pi_session not in output["_pending"]:
-                                    output["_pending"][pi_session] = msg
+                                queue_goal(output, pi_session, msg)
                                 output["actions"].append({"node": rk, "state": decision, "session": sm.get("pi"),
                                                           "reason": "pr_unclear_owner", "sent": msg[:80], "result": "queued"})
 
@@ -619,17 +694,14 @@ def main():
                             if asession:
                                 msg = format_goal("PR #%d has been **MERGED**! — %s" % (pn, mp.get("title", "")),
                                                   "Your PR was merged by @%s.\nMerged at: %s" % (mp.get("mergedBy", {}).get("login", "?"), mp.get("mergedAt", "unknown")), pu)
-                                if asession not in output["_pending"]:
-                                    output["_pending"][asession] = msg
+                                queue_goal(output, asession, msg)
                                 output["actions"].append({"node": mk, "state": "merged", "session": asession,
                                                           "reason": "pr_merged_recent", "sent": msg[:80], "result": "queued"})
-                                post_github_feedback(repo, pn, asession, "MERGED", author, True)
                             else:
                                 msg = format_goal("PR #%d was merged — unclear who to notify" % pn,
                                                   "PR by @%s was merged but @%s is not mapped." % (author, author), pu)
                                 pi_session = sm.get("pi")
-                                if pi_session and pi_session not in output["_pending"]:
-                                    output["_pending"][pi_session] = msg
+                                queue_goal(output, pi_session, msg)
                                 output["actions"].append({"node": mk, "state": "merged", "session": sm.get("pi"),
                                                           "reason": "pr_merged_unmapped_recent", "sent": msg[:80], "result": "queued"})
             except Exception:
@@ -656,18 +728,15 @@ def main():
                                         pu = "https://github.com/%s/pull/%d" % (repo, pn)
                                         msg = format_goal("PR #%d has been **MERGED**! — %s" % (pn, info.get("title", "")),
                                                           "Your PR was merged by PI.\nMerged at: %s" % info.get("mergedAt", "unknown"), pu)
-                                        if asession not in output["_pending"]:
-                                            output["_pending"][asession] = msg
+                                        queue_goal(output, asession, msg)
                                         output["actions"].append({"node": key, "state": "merged", "session": asession,
                                                                   "reason": "pr_merged", "sent": msg[:80], "result": "queued"})
-                                        post_github_feedback(repo, pn, asession, "MERGED", author, True)
                                     elif not asession:
                                         pu = "https://github.com/%s/pull/%d" % (repo, pn)
                                         msg = format_goal("PR #%d was merged — unclear who to notify" % pn,
                                                           "PR by @%s was merged but @%s is not mapped." % (author, author), pu)
                                         pi_session = sm.get("pi")
-                                        if pi_session and pi_session not in output["_pending"]:
-                                            output["_pending"][pi_session] = msg
+                                        queue_goal(output, pi_session, msg)
                                         output["actions"].append({"node": key, "state": "merged", "session": sm.get("pi"),
                                                                   "reason": "pr_merged_unmapped", "sent": msg[:80], "result": "queued"})
                     except Exception:
@@ -704,8 +773,7 @@ def main():
                     bp += "…"
                 url = "https://github.com/%s/pull/%d" % (repo, pn)
                 msg = format_goal("[TO: %s] from @%s on PR #%d — %s" % (target, author, pn, pr["title"]), bp, url)
-                if tsession not in output["_pending"]:
-                    output["_pending"][tsession] = msg
+                queue_goal(output, tsession, msg)
                 new_state[ck] = "forwarded"
                 output["actions"].append({"node": ck, "state": "forwarded", "session": tsession, "reason": "to_directive_pr",
                                           "target": target, "sent": msg[:80], "result": "queued"})
@@ -767,18 +835,19 @@ def main():
                             if len(ms_data["issues"]) > 5:
                                 body += " … (+%d more)" % (len(ms_data["issues"]) - 5)
                         msg = format_goal("Milestone %s — %s" % (ms_name, progress), body, "https://github.com/%s/milestones" % repo)
-                        if pi_session not in output["_pending"]:
-                            output["_pending"][pi_session] = msg
+                        queue_goal(output, pi_session, msg)
                         output["actions"].append({"node": mk, "state": progress, "session": pi_session,
                                                   "reason": "milestone_update", "sent": msg[:80], "result": "queued"})
                 new_state[mk] = {"progress": progress, "overdue": overdue}
     except Exception as e:
         output["warnings"].append("%s milestone scan: %s" % (prefix, str(e)[:80]))
 
-    # Flush one /goal per session (with cooldown)
-    flush_goals(output, prefix, prev_state, new_state)
-
-    save_state(state_file, new_state)
+    delivery_ok = flush_goals(output)
+    if delivery_ok:
+        save_state(state_file, new_state)
+    else:
+        output["warnings"].append("%s delivery failed; prior state retained for retry" % prefix)
+        save_state(state_file, prev_state)
     print(json.dumps(output))
 
 
