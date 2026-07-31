@@ -471,28 +471,52 @@ def main():
                                         "--json", "number,title,author,reviewDecision,body",
                                         "--jq", "."],
                                        capture_output=True, text=True, timeout=10)
-                    if r.returncode == 0:
-                        linked_pr = None
-                        for pr in json.loads(r.stdout):
-                            if re.search(r"(?i)(?:close[sd]?|fix(?:es)?|resolve[sd]?)\s*#%d\b" % issue_num, pr.get("body", "")):
-                                linked_pr = pr
-                                break
-                        if linked_pr:
-                            pu = "https://github.com/%s/pull/%d" % (repo, linked_pr["number"])
-                            if linked_pr.get("reviewDecision") == "CHANGES_REQUESTED":
-                                s = resolve_pr_session(linked_pr, proj_map, projects, sm, assignee_map)
-                                if s:
-                                    session = s
-                                    msg = format_goal("PR #%d needs changes — Issue #%d in Review" % (linked_pr["number"], issue_num),
-                                                      "PR #%d (%s) has CHANGES_REQUESTED. Please address findings." % (linked_pr["number"], linked_pr["title"]), pu)
-                                    reason = "review_pr_changes"
-                            else:
-                                session = sm.get("pi")
-                                msg = format_goal("Issue #%d in Review — PR #%d awaiting PI" % (issue_num, linked_pr["number"]),
-                                                  "PR #%d (%s) by @%s is ready.\nReview: %s" % (linked_pr["number"], linked_pr["title"], linked_pr["author"]["login"], linked_pr.get("reviewDecision", "none")), pu)
-                                reason = "review_pr_ready"
-                except Exception:
-                    pass
+                    if r.returncode != 0:
+                        raise ControlPlaneUnavailable(
+                            "Unable to resolve linked PR for Issue #%d" % issue_num
+                        )
+                    linked_pr = None
+                    for pr in json.loads(r.stdout):
+                        if issue_num in linked_issue_numbers(pr.get("body", "")):
+                            linked_pr = pr
+                            break
+                    if linked_pr:
+                        pu = "https://github.com/%s/pull/%d" % (repo, linked_pr["number"])
+                        if linked_pr.get("reviewDecision") == "CHANGES_REQUESTED":
+                            linked_session = resolve_pr_session(
+                                linked_pr, proj_map, projects, sm, assignee_map
+                            )
+                            if linked_session:
+                                session = linked_session
+                                msg = format_goal(
+                                    "PR #%d needs changes — Issue #%d in Review"
+                                    % (linked_pr["number"], issue_num),
+                                    "PR #%d (%s) has CHANGES_REQUESTED. Please address findings."
+                                    % (linked_pr["number"], linked_pr["title"]),
+                                    pu,
+                                )
+                                reason = "review_pr_changes"
+                        else:
+                            session = sm.get("pi")
+                            msg = format_goal(
+                                "Issue #%d in Review — PR #%d awaiting PI"
+                                % (issue_num, linked_pr["number"]),
+                                "PR #%d (%s) by @%s is ready.\nReview: %s"
+                                % (
+                                    linked_pr["number"],
+                                    linked_pr["title"],
+                                    linked_pr["author"]["login"],
+                                    linked_pr.get("reviewDecision", "none"),
+                                ),
+                                pu,
+                            )
+                            reason = "review_pr_ready"
+                except ControlPlaneUnavailable:
+                    raise
+                except Exception as exc:
+                    raise ControlPlaneUnavailable(
+                        "Invalid linked PR data for Issue #%d" % issue_num
+                    ) from exc
 
                 if not session:
                     output["warnings"].append("%s Issue #%d in REVIEW — no linked PR" % (prefix, issue_num))
@@ -634,9 +658,9 @@ def main():
                                 output["actions"].append({"node": rk, "state": decision, "session": asession, "reason": reason,
                                                           "sent": msg[:80], "result": "queued"})
 
-                            elif author != "hh1985":
-                                msg = format_goal("PR #%d review: %s — unclear who should act" % (pn, decision),
-                                                  "PR by @%s has review '%s' but @%s is not mapped." % (author, decision, author), pu)
+                            else:
+                                msg = format_goal("PR #%d review: %s — unresolved owner" % (pn, decision),
+                                                  "Linked Issue Project ownership could not be resolved; author is @%s." % author, pu)
                                 pi_session = sm.get("pi")
                                 queue_goal(output, pi_session, msg)
                                 output["actions"].append({"node": rk, "state": decision, "session": sm.get("pi"),
@@ -655,7 +679,7 @@ def main():
 
             try:
                 mr = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "merged",
-                                     "--json", "number,title,mergedAt,author,mergedBy",
+                                     "--json", "number,title,mergedAt,author,mergedBy,body",
                                      "--jq", ".[:10]"],
                                     capture_output=True, text=True, timeout=10)
                 if mr.returncode == 0:
@@ -665,7 +689,9 @@ def main():
                         if mk not in merged_keys and prev_state.get(mk) != "merged":
                             new_state[mk] = "merged"
                             author = mp.get("author", {}).get("login", "unknown")
-                            asession = resolve_assignee_session(author, assignee_map, sm)
+                            asession = resolve_pr_session(
+                                mp, proj_map, projects, sm, assignee_map
+                            )
                             pu = "https://github.com/%s/pull/%d" % (repo, pn)
                             if asession:
                                 msg = format_goal("PR #%d has been **MERGED**! — %s" % (pn, mp.get("title", "")),
@@ -690,8 +716,8 @@ def main():
                     pn = int(key.split(":")[1])
                     try:
                         cl = subprocess.run(["gh", "pr", "view", str(pn), "--repo", repo,
-                                             "--json", "state,mergedAt,author,title",
-                                             "--jq", "{state, mergedAt, author: .author.login, title}"],
+                                             "--json", "state,mergedAt,author,title,body",
+                                             "--jq", "{state, mergedAt, author: .author.login, title, body}"],
                                             capture_output=True, text=True, timeout=10)
                         if cl.returncode == 0:
                             info = json.loads(cl.stdout)
@@ -699,7 +725,10 @@ def main():
                                 new_state[key] = "merged"
                                 author = info.get("author", "")
                                 if author != "hh1985":
-                                    asession = resolve_assignee_session(author, assignee_map, sm)
+                                    asession = resolve_pr_session(
+                                        {"author": {"login": author}, "body": info.get("body", "")},
+                                        proj_map, projects, sm, assignee_map,
+                                    )
                                     if asession and prev_state.get(key) != "merged":
                                         pu = "https://github.com/%s/pull/%d" % (repo, pn)
                                         msg = format_goal("PR #%d has been **MERGED**! — %s" % (pn, info.get("title", "")),
