@@ -1,109 +1,73 @@
 # Dispatcher Handover — 交接文档
 
-> 本文档记录 bot-dispatcher 的设计决策、运行规则与待办事项。
-> 由 PI 负责维护更新；执行者（Hermes/Codex sessions）只负责执行。
+## 定位
 
-## 1. 设计原则
+`bot-dispatcher` 是 PI 管理 Codex 团队的 no-agent GitHub 通知层。它每个
+cron tick 读取 GitHub Issue Graph、Project、Issue/PR 评论和 PR 状态，把变化
+送到对应 Codex session。它不启动 Hermes，也不进行模型推理。
 
-1. **GitHub Issue Graph 是控制平面真相源** — 所有路由/依赖/生命周期决策以 `blockedBy` / `blocking` / `parent` / `subIssues` / `issueType` 为准。Issue 正文、评论、labels、本地文件只是说明，不能覆盖 Graph。
-2. **Owner 由 Project 决定** — Issue 属于哪个 GitHub Project → 该 Project 配置的 `owner` 角色 → `session_map[role]` 映射到 agent-deck session。assignee 只是占位，不参与路由。
-3. **PI 只关注结果** — Issue 级别的状态流转（Inbox/Ready/In Progress/Blocked）不通知 PI；只有 PR 事件（新 PR、Draft→Ready、待合并）和里程碑变化才找 PI。
-4. **一个 session 一次一条消息** — 同一 tick 内多个事件指向同一 session 时，只发第一条（`_pending` 队列 + flush）。
-5. **Worker 用 bot 账号，PI 用主账号** — 所有 worker session（Engineer/Strategy/Data）的 git/gh 身份是 `everything-bot-engineer`；PI 是 `hh1985`（通过 `gh-identity-pi.sh` wrapper 注入 GH_TOKEN）。
+Dispatcher 只传递事实，不决定 roadmap，不修改 Issue Graph 或 Project
+Status，不合并 PR，不关闭 Issue，不授权部署。
 
-## 2. 通知矩阵
+## 真相源与 Owner
 
-### Issue 状态变化（Project Status 列）
+1. 依赖和拆解：GitHub Issue Graph 的
+   `blockedBy/blocking/parent/subIssues/issueType`。
+2. 生命周期：GitHub Project `Status`。
+3. 职能 Owner：Issue 的唯一 Project membership → 配置的 owner role。
+4. PR 执行者：优先使用 PR 关联 Issue 的 Project owner；只有没有关联 Issue
+   时才使用 GitHub author fallback。共享 bot 账号不能决定 Engineer/Strategist。
 
-| 变化 | 通知谁 | 说明 |
-|------|--------|------|
-| Ready | → Owner | Issue 所在 Project 的 owner |
-| In Progress | 无 | 静默 |
-| Blocked（有 linked PR 且 CHANGES_REQUESTED） | → PR 作者 | 去改 PR |
-| Blocked（无 linked PR） | 无 | 仅 warning 日志 |
-| Review（PR APPROVED） | → PI | 等待 PI 审/合并 |
-| Review（PR CHANGES_REQUESTED） | → PR 作者 | 去改 PR |
-| Review（无 linked PR） | 无 | 仅 warning 日志 |
-| Done | → Owner | 完成回执 |
-| 任意变化 | → Graph 上下游 owner | blockedBy/blocking/parent/subIssues 关联的 Issue owner |
+GitHub Graph 或 Project 读取失败、分页游标异常、Issue 同时落入多个配置
+Project 时，本轮生命周期路由 fail closed。
 
-### PR 事件
+## 通知策略
 
-| 事件 | 通知谁 |
-|------|--------|
-| 新 PR | → PI |
-| Draft → Ready for Review | → PI |
-| Review 变化（APPROVED / CHANGES_REQUESTED） | → PR 作者 |
-| Merged | → PR 作者回执 |
+- Ready → Issue 的 Project owner。
+- Review → 无整改时通知 PI；有 Changes Requested 时通知关联 Issue owner。
+- Done → Issue owner 回执。
+- Graph 上下游变化 → 相关 Issue owner。
+- 新 PR、Draft→Ready、milestone 风险 → PI。
+- `[TO: Role]` → 对应 role session。
+- merge/review 回执 → 关联 owner 或 author fallback。
 
-### 其他
+同一 tick 内，同一 session 的所有事件组成一条 digest；不能只保留第一条。
+只有全部 digest 发送成功才提交 dedup state。发送失败保留旧 state，下次重试。
+不提前在 GitHub 写“已派发成功”。
 
-| 事件 | 通知谁 |
-|------|--------|
-| `[TO: Role]` 评论（Issue 或 PR） | → 对应 session |
-| Milestone 进度变化 / 超期 / <7天 | → PI |
-| Stale 卡片（>1h 无活动） | 自动 Blocked + warning（不通知） |
+## 运行
 
-## 3. 配置说明
-
-`dispatcher.yaml` 每 repo 一段：
-
-```yaml
-repos:
-  <repo-name>:
-    repo: <owner>/<name>
-    projects:
-      - number: <project-number>
-        node: "<project-node-id>"      # gh project list --format json 获取
-        name: "<project-title>"
-        owner: <role-key>              # 引用 session_map 的 key
-    session_map:
-      pi: <pi-session>
-      engineer: <engineer-session>
-      strategist: <strategy-session>
-      data: <data-session>             # 可选
-    assignee_map:
-      <github-login>: <role-key>
-    mention_map:
-      <[TO: 关键字]>: <role-key>
-```
-
-## 4. 部署 / 运行
+配置默认读取仓库根目录的 `dispatcher.yaml`，状态默认写入
+`~/.local/state/bot-dispatcher/`。
 
 ```bash
-# 本地安装（cron 引用这些路径）
-cp dispatcher.py ~/.hermes/scripts/
-cp dispatcher.yaml ~/.hermes/config/
-cp bj-dispatcher.sh pt-dispatcher.sh ~/.hermes/scripts/
-chmod +x ~/.hermes/scripts/dispatcher.py
-
-# 手动测试
-python3 ~/.hermes/scripts/dispatcher.py --repo beijing-lot
-python3 ~/.hermes/scripts/dispatcher.py --repo paired-trading
+python3 -m pip install -r requirements.txt
+./bj-dispatcher.sh
+./pt-dispatcher.sh
 ```
 
-Cron：no_agent 脚本，每 1 分钟，deliver=local，输出到 `~/.hermes/cron/output/<job_id>/`。
+cron 应直接调用审核后的仓库 checkout wrapper，不复制
+`dispatcher.py` 到其他目录。cron 是 no-agent local notification job。
 
-## 5. 已知问题 / 待办
+可选环境变量：
 
-- [ ] **代码与本地运行实例不同步** — 本 repo 是快照，`~/.hermes/scripts/dispatcher.py` 是 cron 实际运行的版本。后续修改必须同步两边，或改为 cron 直接引用 repo 路径。
-- [ ] 是否重建 dispatcher cron（当前已暂停，等 PI 决策）
-- [ ] PR 的 Project Status 只处理 Review，Draft/Ready 状态来自 PR 自身 `isDraft` 字段
-- [ ] Milestone 扫描假设 `gh issue list --json` 输出单行 JSON，已按行解析兼容
-- [ ] 首次运行（空 state）会大量补发历史 `[TO: ...]` 评论 — 属于预期行为
+- `BOT_DISPATCHER_CONFIG`
+- `BOT_DISPATCHER_STATE_DIR`
 
-## 6. 身份管理
+## 测试与部署
 
-- PI session（beijing-lot-PI / paired-trading-PI）使用 `gh-identity-pi.sh` wrapper：
-  ```bash
-  agent-deck session set <session> wrapper "bash ~/.hermes/scripts/gh-identity-pi.sh {command}"
-  ```
-- worker session 无 wrapper，沿用全局 `everything-bot-engineer`
+```bash
+python3 -m pip install -r requirements-dev.txt
+pytest -q
+```
 
-## 7. 变更流程（建议）
+变更必须经过 Issue → PR → PI Review → PI Merge。合并不等于部署；cron
+切换或恢复必须由 PI 单独授权。部署前应使用临时 state 目录运行一次，
+核对分页、目标 session、digest 数量及失败重试，不向生产 session 发送测试消息。
 
-1. PI 在 bot-dispatcher repo 开 Issue 描述需求
-2. 分配 owner（Engineer/Strategist）实施
-3. PR → PI review → merge
-4. PI 确认后同步部署到 `~/.hermes/scripts/`
-5. 更新本文档
+## 当前边界
+
+- 没有自动 Blocked、自动 Review 或 stale lifecycle mutation。
+- 不创建新的服务、数据库或消息中间件。
+- 不让 Hermes session 参与维护或运行。
+- PI 保持 roadmap 总览，Dispatcher 只降低轮询成本。
