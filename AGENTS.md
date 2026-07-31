@@ -27,12 +27,14 @@ per session per tick.
 1. Open an Issue describing the change (routing rule, new repo, bug).
 2. Executor implements in a branch/PR referencing the Issue.
 3. PI reviews and merges (only PI merges).
-4. PI authorizes deployment; sync to `~/.hermes/scripts/` and restart cron.
+4. PI authorizes deployment; cron must run the reviewed repository checkout directly.
 
 ## Ground rules
 
 - Never commit GitHub tokens, session configs, or `~/.hermes` internals.
 - Keep `dispatcher.yaml` free of secrets; session names are not secrets.
-- The local running copy and this repo must stay in sync — update both in one
-  PR or note the drift explicitly in the PR body.
+- Do not maintain a copied runtime implementation. Cron points to the reviewed
+  repository checkout so deployed code has one source of truth.
+- Do not start Hermes or another reasoning agent from cron. The job is a
+  no-agent observer and notification transport only.
 - When GitHub is unreadable, fail closed (report) — never fabricate state.
