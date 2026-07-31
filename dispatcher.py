@@ -395,6 +395,8 @@ def main():
     output = {"ts": time.time(), "actions": [], "warnings": [], "_pending": {}}
     prev_state = load_state(state_file)
     new_state = dict(prev_state)
+    proj_map = {}
+    control_plane_ok = False
 
     # ── 1. Project Status changes ──
     try:
@@ -540,6 +542,7 @@ def main():
 
             new_state[sk] = cur_s
 
+        control_plane_ok = True
     except Exception as e:
         output["_pending"] = {}
         new_state = dict(prev_state)
@@ -631,6 +634,10 @@ def main():
 
                 # 3b. Review state changes
                 try:
+                    if not control_plane_ok:
+                        raise ControlPlaneUnavailable(
+                            "Project/Graph unavailable for PR owner routing"
+                        )
                     rv = subprocess.run(["gh", "pr", "view", str(pn), "--repo", repo,
                                          "--json", "reviewDecision", "--jq", ".reviewDecision"],
                                         capture_output=True, text=True, timeout=10)
@@ -672,6 +679,10 @@ def main():
                     pass
 
             # 3c. Track closed/merged + recent merges
+            if not control_plane_ok:
+                raise ControlPlaneUnavailable(
+                    "Project/Graph unavailable for merged PR owner routing"
+                )
             open_keys = {"pr:%d" % p["number"] for p in prs}
             merged_keys = {k for k, v in prev_state.items()
                            if k.startswith("pr:") and not k.startswith("prreview:")
