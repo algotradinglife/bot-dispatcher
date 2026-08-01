@@ -243,18 +243,40 @@ def save_state(state_file, state):
     state_file.write_text(json.dumps(state))
 
 
-def gql_query(query):
-    r = subprocess.run(["gh", "api", "graphql", "-f", "query=%s" % query],
-                       capture_output=True, text=True, timeout=20)
-    if r.returncode != 0:
-        raise ControlPlaneUnavailable("GitHub GraphQL failed: %s" % r.stderr.strip()[:160])
-    try:
-        payload = json.loads(r.stdout)
-    except Exception as exc:
-        raise ControlPlaneUnavailable("GitHub GraphQL returned invalid JSON") from exc
-    if payload.get("errors"):
-        raise ControlPlaneUnavailable("GitHub GraphQL errors: %s" % str(payload["errors"])[:160])
-    return payload
+def gql_query(query, retries=3, base_delay=1.0):
+    """Run a GraphQL query with retry on transient failures (rate limit, network)."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = subprocess.run(["gh", "api", "graphql", "-f", "query=%s" % query],
+                               capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            last_err = "timeout"
+        else:
+            if r.returncode != 0:
+                last_err = r.stderr.strip()[:160]
+            else:
+                try:
+                    payload = json.loads(r.stdout)
+                except Exception as exc:
+                    last_err = "invalid JSON: %s" % exc
+                else:
+                    if payload.get("errors"):
+                        # Retry only on transient error kinds; fail fast otherwise
+                        err_str = str(payload["errors"])
+                        transient = any(k in err_str for k in (
+                            "rate limit", "rate_limit", "abuse", "internal", "timeout",
+                            "connection", "Network error", "ETIMEDOUT", "503", "502",
+                        ))
+                        if not transient:
+                            raise ControlPlaneUnavailable(
+                                "GitHub GraphQL errors: %s" % err_str[:160])
+                        last_err = err_str[:160]
+                    else:
+                        return payload
+        if attempt < retries - 1:
+            time.sleep(base_delay * (2 ** attempt))
+    raise ControlPlaneUnavailable("GitHub GraphQL failed: %s" % (last_err or "unknown"))
 
 
 def _issue_relation(repo, issue_num, relation):
@@ -563,15 +585,32 @@ def main():
     # ── 1. Project Status changes ──
     try:
         proj_map, items = build_issue_proj_map(cfg)
-        issue_graphs = {
-            item["number"]: get_issue_graph(repo, item["number"])
+        # Fetch issue graphs in parallel (one GraphQL call per issue; large repos
+        # benefit from concurrency instead of serial subprocess latency)
+        changed_issues = [
+            item["number"]
             for item in items
             if not item.get("is_pr")
             and prev_state.get(
                 project_state_key(item["project_num"], item["number"]),
                 "Inbox",
             ) != item.get("status", "Inbox")
-        }
+        ]
+        issue_graphs = {}
+        if changed_issues:
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+
+                def _fetch_graph(num):
+                    return num, get_issue_graph(repo, num)
+
+                with ThreadPoolExecutor(max_workers=min(8, len(changed_issues))) as ex:
+                    for num, graph in ex.map(_fetch_graph, changed_issues):
+                        issue_graphs[num] = graph
+            except Exception:
+                # Fall back to serial if concurrency fails
+                for num in changed_issues:
+                    issue_graphs[num] = get_issue_graph(repo, num)
         for item in items:
             issue_num = item["number"]
             pn = item["project_num"]

@@ -312,3 +312,23 @@ def test_quoted_directive_is_ignored() -> None:
 
 def test_project_state_key_is_repo_neutral() -> None:
     assert MOD.project_state_key(7, 42) == "project:7:42:status"
+
+
+def test_gql_query_retries_transient_failure() -> None:
+    """Transient GraphQL failures are retried; success on second attempt."""
+    transient = SimpleNamespace(returncode=1, stdout="", stderr="rate limit exceeded")
+    ok = SimpleNamespace(
+        returncode=0,
+        stdout='{"data": {"repository": {"issue": {"number": 1}}}}',
+        stderr="",
+    )
+    with patch.object(MOD.subprocess, "run", side_effect=[transient, ok]):
+        payload = MOD.gql_query("{dummy}", retries=2, base_delay=0)
+    assert payload["data"]["repository"]["issue"]["number"] == 1
+
+
+def test_gql_query_raises_after_all_retries() -> None:
+    failed = SimpleNamespace(returncode=1, stdout="", stderr="persistent error")
+    with patch.object(MOD.subprocess, "run", return_value=failed):
+        with pytest.raises(MOD.ControlPlaneUnavailable):
+            MOD.gql_query("{dummy}", retries=2, base_delay=0)
