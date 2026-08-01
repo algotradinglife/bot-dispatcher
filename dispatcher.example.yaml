@@ -1,0 +1,32 @@
+repos:
+  sample-research:
+    repo: example-org/sample-research
+
+    # GitHub Project V2 membership determines the owner role for each item.
+    projects:
+      - number: 1
+        node: "PVT_REPLACE_WITH_PROJECT_NODE_ID"
+        name: "Research"
+        owner: researcher
+      - number: 2
+        node: "PVT_REPLACE_WITH_PROJECT_NODE_ID"
+        name: "Engineering"
+        owner: engineer
+
+    # Role keys are local to this repository entry.
+    session_map:
+      pi: sample-PI
+      researcher: sample-Research
+      engineer: sample-Engineering
+
+    # PR authors are routed back to the session for their role.
+    assignee_map:
+      example-maintainer: pi
+      example-bot: engineer
+
+    # [TO: role] directives are case-insensitive.
+    mention_map:
+      pi: pi
+      researcher: researcher
+      research: researcher
+      engineer: engineer

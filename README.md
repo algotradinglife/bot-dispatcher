@@ -1,6 +1,13 @@
 # Bot Dispatcher
 
-No-agent GitHub notification relay for PI-managed Codex sessions.
+Bot Dispatcher is a small, configuration-driven polling service for teams that
+coordinate work through GitHub Issues, Project V2 boards, pull requests, and
+agent-deck sessions. One invocation performs one scan; a scheduler can run it as
+a `no_agent` job every minute.
+
+The tracked tree contains no live repository IDs, session names, GitHub
+accounts, tokens, or machine-specific paths. Runtime configuration stays
+outside Git.
 
 ## Boundary
 
@@ -8,51 +15,107 @@ The dispatcher observes GitHub and delivers notifications. It does not decide
 roadmap, mutate Issue Graph or Project Status, merge PRs, close Issues, or
 authorize deployment. PI owns those decisions.
 
-## Architecture
+## What it routes
 
-- `dispatcher.py` — generic engine; `--repo <name>` selects configuration
-- `dispatcher.yaml` — Project-to-owner and owner-to-session mapping
-- `bj-dispatcher.sh` / `pt-dispatcher.sh` — repo-local cron entry points
-- `~/.local/state/bot-dispatcher/` — delivery/dedup state by default
+- Project Status changes to the role that owns that Project.
+- Native Issue Graph relationships (`blockedBy`, `blocking`, `parent`, and
+  `subIssues`) to related owners.
+- `[TO: role]` directives in Issue and PR comments.
+- New PRs, Draft-to-Ready transitions, review changes, and merge receipts.
+- Milestone progress and deadline warnings.
 
-## Signals
+All events for one session are combined into one digest per scan. State is
+committed only after every digest is accepted; a failed delivery retains the
+previous state so the event can be retried.
 
-| Signal | Destination |
-|---|---|
-| Issue becomes Ready | Project owner session |
-| Issue or PR enters Review | PI or linked Issue owner, depending on review state |
-| Issue Graph stakeholder changes | Related Issue owners |
-| `[TO: Role]` comment | Mapped role session |
-| New PR / Draft→Ready | PI |
-| PR review change / merge | Linked Issue owner or author fallback |
-| Milestone risk | PI |
+## Requirements
 
-Multiple events for one session are combined into one digest per tick. Delivery
-state is committed only after all digests are accepted; a failed tick retains
-the prior state so events are retried.
-
-## Run
+- Python 3.10+
+- [GitHub CLI](https://cli.github.com/) authenticated for the configured repos
+- `agent-deck` with the configured sessions
+- PyYAML 6.x
 
 ```bash
-python3 -m pip install -r requirements.txt
-./bj-dispatcher.sh
-./pt-dispatcher.sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-Configuration defaults to the repository's `dispatcher.yaml`. Override with
-`BOT_DISPATCHER_CONFIG`. State defaults to
-`~/.local/state/bot-dispatcher`; override with
+## Configure
+
+Copy the sanitized example to the default local config path:
+
+```bash
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/bot-dispatcher"
+cp dispatcher.example.yaml \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/bot-dispatcher/dispatcher.yaml"
+```
+
+Edit the copy with your GitHub repository, Project V2 node IDs, roles, and
+agent-deck session names. `dispatcher.yaml` is ignored by Git.
+
+Validate without contacting GitHub or agent-deck:
+
+```bash
+python dispatcher.py --repo sample-research --validate-config
+```
+
+For a config stored elsewhere, pass `--config` or set
+`BOT_DISPATCHER_CONFIG`. State defaults to the XDG state directory under
+`bot-dispatcher`; override it with `--state-dir` or
 `BOT_DISPATCHER_STATE_DIR`.
 
-## Tests
+## Run safely
+
+First perform a dry run. It reads GitHub but sends no agent-deck messages and
+writes no state:
 
 ```bash
-python3 -m pip install -r requirements-dev.txt
-pytest -q
+python dispatcher.py --repo sample-research --dry-run
 ```
 
-## Governance
+Then run one real polling tick:
 
-GitHub Issue Graph is the dependency source of truth. Project membership
-determines functional ownership. When Graph or Project reads fail, lifecycle
-routing fails closed. See `AGENTS.md`.
+```bash
+python dispatcher.py --repo sample-research
+```
+
+## One-minute no-agent schedule
+
+Point the scheduler directly at the generic entrypoint; per-repository wrapper
+scripts are unnecessary:
+
+```text
+schedule: every 1 minute
+mode: no_agent
+command: python3 /opt/bot-dispatcher/dispatcher.py --repo sample-research
+```
+
+Use one scheduled job per repository key when multiple repositories share the
+same config. Keep authentication and agent-deck session setup in the scheduler
+environment rather than in this repository.
+
+## Configuration model
+
+Routing follows:
+
+```text
+Issue -> GitHub Project membership -> configured owner role -> session_map
+```
+
+`assignee_map` is the fallback for PRs without a linked Issue. For PRs that do
+link an Issue, its Project ownership wins. `mention_map` maps the value in a
+`[TO: role]` directive to a role. Every referenced role must exist in
+`session_map`, and a `pi` session is required.
+
+## Development
+
+```bash
+python -m pip install -r requirements-dev.txt
+pytest -q
+python -m py_compile dispatcher.py
+```
+
+CI runs the pytest suite on every PR and push to `main`. See
+[operations](docs/OPERATIONS.md) for deployment and failure handling, and
+[dispatcher framework](docs/SKILL.md) for routing semantics.
