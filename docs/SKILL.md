@@ -29,6 +29,8 @@ The scheduler supplies the cadence. No repository-specific wrapper is needed.
 - Native Issue Graph fields define dependencies and decomposition.
 - Project V2 membership identifies the owner role.
 - `session_map` maps owner roles to delivery sessions.
+- `workflow_role`, when configured, identifies the dedicated operational
+  coordinator. It defaults to `pi` when omitted.
 - Issue bodies, comments, labels, and local state cannot override Graph or
   Project ownership.
 
@@ -47,16 +49,20 @@ and expose a warning rather than manufacture relationships.
 - `Review` -> PI or mapped PR author, depending on the PR review state.
 - `Done` -> Project owner.
 - Related Graph nodes -> their Project owners.
+- Every Issue Status transition -> dedicated workflow coordinator when
+  `workflow_role` is explicitly configured and differs from the primary
+  recipient.
 
 The dispatcher does not write Project Status or Graph relationships.
 
 Use this lifecycle order for new work:
 
 ```text
-1. PI/control-plane owner writes all native graph and Project routing fields.
-2. PI/control-plane owner sets Status to Ready.
+1. PI writes business intent; the authorized PM/control-plane owner writes the
+   approved native graph and Project routing fields.
+2. PM/control-plane owner sets Status to Ready after PI authorization.
 3. Dispatcher sends /goal and submits Enter to the Project owner session.
-4. After the tick reports ok + Enter, the authorized owner sets In Progress.
+4. After the tick reports ok + Enter, PM/control-plane owner sets In Progress.
 ```
 
 Do not create work directly in `In Progress` when an initial dispatcher launch
@@ -65,10 +71,13 @@ is required. Such a transition is observed and stored, but it is not routed as
 
 ### Pull requests
 
-- New PR -> PI.
-- Draft to Ready -> PI.
-- Review decision change -> mapped author, otherwise PI.
-- Merge -> mapped author receipt, otherwise PI.
+- New PR -> workflow coordinator.
+- Draft to Ready -> workflow coordinator.
+- Review decision change -> mapped author, otherwise workflow coordinator.
+- Merge -> mapped author receipt, otherwise workflow coordinator.
+
+Explicit `[TO: PI]` directives are not redirected by `workflow_role`; they
+remain direct business-decision escalations to PI.
 
 ### Explicit directives
 

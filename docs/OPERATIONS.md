@@ -73,7 +73,7 @@ should contain two related actions:
 - a Project action with `reason: issue_ready` and `result: queued`;
 - a session digest action with `result: ok + Enter`.
 
-Only after the second action succeeds should the PI or authorized
+Only after the second action succeeds should the configured PM or authorized
 control-plane operator set the Issue to `In Progress`. `In Progress` is an
 execution record, not an initial-dispatch trigger, and the dispatcher does not
 write it automatically.
@@ -83,6 +83,24 @@ edit the dispatcher state file. Move the Issue to `Ready`, confirm a later tick
 reports `ok + Enter`, and then move it to `In Progress`. If delivery fails, keep
 the Issue in `Ready`; at-least-once state handling preserves the transition for
 retry.
+
+## Dedicated PM operation
+
+To keep PI focused on business and research decisions, configure a dedicated
+role and session:
+
+```yaml
+session_map:
+  pi: team-PI
+  pm: team-PM
+workflow_role: pm
+```
+
+Validate the config before enabling the schedule. The PM session will receive
+workflow coordination and lifecycle events, while explicit `[TO: PI]` comments
+continue to reach PI. The PM should escalate contract changes, research
+authorization, domain acceptance, and other business decisions to PI; routine
+status, review, merge, closure, dependency, and reminder work stays with PM.
 
 ## Rollback
 

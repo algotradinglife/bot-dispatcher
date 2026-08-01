@@ -16,8 +16,14 @@ repos:
     # Role keys are local to this repository entry.
     session_map:
       pi: sample-PI
+      pm: sample-PM
       researcher: sample-Research
       engineer: sample-Engineering
+
+    # Optional. Operational coordination defaults to pi when omitted.
+    # With a dedicated PM, PR workflow, milestones, and Issue lifecycle copies
+    # route here while explicit [TO: PI] decisions still route to pi.
+    workflow_role: pm
 
     # PR authors are routed back to the session for their role.
     assignee_map:
@@ -27,6 +33,7 @@ repos:
     # [TO: role] directives are case-insensitive.
     mention_map:
       pi: pi
+      pm: pm
       researcher: researcher
       research: researcher
       engineer: engineer

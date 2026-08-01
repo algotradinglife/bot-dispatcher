@@ -13,7 +13,8 @@ outside Git.
 
 The dispatcher observes GitHub and delivers notifications. It does not decide
 roadmap, mutate Issue Graph or Project Status, merge PRs, close Issues, or
-authorize deployment. PI owns those decisions.
+authorize deployment. PI owns business decisions and final domain acceptance;
+an optional dedicated PM can own workflow coordination.
 
 ## What it routes
 
@@ -44,9 +45,9 @@ goal. The required lifecycle is:
 Inbox/planning -> Ready -> dispatcher: /goal + Enter -> In Progress
 ```
 
-After successful `Ready` delivery, the PI or other authorized control-plane
-operator advances the Issue to `In Progress`. The dispatcher never performs
-that status mutation itself.
+After successful `Ready` delivery, the configured workflow coordinator or
+other authorized control-plane operator advances the Issue to `In Progress`.
+The dispatcher never performs that status mutation itself.
 
 ## Requirements
 
@@ -127,6 +128,29 @@ Issue -> GitHub Project membership -> configured owner role -> session_map
 link an Issue, its Project ownership wins. `mention_map` maps the value in a
 `[TO: role]` directive to a role. Every referenced role must exist in
 `session_map`, and a `pi` session is required.
+
+### Dedicated PM mode
+
+Set `workflow_role` to a role in `session_map` to separate operational
+coordination from PI decisions:
+
+```yaml
+session_map:
+  pi: team-PI
+  pm: team-PM
+  strategist: team-Strategy
+workflow_role: pm
+mention_map:
+  PI: pi
+  PM: pm
+```
+
+With this mode enabled, the PM receives new-PR and Draft-to-Ready events,
+Review coordination, unresolved ownership, merged/unmapped receipts, Milestone
+updates, and copies of Issue lifecycle changes. Project owners still receive
+their own execution events, including the initial `Ready` goal. Explicit
+`[TO: PI]` directives continue to reach PI directly. If `workflow_role` is
+omitted, operational events continue to use `pi` for backward compatibility.
 
 ## Development
 

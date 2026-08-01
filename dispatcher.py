@@ -59,6 +59,12 @@ def validate_repo_config(repo_name, cfg):
            for role, session in session_map.items()):
         raise ValueError("repo '%s' session_map entries must be non-empty strings" % repo_name)
 
+    workflow_role = cfg.get("workflow_role", "pi")
+    if not isinstance(workflow_role, str) or workflow_role not in session_map:
+        raise ValueError(
+            "repo '%s' workflow_role is not in session_map" % repo_name
+        )
+
     projects = cfg.get("projects", [])
     if not isinstance(projects, list):
         raise ValueError("repo '%s' projects must be a list" % repo_name)
@@ -115,6 +121,11 @@ def build_session_map(cfg):
     return sm, {v: k for k, v in sm.items()}
 
 
+def resolve_workflow_session(cfg, session_map):
+    """Resolve the operational coordinator while keeping PI as the default."""
+    return session_map.get(cfg.get("workflow_role", "pi"))
+
+
 def resolve_owner(proj_num, projects, sm):
     for p in projects:
         if p["number"] == proj_num:
@@ -168,6 +179,54 @@ def queue_goal(output, session, message):
     if not session:
         return
     output.setdefault("_pending", {}).setdefault(session, []).append(message)
+
+
+def queue_workflow_issue_transition(
+    cfg,
+    session_map,
+    state_key,
+    issue_num,
+    title,
+    previous_status,
+    current_status,
+    url,
+    primary_session,
+    output,
+):
+    """Give an explicitly configured PM visibility into Issue lifecycle work."""
+    if "workflow_role" not in cfg:
+        return
+    workflow_session = resolve_workflow_session(cfg, session_map)
+    if not workflow_session or workflow_session == primary_session:
+        return
+
+    guidance = {
+        "Ready": "Verify executor delivery; advance lifecycle only after /goal + Enter succeeds.",
+        "In Progress": "Track execution and follow up if progress stalls.",
+        "Blocked": "Coordinate blocker, graph, or requested-change resolution.",
+        "Review": "Coordinate validation, PI business review when needed, merge, and Issue closure.",
+        "Waiting": "Track the external condition and restore Ready only when it clears.",
+        "Done": "Verify terminal evidence, native graph state, Project status, and Issue closure.",
+        "Cancelled": "Verify cancellation reason and terminal cleanup.",
+    }.get(current_status, "Review the lifecycle transition and coordinate the next action.")
+    message = format_goal(
+        "PM coordination: Issue #%d -> %s — %s"
+        % (issue_num, current_status, title),
+        "Project Status changed from %s to %s.\n%s\n\n"
+        "Do not make PI business decisions; escalate them explicitly to PI."
+        % (previous_status, current_status, guidance),
+        url,
+    )
+    queue_goal(output, workflow_session, message)
+    output["actions"].append({
+        "node": "workflow:%s" % state_key,
+        "state": current_status,
+        "session": workflow_session,
+        "reason": "issue_status_coordinator",
+        "prev_status": previous_status,
+        "sent": message[:80],
+        "result": "queued",
+    })
 
 
 def load_state(state_file):
@@ -400,7 +459,7 @@ def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
                 url = "https://github.com/%s/pull/%d" % (repo, pr["number"])
                 message = format_goal(
                     title="PR #%d needs changes — Issue #%d" % (pr["number"], issue_num),
-                    body="PR #%d (%s) has CHANGES_REQUESTED by PI. Please address the findings."
+                    body="PR #%d (%s) has CHANGES_REQUESTED. Please address the findings."
                          % (pr["number"], pr["title"]),
                     url=url,
                 )
@@ -488,6 +547,7 @@ def main():
     repo = cfg["repo"]
     projects = cfg.get("projects", [])
     sm, _ = build_session_map(cfg)
+    coordinator_session = resolve_workflow_session(cfg, sm)
     assignee_map = cfg.get("assignee_map", {})
     mention_map = build_mention_map(cfg, sm)
     safe_repo_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", args.repo)
@@ -549,10 +609,10 @@ def main():
             # PRs on project board — only Review status matters
             if item.get("is_pr"):
                 if cur_s == "Review":
-                    session = sm.get("pi")
+                    session = coordinator_session
                     if session:
                         msg = format_goal("PR #%d is in REVIEW — %s" % (issue_num, title),
-                                          "Project: %s\nPlease review and merge." % item.get("project_name", str(pn)), url)
+                                          "Project: %s\nCoordinate review and merge; request PI business review when required." % item.get("project_name", str(pn)), url)
                         reason = "pr_review_ready"
                         queue_goal(output, session, msg)
                         output["actions"].append({"node": sk, "state": cur_s, "session": session, "reason": reason,
@@ -610,11 +670,12 @@ def main():
                                 )
                                 reason = "review_pr_changes"
                         else:
-                            session = sm.get("pi")
+                            session = coordinator_session
                             msg = format_goal(
-                                "Issue #%d in Review — PR #%d awaiting PI"
+                                "Issue #%d in Review — PR #%d awaiting coordination"
                                 % (issue_num, linked_pr["number"]),
-                                "PR #%d (%s) by @%s is ready.\nReview: %s"
+                                "PR #%d (%s) by @%s is ready.\nReview: %s\n"
+                                "Coordinate validation, PI business review when needed, merge, and closure."
                                 % (
                                     linked_pr["number"],
                                     linked_pr["title"],
@@ -647,6 +708,19 @@ def main():
                 queue_goal(output, session, msg)
                 output["actions"].append({"node": sk, "state": cur_s, "session": session, "reason": reason,
                                           "prev_status": prev_s, "sent": msg[:80], "result": "queued"})
+
+            queue_workflow_issue_transition(
+                cfg,
+                sm,
+                sk,
+                issue_num,
+                title,
+                prev_s,
+                cur_s,
+                url,
+                session,
+                output,
+            )
 
             # Notify graph stakeholders
             notify_graph_stakeholders(
@@ -723,25 +797,23 @@ def main():
                 author = pr["author"]["login"]
                 is_draft = pr.get("isDraft", False)
 
-                # 0. Draft->Ready transition -> PI
+                # 0. Draft->Ready transition -> workflow coordinator
                 dk = "prdraft:%d" % pn
                 was_draft = prev_state.get(dk)
                 if was_draft is True and not is_draft:
                     msg = format_goal("PR #%d is now READY FOR REVIEW — %s" % (pn, pr["title"]),
                                       "Author: @%s\nThe PR was moved from Draft to Ready.\nBranch: %s" % (author, pr.get("headRefName", "")), pu)
-                    pi_session = sm.get("pi")
-                    queue_goal(output, pi_session, msg)
-                    output["actions"].append({"node": dk, "state": "ready", "session": sm.get("pi"),
+                    queue_goal(output, coordinator_session, msg)
+                    output["actions"].append({"node": dk, "state": "ready", "session": coordinator_session,
                                               "reason": "pr_draft_ready", "sent": msg[:80], "result": "queued"})
                 new_state[dk] = is_draft
 
-                # 3a. New PR -> PI
+                # 3a. New PR -> workflow coordinator
                 if prev_state.get(pk) != "open":
                     msg = format_goal("New PR #%d: %s by @%s" % (pn, pr["title"], author),
                                       "Status: %s\nBranch: %s" % (pr.get("mergeStateStatus", "unknown"), pr["headRefName"]), pu)
-                    pi_session = sm.get("pi")
-                    queue_goal(output, pi_session, msg)
-                    output["actions"].append({"node": pk, "state": "open", "session": sm.get("pi"), "reason": "new_pr",
+                    queue_goal(output, coordinator_session, msg)
+                    output["actions"].append({"node": pk, "state": "open", "session": coordinator_session, "reason": "new_pr",
                                               "sent": msg[:80], "result": "queued"})
                     new_state[pk] = "open"
 
@@ -768,7 +840,7 @@ def main():
                                 elif decision == "CHANGES_REQUESTED":
                                     reason = "pr_changes_requested"
                                     t = "PR #%d has **CHANGES REQUESTED** — %s" % (pn, pr["title"])
-                                    b = "PI has requested changes. Please address findings."
+                                    b = "A reviewer has requested changes. Please address findings."
                                 else:
                                     reason = "pr_review_changed"
                                     t = "PR #%d review updated — %s" % (pn, pr["title"])
@@ -780,9 +852,8 @@ def main():
                             else:
                                 msg = format_goal("PR #%d review: %s — unresolved owner" % (pn, decision),
                                                   "Linked Issue Project ownership could not be resolved; author is @%s." % author, pu)
-                                pi_session = sm.get("pi")
-                                queue_goal(output, pi_session, msg)
-                                output["actions"].append({"node": rk, "state": decision, "session": sm.get("pi"),
+                                queue_goal(output, coordinator_session, msg)
+                                output["actions"].append({"node": rk, "state": decision, "session": coordinator_session,
                                                           "reason": "pr_unclear_owner", "sent": msg[:80], "result": "queued"})
 
                         if decision:
@@ -825,9 +896,8 @@ def main():
                             else:
                                 msg = format_goal("PR #%d was merged — unclear who to notify" % pn,
                                                   "PR by @%s was merged but @%s is not mapped." % (author, author), pu)
-                                pi_session = sm.get("pi")
-                                queue_goal(output, pi_session, msg)
-                                output["actions"].append({"node": mk, "state": "merged", "session": sm.get("pi"),
+                                queue_goal(output, coordinator_session, msg)
+                                output["actions"].append({"node": mk, "state": "merged", "session": coordinator_session,
                                                           "reason": "pr_merged_unmapped_recent", "sent": msg[:80], "result": "queued"})
             except Exception:
                 pass
@@ -854,7 +924,7 @@ def main():
                                 if asession and prev_state.get(key) != "merged":
                                     pu = "https://github.com/%s/pull/%d" % (repo, pn)
                                     msg = format_goal("PR #%d has been **MERGED**! — %s" % (pn, info.get("title", "")),
-                                                      "Your PR was merged by PI.\nMerged at: %s" % info.get("mergedAt", "unknown"), pu)
+                                                      "Your PR was merged.\nMerged at: %s" % info.get("mergedAt", "unknown"), pu)
                                     queue_goal(output, asession, msg)
                                     output["actions"].append({"node": key, "state": "merged", "session": asession,
                                                               "reason": "pr_merged", "sent": msg[:80], "result": "queued"})
@@ -862,9 +932,8 @@ def main():
                                     pu = "https://github.com/%s/pull/%d" % (repo, pn)
                                     msg = format_goal("PR #%d was merged — unclear who to notify" % pn,
                                                       "PR by @%s was merged but @%s is not mapped." % (author, author), pu)
-                                    pi_session = sm.get("pi")
-                                    queue_goal(output, pi_session, msg)
-                                    output["actions"].append({"node": key, "state": "merged", "session": sm.get("pi"),
+                                    queue_goal(output, coordinator_session, msg)
+                                    output["actions"].append({"node": key, "state": "merged", "session": coordinator_session,
                                                               "reason": "pr_merged_unmapped", "sent": msg[:80], "result": "queued"})
                     except Exception:
                         pass
@@ -952,8 +1021,7 @@ def main():
                         overdue = "%d days left" % int(days_left)
 
                 if prev.get("progress") != progress or (overdue and prev.get("overdue") != overdue):
-                    pi_session = sm.get("pi")
-                    if pi_session:
+                    if coordinator_session:
                         body = "Progress: %s/%s complete\n" % (ms_data["done"], ms_data["total"])
                         if overdue:
                             body += "Deadline: %s\n" % overdue
@@ -962,8 +1030,8 @@ def main():
                             if len(ms_data["issues"]) > 5:
                                 body += " … (+%d more)" % (len(ms_data["issues"]) - 5)
                         msg = format_goal("Milestone %s — %s" % (ms_name, progress), body, "https://github.com/%s/milestones" % repo)
-                        queue_goal(output, pi_session, msg)
-                        output["actions"].append({"node": mk, "state": progress, "session": pi_session,
+                        queue_goal(output, coordinator_session, msg)
+                        output["actions"].append({"node": mk, "state": progress, "session": coordinator_session,
                                                   "reason": "milestone_update", "sent": msg[:80], "result": "queued"})
                 new_state[mk] = {"progress": progress, "overdue": overdue}
     except Exception as e:

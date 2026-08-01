@@ -9,8 +9,12 @@ the scheduler owns cadence and `no_agent` execution.
 
 ## Roles
 
-- **PI** owns routing policy, Issue Graph relationships, final review, merges,
-  and deployment decisions.
+- **PI** owns routing policy, business and research decisions, final domain
+  acceptance, and deployment authorization.
+- **PM**, when configured through `workflow_role`, owns operational
+  coordination: lifecycle tracking, dependency follow-up, review scheduling,
+  merge/closure follow-up, and dispatcher exception handling. PM escalates
+  business decisions to PI and does not decide them independently.
 - **Executors** may implement changes through Issues and PRs but must not
   silently redefine routing policy or deploy a new runtime.
 - The dispatcher is execution-only. It reports and routes configured state; it
