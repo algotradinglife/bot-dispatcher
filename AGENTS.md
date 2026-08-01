@@ -2,39 +2,55 @@
 
 ## Repository purpose
 
-This repo contains the generic **bot-dispatcher**: a config-driven daemon that
-routes GitHub events (Issue Graph changes, Project Status changes, `[TO: ...]`
-comments, PR events, milestone progress) to agent-deck sessions, one message
-per session per tick.
+This repository contains a generic, configuration-driven dispatcher that
+routes GitHub Issue Graph, Project Status, pull-request, comment, and milestone
+events to agent-deck sessions. The engine performs one polling tick per process;
+the scheduler owns cadence and `no_agent` execution.
 
 ## Roles
 
-- **PI** owns: issue contracts, graph edges, routing decisions, final review,
-  PR merges, and deployment decisions (which version runs in cron).
-- **Executors** (Engineer/Strategy/Data sessions) may propose changes via
-  Issues/PRs but must not silently redefine routing rules or deploy.
-- The dispatcher itself is **execution-only** — it never decides policy.
+- **PI** owns routing policy, Issue Graph relationships, final review, merges,
+  and deployment decisions.
+- **Executors** may implement changes through Issues and PRs but must not
+  silently redefine routing policy or deploy a new runtime.
+- The dispatcher is execution-only. It reports and routes configured state; it
+  does not invent dependency or lifecycle relationships.
 
 ## Control plane
 
-- GitHub Issue Graph (`blockedBy`/`blocking`/`parent`/`subIssues`/`issueType`)
-  is the source of truth for dependencies and lifecycle.
-- GitHub Project membership determines functional ownership (Project → Owner Role).
-- `dispatcher.yaml` is the single config; repo-specific overrides belong there.
+- Native GitHub Issue Graph fields (`blockedBy`, `blocking`, `parent`,
+  `subIssues`, and `issueType`) are authoritative for dependencies and
+  decomposition.
+- GitHub Project membership determines functional ownership.
+- The local runtime YAML determines how Project owners and explicit mentions map
+  to agent-deck sessions.
+- If required GitHub state cannot be read, lifecycle routing fails closed.
+
+## Configuration policy
+
+- `dispatcher.example.yaml` is the only tracked configuration and must contain
+  placeholders only.
+- Live `dispatcher.yaml`, tokens, personal identities, session inventories,
+  machine paths, and state files must never be committed.
+- Repository-specific wrapper scripts are not accepted. Schedulers invoke the
+  generic CLI with a repository key.
 
 ## Change workflow
 
-1. Open an Issue describing the change (routing rule, new repo, bug).
-2. Executor implements in a branch/PR referencing the Issue.
-3. PI reviews and merges (only PI merges).
-4. PI authorizes deployment; cron must run the reviewed repository checkout directly.
+1. Open an Issue describing the behavior or routing change.
+2. Implement on a branch and add tests for reusable behavior.
+3. Open a draft PR referencing the Issue.
+4. PI reviews and merges.
+5. PI separately authorizes deployment of the merged version.
 
 ## Ground rules
 
-- Never commit GitHub tokens, session configs, or `~/.hermes` internals.
-- Keep `dispatcher.yaml` free of secrets; session names are not secrets.
-- Do not maintain a copied runtime implementation. Cron points to the reviewed
-  repository checkout so deployed code has one source of truth.
-- Do not start Hermes or another reasoning agent from cron. The job is a
-  no-agent observer and notification transport only.
-- When GitHub is unreadable, fail closed (report) — never fabricate state.
+- Preserve one digest per session per tick without dropping queued events.
+- Preserve at-least-once delivery: failed delivery keeps the previous state for
+  retry.
+- Dry-run must not send messages or write state.
+- Do not maintain copied runtime code. Schedulers point to a reviewed checkout.
+- Do not start a reasoning agent from cron; the job is a `no_agent` observer and
+  notification transport only.
+- Keep the deployed runtime unchanged unless deployment is explicitly
+  authorized.

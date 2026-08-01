@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Generic Research OS Dispatcher — no_agent, read-only.
-Reads repo-local dispatcher.yaml unless BOT_DISPATCHER_CONFIG is set.
-Usage: dispatcher.py --repo <repo_name>
+Config-driven GitHub dispatcher for no-agent polling jobs.
+Reads repository routing from a local YAML file.
+Usage: dispatcher.py --repo <repo_key> [--config <path>]
 
 Routes based on GitHub Issue Graph (blockedBy/blocking/parent/subIssues)
 and GitHub Project Status. Sends one /goal per session per tick.
@@ -24,12 +24,20 @@ except ImportError:
     print("ERROR: PyYAML required. pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-REPO_ROOT = Path(__file__).resolve().parent
-CONFIG_FILE = Path(os.environ.get("BOT_DISPATCHER_CONFIG", REPO_ROOT / "dispatcher.yaml"))
-STATE_DIR = Path(os.environ.get(
+DEFAULT_CONFIG_HOME = Path(os.environ.get(
+    "XDG_CONFIG_HOME", Path.home() / ".config"
+)).expanduser()
+DEFAULT_STATE_HOME = Path(os.environ.get(
+    "XDG_STATE_HOME", Path.home() / ".local" / "state"
+)).expanduser()
+DEFAULT_CONFIG_FILE = Path(os.environ.get(
+    "BOT_DISPATCHER_CONFIG",
+    DEFAULT_CONFIG_HOME / "bot-dispatcher" / "dispatcher.yaml",
+)).expanduser()
+DEFAULT_STATE_DIR = Path(os.environ.get(
     "BOT_DISPATCHER_STATE_DIR",
-    Path.home() / ".local" / "state" / "bot-dispatcher",
-))
+    DEFAULT_STATE_HOME / "bot-dispatcher",
+)).expanduser()
 GRAPH_PAGE_SIZE = 100
 
 
@@ -37,19 +45,69 @@ class ControlPlaneUnavailable(RuntimeError):
     """Raised when GitHub cannot provide authoritative routing state."""
 
 
+def validate_repo_config(repo_name, cfg):
+    if not isinstance(cfg, dict):
+        raise ValueError("repo '%s' config must be a mapping" % repo_name)
+    repo = cfg.get("repo")
+    if not isinstance(repo, str) or not re.fullmatch(r"[^/\s]+/[^/\s]+", repo):
+        raise ValueError("repo '%s' must set repo: owner/name" % repo_name)
 
-def load_config(repo_name):
-    if not CONFIG_FILE.exists():
-        print("ERROR: config not found at %s" % CONFIG_FILE, file=sys.stderr)
-        sys.exit(1)
-    raw = yaml.safe_load(CONFIG_FILE.read_text())
+    session_map = cfg.get("session_map")
+    if not isinstance(session_map, dict) or not session_map.get("pi"):
+        raise ValueError("repo '%s' must map the pi session" % repo_name)
+    if any(not isinstance(role, str) or not isinstance(session, str) or not session
+           for role, session in session_map.items()):
+        raise ValueError("repo '%s' session_map entries must be non-empty strings" % repo_name)
+
+    projects = cfg.get("projects", [])
+    if not isinstance(projects, list):
+        raise ValueError("repo '%s' projects must be a list" % repo_name)
+    project_numbers = set()
+    for project in projects:
+        if not isinstance(project, dict):
+            raise ValueError("repo '%s' project entries must be mappings" % repo_name)
+        number = project.get("number")
+        node = project.get("node")
+        owner = project.get("owner")
+        if (not isinstance(number, int) or isinstance(number, bool)
+                or number < 1 or number in project_numbers):
+            raise ValueError("repo '%s' project numbers must be unique positive integers" % repo_name)
+        if not isinstance(node, str) or not node:
+            raise ValueError("repo '%s' project %s must set a node ID" % (repo_name, number))
+        if owner not in session_map:
+            raise ValueError("repo '%s' project %s owner is not in session_map" % (repo_name, number))
+        project_numbers.add(number)
+
+    for map_name in ("assignee_map", "mention_map"):
+        role_map = cfg.get(map_name, {})
+        if not isinstance(role_map, dict):
+            raise ValueError("repo '%s' %s must be a mapping" % (repo_name, map_name))
+        unknown_roles = sorted({role for role in role_map.values() if role not in session_map})
+        if unknown_roles:
+            raise ValueError("repo '%s' %s references unknown roles: %s" % (
+                repo_name, map_name, ", ".join(unknown_roles)))
+
+
+def load_config(repo_name, config_file=DEFAULT_CONFIG_FILE):
+    config_file = Path(config_file).expanduser()
+    if not config_file.exists():
+        raise ValueError("config not found at %s" % config_file)
+    raw = yaml.safe_load(config_file.read_text()) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("config root must be a mapping")
     repos = raw.get("repos", {})
+    if not isinstance(repos, dict):
+        raise ValueError("config 'repos' must be a mapping")
     cfg = repos.get(repo_name)
     if not cfg:
-        print("ERROR: repo '%s' not in config. Available: %s" % (
-            repo_name, ", ".join(repos.keys())), file=sys.stderr)
-        sys.exit(1)
+        raise ValueError("repo '%s' not in config. Available: %s" % (
+            repo_name, ", ".join(sorted(repos.keys()))))
+    validate_repo_config(repo_name, cfg)
     return cfg
+
+
+def project_state_key(project_number, item_number, field="status"):
+    return "project:%d:%d:%s" % (project_number, item_number, field)
 
 
 def build_session_map(cfg):
@@ -93,7 +151,7 @@ def parse_to_directive(body, mention_map):
         s = line.strip()
         if s.startswith('>') or not s:
             continue
-        m = re.match(r'(?:@\S+\s+)?\[TO:\s*(\w+)\]', s, re.IGNORECASE)
+        m = re.match(r'(?:@\S+\s+)?\[TO:\s*([A-Za-z0-9_-]+)\]', s, re.IGNORECASE)
         if m:
             t = m.group(1)
             return t, resolve_target_to_session(t, mention_map)
@@ -213,8 +271,8 @@ def find_owner_for_issue(issue_num, proj_map, projects, sm):
     return None
 
 
-def notify_graph_stakeholders(repo, issue_num, title, cur_s, url, proj_map, projects, sm, output, prefix):
-    graph = get_issue_graph(repo, issue_num)
+def notify_graph_stakeholders(repo, issue_num, title, cur_s, url, graph,
+                              proj_map, projects, sm, output):
     related = set()
     if graph["parent"]:
         related.add(graph["parent"])
@@ -350,7 +408,7 @@ def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
     return None
 
 
-def flush_goals(output):
+def flush_goals(output, dry_run=False):
     """Send one digest per session while retaining every queued event."""
     pending = output.pop("_pending", {})
     all_success = True
@@ -358,16 +416,20 @@ def flush_goals(output):
         if isinstance(messages, str):
             messages = [messages]
         digest = "\n\n==============================\n\n".join(messages)
-        result = subprocess.run(
-            ["agent-deck", "session", "send", session, "--no-wait", digest],
-            capture_output=True, text=True, timeout=30,
-        )
-        success = result.returncode == 0
+        if dry_run:
+            success = True
+            outcome = "dry-run"
+        else:
+            result = subprocess.run(
+                ["agent-deck", "session", "send", session, "--no-wait", digest],
+                capture_output=True, text=True, timeout=30,
+            )
+            success = result.returncode == 0
+            outcome = "ok" if success else "FAILED: %s" % result.stderr.strip()[:160]
         all_success = all_success and success
-        outcome = "ok" if success else "FAILED: %s" % result.stderr.strip()[:160]
         output["actions"].append({
             "node": "goal:%s" % session,
-            "state": "sent" if success else "pending_retry",
+            "state": "dry_run" if dry_run else ("sent" if success else "pending_retry"),
             "session": session,
             "reason": "goal_digest",
             "event_count": len(messages),
@@ -378,18 +440,32 @@ def flush_goals(output):
 
 def main():
     parser = argparse.ArgumentParser(description="Generic repo dispatcher")
-    parser.add_argument("--repo", required=True, help="Repo name from dispatcher.yaml")
+    parser.add_argument("--repo", required=True, help="Repository key from the config file")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_FILE,
+                        help="YAML config path (default: %(default)s)")
+    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR,
+                        help="State directory (default: %(default)s)")
+    parser.add_argument("--validate-config", action="store_true",
+                        help="Validate the selected repository config and exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Scan once without sending messages or updating state")
     args = parser.parse_args()
 
-    cfg = load_config(args.repo)
+    try:
+        cfg = load_config(args.repo, args.config)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.validate_config:
+        print(json.dumps({"repo_key": args.repo, "repo": cfg["repo"], "valid": True}))
+        return
+
     repo = cfg["repo"]
-    org = cfg.get("org", "")
     projects = cfg.get("projects", [])
-    sm, rev_sm = build_session_map(cfg)
+    sm, _ = build_session_map(cfg)
     assignee_map = cfg.get("assignee_map", {})
     mention_map = build_mention_map(cfg, sm)
-
-    state_file = STATE_DIR / ("dispatcher_%s_state.json" % args.repo)
+    safe_repo_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", args.repo)
+    state_file = args.state_dir.expanduser() / ("dispatcher_%s_state.json" % safe_repo_key)
     prefix = "[%s]" % args.repo
 
     output = {"ts": time.time(), "actions": [], "warnings": [], "_pending": {}}
@@ -401,10 +477,19 @@ def main():
     # ── 1. Project Status changes ──
     try:
         proj_map, items = build_issue_proj_map(cfg)
+        issue_graphs = {
+            item["number"]: get_issue_graph(repo, item["number"])
+            for item in items
+            if not item.get("is_pr")
+            and prev_state.get(
+                project_state_key(item["project_num"], item["number"]),
+                "Inbox",
+            ) != item.get("status", "Inbox")
+        }
         for item in items:
             issue_num = item["number"]
             pn = item["project_num"]
-            sk = "bjproject:%d:%d:status" % (pn, issue_num)
+            sk = project_state_key(pn, issue_num)
             prev_s = prev_state.get(sk, "Inbox")
             cur_s = item.get("status", "Inbox")
 
@@ -538,7 +623,9 @@ def main():
                                           "prev_status": prev_s, "sent": msg[:80], "result": "queued"})
 
             # Notify graph stakeholders
-            notify_graph_stakeholders(repo, issue_num, title, cur_s, url, proj_map, projects, sm, output, prefix)
+            notify_graph_stakeholders(
+                repo, issue_num, title, cur_s, url, issue_graphs[issue_num],
+                proj_map, projects, sm, output)
 
             new_state[sk] = cur_s
 
@@ -664,7 +751,6 @@ def main():
                                 queue_goal(output, asession, msg)
                                 output["actions"].append({"node": rk, "state": decision, "session": asession, "reason": reason,
                                                           "sent": msg[:80], "result": "queued"})
-
                             else:
                                 msg = format_goal("PR #%d review: %s — unresolved owner" % (pn, decision),
                                                   "Linked Issue Project ownership could not be resolved; author is @%s." % author, pu)
@@ -735,26 +821,25 @@ def main():
                             if info.get("state") == "MERGED":
                                 new_state[key] = "merged"
                                 author = info.get("author", "")
-                                if author != "hh1985":
-                                    asession = resolve_pr_session(
-                                        {"author": {"login": author}, "body": info.get("body", "")},
-                                        proj_map, projects, sm, assignee_map,
-                                    )
-                                    if asession and prev_state.get(key) != "merged":
-                                        pu = "https://github.com/%s/pull/%d" % (repo, pn)
-                                        msg = format_goal("PR #%d has been **MERGED**! — %s" % (pn, info.get("title", "")),
-                                                          "Your PR was merged by PI.\nMerged at: %s" % info.get("mergedAt", "unknown"), pu)
-                                        queue_goal(output, asession, msg)
-                                        output["actions"].append({"node": key, "state": "merged", "session": asession,
-                                                                  "reason": "pr_merged", "sent": msg[:80], "result": "queued"})
-                                    elif not asession:
-                                        pu = "https://github.com/%s/pull/%d" % (repo, pn)
-                                        msg = format_goal("PR #%d was merged — unclear who to notify" % pn,
-                                                          "PR by @%s was merged but @%s is not mapped." % (author, author), pu)
-                                        pi_session = sm.get("pi")
-                                        queue_goal(output, pi_session, msg)
-                                        output["actions"].append({"node": key, "state": "merged", "session": sm.get("pi"),
-                                                                  "reason": "pr_merged_unmapped", "sent": msg[:80], "result": "queued"})
+                                asession = resolve_pr_session(
+                                    {"author": {"login": author}, "body": info.get("body", "")},
+                                    proj_map, projects, sm, assignee_map,
+                                )
+                                if asession and prev_state.get(key) != "merged":
+                                    pu = "https://github.com/%s/pull/%d" % (repo, pn)
+                                    msg = format_goal("PR #%d has been **MERGED**! — %s" % (pn, info.get("title", "")),
+                                                      "Your PR was merged by PI.\nMerged at: %s" % info.get("mergedAt", "unknown"), pu)
+                                    queue_goal(output, asession, msg)
+                                    output["actions"].append({"node": key, "state": "merged", "session": asession,
+                                                              "reason": "pr_merged", "sent": msg[:80], "result": "queued"})
+                                elif not asession:
+                                    pu = "https://github.com/%s/pull/%d" % (repo, pn)
+                                    msg = format_goal("PR #%d was merged — unclear who to notify" % pn,
+                                                      "PR by @%s was merged but @%s is not mapped." % (author, author), pu)
+                                    pi_session = sm.get("pi")
+                                    queue_goal(output, pi_session, msg)
+                                    output["actions"].append({"node": key, "state": "merged", "session": sm.get("pi"),
+                                                              "reason": "pr_merged_unmapped", "sent": msg[:80], "result": "queued"})
                     except Exception:
                         pass
     except Exception as e:
@@ -858,12 +943,14 @@ def main():
     except Exception as e:
         output["warnings"].append("%s milestone scan: %s" % (prefix, str(e)[:80]))
 
-    delivery_ok = flush_goals(output)
-    if delivery_ok:
-        save_state(state_file, new_state)
-    else:
-        output["warnings"].append("%s delivery failed; prior state retained for retry" % prefix)
-        save_state(state_file, prev_state)
+    delivery_ok = flush_goals(output, dry_run=args.dry_run)
+    if not args.dry_run:
+        if delivery_ok:
+            save_state(state_file, new_state)
+        else:
+            output["warnings"].append(
+                "%s delivery failed; prior state retained for retry" % prefix)
+            save_state(state_file, prev_state)
     print(json.dumps(output))
 
 
