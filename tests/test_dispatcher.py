@@ -93,6 +93,68 @@ def test_rejects_duplicate_project_number() -> None:
         MOD.validate_repo_config("sample", config)
 
 
+def test_workflow_session_defaults_to_pi() -> None:
+    config = valid_config()
+    assert MOD.resolve_workflow_session(config, config["session_map"]) == "sample-PI"
+
+
+def test_explicit_pm_workflow_session_is_resolved() -> None:
+    config = valid_config()
+    config["session_map"]["pm"] = "sample-PM"
+    config["workflow_role"] = "pm"
+    MOD.validate_repo_config("sample", config)
+    assert MOD.resolve_workflow_session(config, config["session_map"]) == "sample-PM"
+
+
+def test_rejects_unknown_workflow_role() -> None:
+    config = valid_config()
+    config["workflow_role"] = "pm"
+    with pytest.raises(ValueError, match="workflow_role is not in session_map"):
+        MOD.validate_repo_config("sample", config)
+
+
+def test_explicit_pm_receives_issue_lifecycle_copy() -> None:
+    config = valid_config()
+    config["session_map"]["pm"] = "sample-PM"
+    config["workflow_role"] = "pm"
+    output = {"actions": [], "_pending": {}}
+    MOD.queue_workflow_issue_transition(
+        config,
+        config["session_map"],
+        "project:1:42:status",
+        42,
+        "Test research",
+        "Ready",
+        "In Progress",
+        "https://example.test/issues/42",
+        "sample-Research",
+        output,
+    )
+    assert list(output["_pending"]) == ["sample-PM"]
+    assert output["_pending"]["sample-PM"][0].startswith(
+        "/goal PM coordination: Issue #42 -> In Progress"
+    )
+    assert output["actions"][0]["reason"] == "issue_status_coordinator"
+
+
+def test_implicit_pi_mode_does_not_add_lifecycle_copy() -> None:
+    config = valid_config()
+    output = {"actions": [], "_pending": {}}
+    MOD.queue_workflow_issue_transition(
+        config,
+        config["session_map"],
+        "project:1:42:status",
+        42,
+        "Test research",
+        "Ready",
+        "In Progress",
+        "https://example.test/issues/42",
+        "sample-Research",
+        output,
+    )
+    assert output == {"actions": [], "_pending": {}}
+
+
 def test_project_items_follow_all_cursor_pages() -> None:
     cfg = {"projects": [{"number": 2, "node": "PVT_test", "name": "Research"}]}
     pages = [
