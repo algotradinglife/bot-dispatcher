@@ -160,7 +160,7 @@ def parse_to_directive(body, mention_map):
 
 
 def format_goal(title, body, url):
-    return "%s\n\n%s\n\n---\n%s" % (title, body, url)
+    return "/goal %s\n\n%s\n\n---\n%s" % (title, body, url)
 
 
 def queue_goal(output, session, message):
@@ -408,6 +408,29 @@ def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
     return None
 
 
+def submit_session_enter(session):
+    """Submit a goal that agent-deck may have only pasted into the TUI."""
+    shown = subprocess.run(
+        ["agent-deck", "session", "show", session, "--json"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if shown.returncode != 0:
+        return False, "session lookup failed: %s" % shown.stderr.strip()[:120]
+    try:
+        tmux_session = json.loads(shown.stdout).get("tmux_session")
+    except (json.JSONDecodeError, AttributeError):
+        return False, "session lookup returned invalid JSON"
+    if not tmux_session:
+        return False, "session lookup returned no tmux_session"
+    submitted = subprocess.run(
+        ["tmux", "send-keys", "-t", tmux_session, "Enter"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if submitted.returncode != 0:
+        return False, "Enter submission failed: %s" % submitted.stderr.strip()[:120]
+    return True, "ok"
+
+
 def flush_goals(output, dry_run=False):
     """Send one digest per session while retaining every queued event."""
     pending = output.pop("_pending", {})
@@ -426,6 +449,9 @@ def flush_goals(output, dry_run=False):
             )
             success = result.returncode == 0
             outcome = "ok" if success else "FAILED: %s" % result.stderr.strip()[:160]
+            if success:
+                success, enter_outcome = submit_session_enter(session)
+                outcome = "ok + Enter" if success else "FAILED: %s" % enter_outcome
         all_success = all_success and success
         output["actions"].append({
             "node": "goal:%s" % session,
