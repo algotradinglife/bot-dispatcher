@@ -65,6 +65,25 @@ Alert on:
 The dispatcher does not modify native Project Status or Issue Graph
 relationships.
 
+## Ready and In Progress runbook
+
+For a newly authorized Issue, set the Project Status to `Ready`. The next tick
+should contain two related actions:
+
+- a Project action with `reason: issue_ready` and `result: queued`;
+- a session digest action with `result: ok + Enter`.
+
+Only after the second action succeeds should the PI or authorized
+control-plane operator set the Issue to `In Progress`. `In Progress` is an
+execution record, not an initial-dispatch trigger, and the dispatcher does not
+write it automatically.
+
+If an Issue was moved directly from planning to `In Progress`, do not delete or
+edit the dispatcher state file. Move the Issue to `Ready`, confirm a later tick
+reports `ok + Enter`, and then move it to `In Progress`. If delivery fails, keep
+the Issue in `Ready`; at-least-once state handling preserves the transition for
+retry.
+
 ## Rollback
 
 1. Disable the scheduled job.
