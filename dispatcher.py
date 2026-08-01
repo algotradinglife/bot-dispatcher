@@ -1033,9 +1033,12 @@ def main():
     try:
         mr = subprocess.run(["gh", "issue", "list", "--repo", repo, "--state", "open",
                              "--json", "number,title,milestone,projectItems",
-                             "--jq", ".[] | select(.milestone != null) | {n: .number, title: .title[0:50], ms: .milestone.title, ms_due: .milestone.dueOn, status: [.projectItems[] | .status.name][0]}"],
+                             "--jq", ".[] | {n: .number, title: .title[0:50], ms: (.milestone.title // null), ms_due: (.milestone.dueOn // null), status: ([.projectItems[] | .status.name] | first // \"Inbox\"), nproj: ([.projectItems[] | .title] | length)}"],
                             capture_output=True, text=True, timeout=15)
         if mr.returncode == 0:
+            # Coverage check: every open Issue must have a Project and a Milestone.
+            # Missing either means PI has not finished routing — flag it.
+            uncovered = []
             milestones = {}
             now = time.time()
             for line in mr.stdout.strip().split('\n'):
@@ -1045,6 +1048,16 @@ def main():
                     row = json.loads(line)
                 except Exception:
                     continue
+                n = row.get("n")
+                has_ms = bool(row.get("ms"))
+                has_proj = (row.get("nproj") or 0) > 0
+                if n is not None and (not has_ms or not has_proj):
+                    missing = []
+                    if not has_proj:
+                        missing.append("Project")
+                    if not has_ms:
+                        missing.append("Milestone")
+                    uncovered.append("#%d (missing %s)" % (n, " + ".join(missing)))
                 ms = row.get("ms", "")
                 if not ms:
                     continue
@@ -1087,6 +1100,13 @@ def main():
                         output["actions"].append({"node": mk, "state": progress, "session": coordinator_session,
                                                   "reason": "milestone_update", "sent": msg[:80], "result": "queued"})
                 new_state[mk] = {"progress": progress, "overdue": overdue}
+            if uncovered:
+                output["warnings"].append(
+                    "%s un-routed issues (missing Project and/or Milestone): %s" % (
+                        prefix, ", ".join(uncovered[:8])))
+                if len(uncovered) > 8:
+                    output["warnings"].append(
+                        "%s ... and %d more un-routed issues" % (prefix, len(uncovered) - 8))
     except Exception as e:
         output["warnings"].append("%s milestone scan: %s" % (prefix, str(e)[:80]))
 

@@ -16,6 +16,7 @@ PI 是每个项目的最终决策者和质量守门人。dispatcher 的所有路
 | **Issue 契约** | 定义/修改 Issue 的验收标准、scope、优先级 |
 | **Issue Graph** | 建立/修改 `blockedBy` / `blocking` / `parent` / `subIssues` 关系 |
 | **Project 路由** | 决定 Issue 进哪个 Project、Owner Role 归谁 |
+| **Project + Milestone 分配（强制）** | **每个 Issue 必须挂载到明确的 Project 和 Milestone**。Project 决定 owner 路由；Milestone 决定交付目标和 deadline。两者缺失的 Issue 视为未就绪，dispatcher 不路由，直到 PI 补齐 |
 | **最终 Review** | 执行验收 gate（fresh EV、证据完整性、契约符合性） |
 | **PR 合并权** | 唯一有权 merge PR 的角色 |
 | **Issue 关闭** | 唯一有权关闭 Issue 的角色 |
@@ -66,6 +67,20 @@ Worker 角色**方向不同、流程相同**。所有执行者遵循同一条职
 5. 响应   — 处理 PI review 意见（CHANGES_REQUESTED → 修改重推）
 6. 汇报   — 结果通过 [TO: PI] 评论汇报，附证据
 ```
+
+### 2.1a Engineering Validation（EV）由 worker 负责
+
+**EV 不是独立角色，而是 worker 的职责之一。** 每个 worker session 完成
+产出型任务后，必须执行独立的 Engineering Validation：
+
+- **执行者**：由产出方 **自己所在角色的 session** 派出独立验证（可 fork
+  一个独立 agent 实例做 fresh review），或由另一 worker session 交叉验证
+- **不需要独立的 reviewer/EV 角色**（不设专用 EV session）
+- **EV 内容**：在干净副本上重跑证据链（SHA 校验、receipt、fresh read-only
+  验证），确认产出可复现、无越权、scope 无膨胀
+- **EV 结果**：随产出一起通过 `[TO: PI]` 汇报，作为 PI 验收 gate 的输入
+- **交叉验证**：涉及资金/数据的敏感变更，建议另一 worker session 交叉
+  验证（如 Strategist 产出 → Engineer 验证数据，反之亦然）
 
 ### 2.2 角色方向差异
 
