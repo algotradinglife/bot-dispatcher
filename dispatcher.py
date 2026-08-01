@@ -512,15 +512,23 @@ def submit_session_enter(session):
     return True, "ok"
 
 
-def flush_goals(output, dry_run=False):
-    """Send one digest per session while retaining every queued event."""
+def flush_goals(output, dry_run=False, baseline=False):
+    """Send one digest per session while retaining every queued event.
+
+    baseline=True (first run): the digest is reported but never delivered —
+    a fresh repo joins from the moment of its first tick, historical events
+    are recorded as seen without replay.
+    """
     pending = output.pop("_pending", {})
     all_success = True
     for session, messages in pending.items():
         if isinstance(messages, str):
             messages = [messages]
         digest = "\n\n==============================\n\n".join(messages)
-        if dry_run:
+        if baseline:
+            success = True
+            outcome = "baseline-skipped"
+        elif dry_run:
             success = True
             outcome = "dry-run"
         else:
@@ -536,7 +544,7 @@ def flush_goals(output, dry_run=False):
         all_success = all_success and success
         output["actions"].append({
             "node": "goal:%s" % session,
-            "state": "dry_run" if dry_run else ("sent" if success else "pending_retry"),
+            "state": "dry_run" if dry_run else ("baseline" if baseline else ("sent" if success else "pending_retry")),
             "session": session,
             "reason": "goal_digest",
             "event_count": len(messages),
@@ -579,6 +587,9 @@ def main():
     output = {"ts": time.time(), "actions": [], "warnings": [], "_pending": {}}
     prev_state = load_state(state_file)
     new_state = dict(prev_state)
+    # First run (no state file): baseline only — never replay historical events.
+    # New repos join the dispatcher from the moment of first tick; backlog is dropped.
+    first_run = not state_file.exists()
     proj_map = {}
     control_plane_ok = False
 
@@ -801,7 +812,9 @@ def main():
                             ck = "comment:%d:%s:%s" % (num, cid, target.lower()) if target else ock
                             if prev_state.get(ock) or prev_state.get(ck):
                                 continue
-                            if not tsession:
+                            if first_run or not tsession:
+                                # Baseline mode (first run): remember the comment,
+                                # never replay historical directives.
                                 new_state[ck] = "seen"
                                 continue
                             bp = body.strip()[:200]
@@ -1000,7 +1013,8 @@ def main():
                 ck = "prcomment:%d:%s:%s" % (pn, cid, target.lower()) if target else ock
                 if prev_state.get(ock) or prev_state.get(ck):
                     continue
-                if not tsession:
+                if first_run or not tsession:
+                    # Baseline mode (first run): remember, never replay.
                     new_state[ck] = "seen"
                     continue
                 bp = body.strip()[:200]
@@ -1076,7 +1090,10 @@ def main():
     except Exception as e:
         output["warnings"].append("%s milestone scan: %s" % (prefix, str(e)[:80]))
 
-    delivery_ok = flush_goals(output, dry_run=args.dry_run)
+    delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run)
+    if first_run:
+        output["warnings"].append(
+            "%s first run: baseline recorded, historical events not replayed" % prefix)
     if not args.dry_run:
         if delivery_ok:
             save_state(state_file, new_state)

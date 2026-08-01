@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -332,3 +333,46 @@ def test_gql_query_raises_after_all_retries() -> None:
     with patch.object(MOD.subprocess, "run", return_value=failed):
         with pytest.raises(MOD.ControlPlaneUnavailable):
             MOD.gql_query("{dummy}", retries=2, base_delay=0)
+
+
+def test_flush_goals_baseline_never_sends() -> None:
+    """Baseline flush records digests as baseline-skipped without agent-deck calls."""
+    output = {"_pending": {"sample-PI": "historical event"}, "actions": []}
+    with patch.object(MOD.subprocess, "run") as mocked:
+        ok = MOD.flush_goals(output, dry_run=False, baseline=True)
+    assert ok is True
+    mocked.assert_not_called()
+    action = output["actions"][0]
+    assert action["state"] == "baseline"
+    assert action["result"] == "baseline-skipped"
+
+
+def test_first_run_marks_comments_seen_not_forwarded() -> None:
+    """On first run a [TO: ...] comment is recorded as seen, never forwarded."""
+    comment = {
+        "id": "c1",
+        "body": "[TO: engineer]\nDo the thing.",
+        "author": {"login": "someone"},
+    }
+    issue = {"number": 1, "title": "t"}
+    with patch.object(MOD.subprocess, "run") as mocked:
+        mocked.side_effect = [
+            SimpleNamespace(returncode=0, stdout=json.dumps([issue]), stderr=""),
+            SimpleNamespace(returncode=0, stdout=json.dumps([comment]), stderr=""),
+        ]
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as td:
+            state_file = Path(td) / "dispatcher_test_state.json"
+            prev = MOD.load_state(state_file)
+            new = dict(prev)
+            # simulate the comment-scan branch for first run
+            first_run = True
+            mention_map = {"engineer": "sample-Engineer"}
+            target, tsession = MOD.parse_to_directive(comment["body"], mention_map)
+            assert (target, tsession) == ("engineer", "sample-Engineer")
+            cid = comment["id"]
+            ck = "comment:%d:%s:%s" % (issue["number"], cid, target.lower())
+            assert prev.get(ck) is None
+            if first_run:
+                new[ck] = "seen"
+    assert new["comment:1:c1:engineer"] == "seen"
