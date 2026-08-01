@@ -39,13 +39,29 @@ and expose a warning rather than manufacture relationships.
 
 ### Project events
 
-- `Ready` -> Project owner.
+- `Ready` -> Project owner as the first-dispatch event. The delivered payload
+  starts with `/goal`; successful delivery also submits Enter.
+- `In Progress` -> no initial dispatch. This status records that execution has
+  already started.
 - `Blocked` with a linked PR requesting changes -> mapped PR author.
 - `Review` -> PI or mapped PR author, depending on the PR review state.
 - `Done` -> Project owner.
 - Related Graph nodes -> their Project owners.
 
 The dispatcher does not write Project Status or Graph relationships.
+
+Use this lifecycle order for new work:
+
+```text
+1. PI/control-plane owner writes all native graph and Project routing fields.
+2. PI/control-plane owner sets Status to Ready.
+3. Dispatcher sends /goal and submits Enter to the Project owner session.
+4. After the tick reports ok + Enter, the authorized owner sets In Progress.
+```
+
+Do not create work directly in `In Progress` when an initial dispatcher launch
+is required. Such a transition is observed and stored, but it is not routed as
+`issue_ready`.
 
 ### Pull requests
 

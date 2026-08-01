@@ -28,6 +28,26 @@ All events for one session are combined into one digest per scan. State is
 committed only after every digest is accepted; a failed delivery retains the
 previous state so the event can be retried.
 
+## Issue lifecycle: Ready vs In Progress
+
+`Ready` is the first-dispatch trigger for an Issue. When an Issue changes to
+`Ready`, the dispatcher sends the Project owner a message beginning with
+`/goal` and submits Enter to the resolved agent-deck tmux session. A successful
+tick reports the final digest delivery as `ok + Enter`.
+
+`In Progress` means execution has already begun. It is deliberately not a
+first-dispatch trigger. If an Issue is created or moved directly to
+`In Progress`, the dispatcher records that status but does not send the initial
+goal. The required lifecycle is:
+
+```text
+Inbox/planning -> Ready -> dispatcher: /goal + Enter -> In Progress
+```
+
+After successful `Ready` delivery, the PI or other authorized control-plane
+operator advances the Issue to `In Progress`. The dispatcher never performs
+that status mutation itself.
+
 ## Requirements
 
 - Python 3.10+
