@@ -139,6 +139,23 @@ def resolve_assignee_session(assignee_login, assignee_map, sm):
     return sm.get(role) if role else None
 
 
+def resolve_author_default_session(author_login, assignee_map, sm, owner_session):
+    """Author-identity fallback routing when a comment cannot be routed by an
+    explicit [TO:] directive or Project ownership:
+    - a message from the PI account (hh1985) defaults to the owner session
+      (the worker who owns the Issue/PR's Project);
+    - a message from a worker account (e.g. everything-bot-engineer) defaults
+      to the PI session.
+    Returns None when the author maps to neither role, so the caller can
+    fail loudly (warning) instead of silently dropping the message."""
+    role = assignee_map.get(author_login)
+    if role == "pi":
+        return owner_session
+    if role and role != "pi":
+        return sm.get("pi")
+    return None
+
+
 def build_mention_map(cfg, sm):
     mm = {}
     raw = cfg.get("mention_map", {})
@@ -804,6 +821,7 @@ def main():
         output["warnings"].append("%s control plane unavailable: %s" % (prefix, str(e)[:160]))
 
     # ── 2. Issue comments [TO: ...] fallback ──
+    warned_issue_comments = set()  # (issue, author) already warned this tick
     try:
         r = subprocess.run(["gh", "issue", "list", "--repo", repo, "--state", "open",
                             "--json", "number,title", "--jq", "."],
@@ -843,10 +861,37 @@ def main():
                                     num, proj_map, projects, sm
                                 )
                             if not tsession:
+                                # No explicit [TO:] target (or unresolvable) —
+                                # fall back to author identity: PI messages
+                                # default to the Issue's Project owner; worker
+                                # messages default to the PI session. Never
+                                # silently drop a routed author's message.
+                                owner = resolve_issue_worker_session(
+                                    num, proj_map, projects, sm
+                                )
+                                tsession = resolve_author_default_session(
+                                    author, assignee_map, sm, owner
+                                )
+                            if not tsession:
+                                # Truly unroutable (unknown author, no owner) —
+                                # record a warning instead of disappearing it.
                                 new_state[ck] = "seen"
+                                wkey = (num, author)
+                                if wkey not in warned_issue_comments:
+                                    warned_issue_comments.add(wkey)
+                                    why = ("[TO: %s] unresolvable" % target
+                                           if target else "no [TO:] directive")
+                                    output["warnings"].append(
+                                        "%s Issue #%d comment by @%s unroutable "
+                                        "(%s, no Project owner, author unmapped)"
+                                        % (prefix, num, author, why)
+                                    )
                                 continue
                             url = "https://github.com/%s/issues/%d" % (repo, num)
-                            msg = format_goal("[TO: %s] from @%s on Issue #%d — %s" % (target, author, num, title), url)
+                            if target:
+                                msg = format_goal("[TO: %s] from @%s on Issue #%d — %s" % (target, author, num, title), url)
+                            else:
+                                msg = format_notice("Comment by @%s on Issue #%d — %s" % (author, num, title), url)
                             queue_goal(output, tsession, msg)
                             new_state[ck] = "forwarded"
                             output["actions"].append({"node": ck, "state": "forwarded", "session": tsession, "reason": "to_directive",
@@ -1020,6 +1065,7 @@ def main():
         output["warnings"].append("%s PR scan: %s" % (prefix, str(e)[:80]))
 
     # ── 3d. PR comments [TO: ...] fallback ──
+    warned_pr_comments = set()  # (pr, author) already warned this tick
     try:
         for pr in prs:
             pn = pr["number"]
@@ -1053,10 +1099,35 @@ def main():
                         pr, proj_map, projects, sm
                     )
                 if not tsession:
+                    # No explicit [TO:] target (or unresolvable) — fall back
+                    # to author identity: PI messages default to the linked
+                    # Issue's Project owner; worker messages default to the
+                    # PI session. Never silently drop a routed author's
+                    # message.
+                    owner = resolve_worker_session(pr, proj_map, projects, sm)
+                    tsession = resolve_author_default_session(
+                        author, assignee_map, sm, owner
+                    )
+                if not tsession:
+                    # Truly unroutable (unknown author, no linked owner) —
+                    # record a warning instead of disappearing it.
                     new_state[ck] = "seen"
+                    wkey = (pn, author)
+                    if wkey not in warned_pr_comments:
+                        warned_pr_comments.add(wkey)
+                        why = ("[TO: %s] unresolvable" % target
+                               if target else "no [TO:] directive")
+                        output["warnings"].append(
+                            "%s PR #%d comment by @%s unroutable "
+                            "(%s, no linked owner, author unmapped)"
+                            % (prefix, pn, author, why)
+                        )
                     continue
                 url = "https://github.com/%s/pull/%d" % (repo, pn)
-                msg = format_goal("[TO: %s] from @%s on PR #%d — %s" % (target, author, pn, pr["title"]), url)
+                if target:
+                    msg = format_goal("[TO: %s] from @%s on PR #%d — %s" % (target, author, pn, pr["title"]), url)
+                else:
+                    msg = format_notice("Comment by @%s on PR #%d — %s" % (author, pn, pr["title"]), url)
                 queue_goal(output, tsession, msg)
                 new_state[ck] = "forwarded"
                 output["actions"].append({"node": ck, "state": "forwarded", "session": tsession, "reason": "to_directive_pr",

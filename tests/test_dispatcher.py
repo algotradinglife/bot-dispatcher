@@ -761,3 +761,203 @@ def test_issue_to_worker_routes_by_project_owner_integration() -> None:
         [a.get("reason") for a in payload.get("actions", [])])
     assert forwarded[0]["session"] == "sample-Strategy", forwarded[0]
     assert forwarded[0]["target"] == "Worker", forwarded[0]
+
+
+def test_author_default_pi_message_goes_to_owner() -> None:
+    """A plain comment from the PI account (no [TO:]) defaults to the Issue
+    Project owner session."""
+    sm = {"pi": "sample-PI", "strategist": "sample-Strategy"}
+    assignee_map = {"hh1985": "pi", "everything-bot-engineer": "engineer"}
+    s = MOD.resolve_author_default_session("hh1985", assignee_map, sm, "sample-Strategy")
+    assert s == "sample-Strategy"
+
+
+def test_author_default_worker_message_goes_to_pi() -> None:
+    """A plain comment from a worker account (no [TO:]) defaults to the PI
+    session."""
+    sm = {"pi": "sample-PI", "strategist": "sample-Strategy"}
+    assignee_map = {"hh1985": "pi", "everything-bot-engineer": "engineer"}
+    s = MOD.resolve_author_default_session("everything-bot-engineer", assignee_map, sm, "sample-Strategy")
+    assert s == "sample-PI"
+
+
+def test_author_default_unknown_author_fails_closed() -> None:
+    """An author mapped to neither PI nor a worker role returns None so the
+    caller can warn instead of silently dropping."""
+    sm = {"pi": "sample-PI"}
+    assignee_map = {"hh1985": "pi"}
+    s = MOD.resolve_author_default_session("random-user", assignee_map, sm, "sample-Strategy")
+    assert s is None
+
+
+def test_plain_pi_comment_routes_to_owner_and_unknown_warns() -> None:
+    """Full-tick: a plain PI comment (no [TO:]) on a Project-owned Issue is
+    routed to the owner session; a comment from an unmapped author produces
+    an unroutable warning instead of silent drop."""
+    import sys
+    import io
+    import contextlib
+    import yaml
+    from pathlib import Path
+
+    repo_cfg = {
+        "repo": "example-org/sample-research",
+        "projects": [
+            {"number": 2, "node": "PVT_EXAMPLE2", "name": "Prediction", "owner": "strategist"},
+        ],
+        "session_map": {"pi": "sample-PI", "strategist": "sample-Strategy", "engineer": "sample-Engineer"},
+        "assignee_map": {"hh1985": "pi", "everything-bot-engineer": "engineer"},
+        "mention_map": {"pi": "pi", "strategist": "strategist"},
+    }
+
+    def fake_run(cmd, **kwargs):
+        ok = SimpleNamespace(returncode=0, stderr="", stdout="")
+        if cmd[:2] == ["gh", "api"]:
+            ok.stdout = json.dumps({"data": {"node": {"items": {
+                "nodes": [{
+                    "id": "ITEM_133",
+                    "content": {"__typename": "Issue", "number": 133, "title": "diversified allocator"},
+                    "fieldValues": {"nodes": [{
+                        "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                        "name": "Inbox",
+                        "field": {"name": "Status"},
+                    }]},
+                }],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}}})
+            return ok
+        if cmd[:3] == ["gh", "issue", "list"]:
+            if "--json" in cmd and "milestone" in " ".join(cmd):
+                ok.stdout = ""
+            else:
+                ok.stdout = json.dumps([{"number": 133, "title": "diversified allocator"}])
+            return ok
+        if cmd[:3] == ["gh", "issue", "view"]:
+            ok.stdout = json.dumps([
+                {"id": "IC_133_PI", "author": {"login": "hh1985"},
+                 "body": "Proceeding with the settlement."},
+                {"id": "IC_133_UNK", "author": {"login": "ghost-user"},
+                 "body": "Can I help?"},
+            ])
+            return ok
+        if cmd[:3] == ["gh", "pr", "list"]:
+            ok.stdout = "[]"
+            return ok
+        if cmd[:3] == ["gh", "pr", "view"]:
+            ok.stdout = "{}"
+            return ok
+        ok.stdout = "{}"
+        return ok
+
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        cfg_file = Path(td) / "dispatcher.yaml"
+        cfg_file.write_text(yaml.safe_dump({"repos": {"sample": repo_cfg}}))
+        state_file = Path(td) / "dispatcher_sample_state.json"
+        state_file.write_text(json.dumps({}))
+
+        with contextlib.redirect_stdout(buf):
+            with patch.object(MOD.subprocess, "run", side_effect=fake_run):
+                with patch.object(sys, "argv", [
+                    "dispatcher.py", "--repo", "sample",
+                    "--config", str(cfg_file),
+                    "--state-dir", td, "--dry-run",
+                ]):
+                    MOD.main()
+    payload = json.loads(buf.getvalue())
+    forwards = [a for a in payload.get("actions", []) if a.get("reason") == "to_directive"]
+    assert len(forwards) == 1, "PI plain comment should forward once: %s" % forwards
+    assert forwards[0]["session"] == "sample-Strategy", forwards[0]
+    warns = payload.get("warnings", [])
+    assert any("unroutable" in w for w in warns), "unknown author should warn: %s" % warns
+
+
+def test_plain_worker_comment_on_pr_routes_to_pi() -> None:
+    """Full-tick: a plain comment (no [TO:]) from the worker bot on an open PR
+    defaults to the PI session via author-identity routing."""
+    import sys
+    import io
+    import contextlib
+    import yaml
+    from pathlib import Path
+
+    repo_cfg = {
+        "repo": "example-org/sample-research",
+        "projects": [
+            {"number": 2, "node": "PVT_EXAMPLE2", "name": "Prediction", "owner": "strategist"},
+        ],
+        "session_map": {"pi": "sample-PI", "strategist": "sample-Strategy", "engineer": "sample-Engineer"},
+        "assignee_map": {"hh1985": "pi", "everything-bot-engineer": "engineer"},
+        "mention_map": {"pi": "pi", "strategist": "strategist"},
+    }
+
+    def fake_run(cmd, **kwargs):
+        ok = SimpleNamespace(returncode=0, stderr="", stdout="")
+        if cmd[:2] == ["gh", "api"]:
+            ok.stdout = json.dumps({"data": {"node": {"items": {
+                "nodes": [{
+                    "id": "ITEM_133",
+                    "content": {"__typename": "Issue", "number": 133, "title": "diversified allocator"},
+                    "fieldValues": {"nodes": [{
+                        "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                        "name": "Inbox",
+                        "field": {"name": "Status"},
+                    }]},
+                }],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}}})
+            return ok
+        if cmd[:3] == ["gh", "issue", "list"]:
+            ok.stdout = ""
+            return ok
+        if cmd[:3] == ["gh", "pr", "list"] and "--state" in cmd:
+            idx = cmd.index("--state")
+            if cmd[idx + 1] == "open":
+                ok.stdout = json.dumps([{
+                    "number": 147, "title": "settle #133 Gate B",
+                    "headRefName": "strategy/bj133-gate-b",
+                    "author": {"login": "hh1985"},
+                    "createdAt": "2026-08-02T12:00:00Z",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Resolves #133",
+                    "isDraft": False,
+                }])
+            else:
+                ok.stdout = "[]"
+            return ok
+        if cmd[:3] == ["gh", "pr", "view"]:
+            view_jq = " ".join(cmd)
+            if "reviewDecision" in view_jq:
+                ok.stdout = ""
+            elif "comments" in view_jq:
+                ok.stdout = json.dumps([{
+                    "id": "IC_147_W", "author": {"login": "everything-bot-engineer"},
+                    "body": "Gate B package rebuilt with WR baseline.",
+                }])
+            else:
+                ok.stdout = "{}"
+            return ok
+        ok.stdout = "{}"
+        return ok
+
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        cfg_file = Path(td) / "dispatcher.yaml"
+        cfg_file.write_text(yaml.safe_dump({"repos": {"sample": repo_cfg}}))
+        state_file = Path(td) / "dispatcher_sample_state.json"
+        state_file.write_text(json.dumps({"pr:147": "open", "prdraft:147": False}))
+
+        with contextlib.redirect_stdout(buf):
+            with patch.object(MOD.subprocess, "run", side_effect=fake_run):
+                with patch.object(sys, "argv", [
+                    "dispatcher.py", "--repo", "sample",
+                    "--config", str(cfg_file),
+                    "--state-dir", td, "--dry-run",
+                ]):
+                    MOD.main()
+    payload = json.loads(buf.getvalue())
+    forwards = [a for a in payload.get("actions", [])
+                if a.get("reason") == "to_directive_pr"]
+    assert len(forwards) == 1, "worker plain comment should forward once: %s" % forwards
+    assert forwards[0]["session"] == "sample-PI", forwards[0]
+    assert not forwards[0].get("target"), forwards[0]  # no [TO:] — notice form
