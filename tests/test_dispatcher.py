@@ -224,6 +224,7 @@ def test_every_event_is_kept_in_one_session_digest() -> None:
     assert run.call_count == 3
     payload = run.call_args_list[0].args[0][-1]
     assert "first" in payload and "second" in payload
+    assert "\n\n" in payload  # compact separator, no heavy block
     assert run.call_args_list[2].args[0] == [
         "tmux", "send-keys", "-t", "agentdeck_sample", "Enter"
     ]
@@ -232,8 +233,14 @@ def test_every_event_is_kept_in_one_session_digest() -> None:
 
 
 def test_goal_messages_set_a_persistent_goal() -> None:
-    assert MOD.format_goal("Do work", "Details", "https://example.test/1").startswith(
-        "/goal Do work\n"
+    assert MOD.format_goal("Do work", "https://example.test/1") == (
+        "/goal Do work\nhttps://example.test/1"
+    )
+
+
+def test_notice_messages_do_not_set_a_goal() -> None:
+    assert MOD.format_notice("Work is done", "https://example.test/1") == (
+        "Work is done\nhttps://example.test/1"
     )
 
 
