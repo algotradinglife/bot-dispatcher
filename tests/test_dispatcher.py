@@ -961,3 +961,33 @@ def test_plain_worker_comment_on_pr_routes_to_pi() -> None:
     assert len(forwards) == 1, "worker plain comment should forward once: %s" % forwards
     assert forwards[0]["session"] == "sample-PI", forwards[0]
     assert not forwards[0].get("target"), forwards[0]  # no [TO:] — notice form
+
+
+def test_to_directive_with_label_prefix_resolves() -> None:
+    """[PI DEPENDENCY CLOSURE][TO: STRATEGY] — [TO:] preceded by a label on
+    the same line must still resolve (the bug that stalled paired-trading)."""
+    target, session = MOD.parse_to_directive(
+        "[PI DEPENDENCY CLOSURE][TO: STRATEGY]\nDependency #80 closed.",
+        {"strategist": "sample-Strategy", "strategy": "sample-Strategy"},
+    )
+    assert (target, session) == ("STRATEGY", "sample-Strategy")
+
+
+def test_to_directive_second_line_still_ignored() -> None:
+    """Directives on later lines are still not scanned (first content line
+    only), preserving the existing single-line contract."""
+    target, session = MOD.parse_to_directive(
+        "Ordinary sentence.\n[TO: PI] ignored directive",
+        {"pi": "sample-PI"},
+    )
+    assert (target, session) == (None, None)
+
+
+def test_inline_prose_to_reference_not_misread() -> None:
+    """A sentence that merely references [TO: ...] mid-line (not as a leading
+    directive) must not be treated as a routing instruction."""
+    target, session = MOD.parse_to_directive(
+        "See the [TO: PI] example in the docs.",
+        {"pi": "sample-PI"},
+    )
+    assert (target, session) == (None, None)
