@@ -680,3 +680,84 @@ def test_plain_comment_not_forwarded_with_fallback() -> None:
     if target and not tsession:
         tsession = MOD.resolve_worker_session(pr, proj_map, projects, sm)
     assert tsession is None
+
+
+def test_issue_to_worker_routes_by_project_owner_integration() -> None:
+    """Full-tick: an Issue comment [TO: Worker] with no mention_map alias
+    still reaches the Issue's Project owner session."""
+    import sys
+    import io
+    import contextlib
+    import yaml
+    from pathlib import Path
+
+    repo_cfg = {
+        "repo": "example-org/sample-research",
+        "projects": [
+            {"number": 2, "node": "PVT_EXAMPLE2", "name": "Prediction", "owner": "strategist"},
+        ],
+        "session_map": {"pi": "sample-PI", "strategist": "sample-Strategy"},
+        "assignee_map": {"hh1985": "pi", "worker-bot": "strategist"},
+        "mention_map": {"pi": "pi", "strategist": "strategist"},
+    }
+
+    def fake_run(cmd, **kwargs):
+        ok = SimpleNamespace(returncode=0, stderr="", stdout="")
+        if cmd[:2] == ["gh", "api"]:
+            ok.stdout = json.dumps({"data": {"node": {"items": {
+                "nodes": [{
+                    "id": "ITEM_133",
+                    "content": {"__typename": "Issue", "number": 133, "title": "diversified allocator"},
+                    "fieldValues": {"nodes": [{
+                        "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                        "name": "Inbox",
+                        "field": {"name": "Status"},
+                    }]},
+                }],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}}})
+            return ok
+        if cmd[:3] == ["gh", "issue", "list"]:
+            if "--json" in cmd and "milestone" in " ".join(cmd):
+                ok.stdout = ""
+            else:
+                ok.stdout = json.dumps([{"number": 133, "title": "diversified allocator"}])
+            return ok
+        if cmd[:3] == ["gh", "issue", "view"]:
+            ok.stdout = json.dumps([{
+                "id": "IC_133_C1",
+                "author": {"login": "hh1985"},
+                "body": "[TO: Worker][GATE B AUTHORIZED]\nProceed with Gate B.",
+            }])
+            return ok
+        if cmd[:3] == ["gh", "pr", "list"]:
+            ok.stdout = "[]"
+            return ok
+        if cmd[:3] == ["gh", "pr", "view"]:
+            ok.stdout = "{}"
+            return ok
+        ok.stdout = "{}"
+        return ok
+
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        cfg_file = Path(td) / "dispatcher.yaml"
+        cfg_file.write_text(yaml.safe_dump({"repos": {"sample": repo_cfg}}))
+        state_file = Path(td) / "dispatcher_sample_state.json"
+        state_file.write_text(json.dumps({}))
+
+        with contextlib.redirect_stdout(buf):
+            with patch.object(MOD.subprocess, "run", side_effect=fake_run):
+                with patch.object(sys, "argv", [
+                    "dispatcher.py", "--repo", "sample",
+                    "--config", str(cfg_file),
+                    "--state-dir", td, "--dry-run",
+                ]):
+                    MOD.main()
+    payload = json.loads(buf.getvalue())
+    forwarded = [a for a in payload.get("actions", [])
+                 if a.get("reason") == "to_directive"]
+    assert len(forwarded) == 1, "expected one issue [TO:] forward: %s" % (
+        [a.get("reason") for a in payload.get("actions", [])])
+    assert forwarded[0]["session"] == "sample-Strategy", forwarded[0]
+    assert forwarded[0]["target"] == "Worker", forwarded[0]

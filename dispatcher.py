@@ -483,6 +483,13 @@ def resolve_worker_session(pr, proj_map, projects, sm):
     return None
 
 
+def resolve_issue_worker_session(issue_num, proj_map, projects, sm):
+    """Resolve the assigned worker for an Issue strictly by its Project
+    ownership. Unrecognized [TO:] aliases on an Issue comment route to the
+    Project that owns the Issue; None if unmapped."""
+    return find_owner_for_issue(issue_num, proj_map, projects, sm)
+
+
 def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
     r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "open",
                         "--json", "number,title,author,reviewDecision,body",
@@ -823,9 +830,19 @@ def main():
                             ck = "comment:%d:%s:%s" % (num, cid, target.lower()) if target else ock
                             if prev_state.get(ock) or prev_state.get(ck):
                                 continue
-                            if first_run or not tsession:
+                            if first_run:
                                 # Baseline mode (first run): remember the comment,
                                 # never replay historical directives.
+                                new_state[ck] = "seen"
+                                continue
+                            if target and not tsession:
+                                # [TO: <alias>] not in mention_map (e.g. "Worker")
+                                # — the assigned worker is the Project that owns
+                                # this Issue.
+                                tsession = resolve_issue_worker_session(
+                                    num, proj_map, projects, sm
+                                )
+                            if not tsession:
                                 new_state[ck] = "seen"
                                 continue
                             url = "https://github.com/%s/issues/%d" % (repo, num)
