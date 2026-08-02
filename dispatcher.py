@@ -261,7 +261,7 @@ def save_state(state_file, state):
     state_file.write_text(json.dumps(state))
 
 
-def gql_query(query, retries=3, base_delay=1.0):
+def gql_query(query, retries=4, base_delay=1.0):
     """Run a GraphQL query with retry on transient failures (rate limit, network)."""
     last_err = None
     for attempt in range(retries):
@@ -284,7 +284,8 @@ def gql_query(query, retries=3, base_delay=1.0):
                         err_str = str(payload["errors"])
                         transient = any(k in err_str for k in (
                             "rate limit", "rate_limit", "abuse", "internal", "timeout",
-                            "connection", "Network error", "ETIMEDOUT", "503", "502",
+                            "connection", "Network error", "ETIMEDOUT", "EOF",
+                            "connection reset", "refused", "TLS", "503", "502",
                         ))
                         if not transient:
                             raise ControlPlaneUnavailable(
