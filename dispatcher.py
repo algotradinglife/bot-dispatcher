@@ -171,8 +171,13 @@ def parse_to_directive(body, mention_map):
 
 
 def format_goal(title, url):
-    """One-line reminder: action + link, no prose."""
+    """One-line task reminder: action + link, no prose. Sets the session goal."""
     return "/goal %s\n%s" % (title, url)
+
+
+def format_notice(title, url):
+    """One-line informational notice: action + link, no goal semantics."""
+    return "%s\n%s" % (title, url)
 
 
 def queue_goal(output, session, message):
@@ -475,6 +480,35 @@ def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
     return None
 
 
+def submit_session_enter(session):
+    """Submit a goal that agent-deck may have only pasted into the TUI.
+
+    Deliberate fallback: agent-deck `session send --no-wait` normally submits
+    the message itself, but on some sessions it only pastes into the input
+    buffer. The extra Enter guarantees delivery; without it, goals can sit
+    unsubmitted at the prompt.
+    """
+    shown = subprocess.run(
+        ["agent-deck", "session", "show", session, "--json"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if shown.returncode != 0:
+        return False, "session lookup failed: %s" % shown.stderr.strip()[:120]
+    try:
+        tmux_session = json.loads(shown.stdout).get("tmux_session")
+    except (json.JSONDecodeError, AttributeError):
+        return False, "session lookup returned invalid JSON"
+    if not tmux_session:
+        return False, "session lookup returned no tmux_session"
+    submitted = subprocess.run(
+        ["tmux", "send-keys", "-t", tmux_session, "Enter"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if submitted.returncode != 0:
+        return False, "Enter submission failed: %s" % submitted.stderr.strip()[:120]
+    return True, "ok"
+
+
 def flush_goals(output, dry_run=False, baseline=False):
     """Send one digest per session while retaining every queued event.
 
@@ -501,6 +535,9 @@ def flush_goals(output, dry_run=False, baseline=False):
             )
             success = result.returncode == 0
             outcome = "ok" if success else "FAILED: %s" % result.stderr.strip()[:160]
+            if success:
+                success, enter_outcome = submit_session_enter(session)
+                outcome = "ok + Enter" if success else "FAILED: %s" % enter_outcome
         all_success = all_success and success
         output["actions"].append({
             "node": "goal:%s" % session,
@@ -699,8 +736,8 @@ def main():
             elif cur_s == "Done":
                 session = owner
                 if session:
-                    msg = format_goal("Issue #%d is DONE — %s" % (issue_num, title),
-                                      url)
+                    msg = format_notice("Issue #%d is DONE — %s" % (issue_num, title),
+                                        url)
                     reason = "issue_done"
 
             if session and msg:
@@ -808,7 +845,7 @@ def main():
 
                 # 3a. New PR -> workflow coordinator
                 if prev_state.get(pk) != "open":
-                    msg = format_goal("New PR #%d: %s by @%s" % (pn, pr["title"], author),
+                    msg = format_notice("New PR #%d: %s by @%s" % (pn, pr["title"], author),
                                       pu)
                     queue_goal(output, coordinator_session, msg)
                     output["actions"].append({"node": pk, "state": "open", "session": coordinator_session, "reason": "new_pr",
@@ -840,7 +877,10 @@ def main():
                                 else:
                                     reason = "pr_review_changed"
                                     t = "PR #%d review updated — %s" % (pn, pr["title"])
-                                msg = format_goal(t, pu)
+                                if decision == "CHANGES_REQUESTED":
+                                    msg = format_goal(t, pu)  # action required
+                                else:
+                                    msg = format_notice(t, pu)  # informational
                                 queue_goal(output, asession, msg)
                                 output["actions"].append({"node": rk, "state": decision, "session": asession, "reason": reason,
                                                           "sent": msg[:80], "result": "queued"})
@@ -883,13 +923,13 @@ def main():
                             )
                             pu = "https://github.com/%s/pull/%d" % (repo, pn)
                             if asession:
-                                msg = format_goal("PR #%d has been **MERGED**! — %s" % (pn, mp.get("title", "")),
+                                msg = format_notice("PR #%d has been **MERGED**! — %s" % (pn, mp.get("title", "")),
                                                   pu)
                                 queue_goal(output, asession, msg)
                                 output["actions"].append({"node": mk, "state": "merged", "session": asession,
                                                           "reason": "pr_merged_recent", "sent": msg[:80], "result": "queued"})
                             else:
-                                msg = format_goal("PR #%d was merged — unclear who to notify" % pn,
+                                msg = format_notice("PR #%d was merged — unclear who to notify" % pn,
                                                   pu)
                                 queue_goal(output, coordinator_session, msg)
                                 output["actions"].append({"node": mk, "state": "merged", "session": coordinator_session,
@@ -918,14 +958,14 @@ def main():
                                 )
                                 if asession and prev_state.get(key) != "merged":
                                     pu = "https://github.com/%s/pull/%d" % (repo, pn)
-                                    msg = format_goal("PR #%d has been **MERGED**! — %s" % (pn, info.get("title", "")),
+                                    msg = format_notice("PR #%d has been **MERGED**! — %s" % (pn, info.get("title", "")),
                                                       pu)
                                     queue_goal(output, asession, msg)
                                     output["actions"].append({"node": key, "state": "merged", "session": asession,
                                                               "reason": "pr_merged", "sent": msg[:80], "result": "queued"})
                                 elif not asession and prev_state.get(key) != "merged":
                                     pu = "https://github.com/%s/pull/%d" % (repo, pn)
-                                    msg = format_goal("PR #%d was merged — unclear who to notify" % pn,
+                                    msg = format_notice("PR #%d was merged — unclear who to notify" % pn,
                                                       pu)
                                     queue_goal(output, coordinator_session, msg)
                                     output["actions"].append({"node": key, "state": "merged", "session": coordinator_session,
@@ -1028,7 +1068,7 @@ def main():
 
                 if prev.get("progress") != progress or (overdue and prev.get("overdue") != overdue):
                     if coordinator_session:
-                        msg = format_goal("Milestone %s — %s%s" % (ms_name, progress, " (%s)" % overdue if overdue else ""),
+                        msg = format_notice("Milestone %s — %s%s" % (ms_name, progress, " (%s)" % overdue if overdue else ""),
                                           "https://github.com/%s/milestones" % repo)
                         queue_goal(output, coordinator_session, msg)
                         output["actions"].append({"node": mk, "state": progress, "session": coordinator_session,

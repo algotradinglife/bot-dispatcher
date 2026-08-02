@@ -212,19 +212,35 @@ def test_every_event_is_kept_in_one_session_digest() -> None:
     MOD.queue_goal(output, "research", "first")
     MOD.queue_goal(output, "research", "second")
     completed = SimpleNamespace(returncode=0, stderr="", stdout="")
-    with patch.object(MOD.subprocess, "run", return_value=completed) as run:
+    shown = SimpleNamespace(
+        returncode=0,
+        stderr="",
+        stdout='{"tmux_session":"agentdeck_sample"}',
+    )
+    with patch.object(
+        MOD.subprocess, "run", side_effect=[completed, shown, completed]
+    ) as run:
         assert MOD.flush_goals(output) is True
-    assert run.call_count == 1
+    assert run.call_count == 3
     payload = run.call_args_list[0].args[0][-1]
     assert "first" in payload and "second" in payload
     assert "\n\n" in payload  # compact separator, no heavy block
+    assert run.call_args_list[2].args[0] == [
+        "tmux", "send-keys", "-t", "agentdeck_sample", "Enter"
+    ]
     assert output["actions"][-1]["event_count"] == 2
-    assert output["actions"][-1]["result"] == "ok"
+    assert output["actions"][-1]["result"] == "ok + Enter"
 
 
 def test_goal_messages_set_a_persistent_goal() -> None:
     assert MOD.format_goal("Do work", "https://example.test/1") == (
         "/goal Do work\nhttps://example.test/1"
+    )
+
+
+def test_notice_messages_do_not_set_a_goal() -> None:
+    assert MOD.format_notice("Work is done", "https://example.test/1") == (
+        "Work is done\nhttps://example.test/1"
     )
 
 
@@ -250,14 +266,21 @@ def test_delivery_failure_is_reported_for_retry() -> None:
 
 
 def test_enter_submission_failure_is_reported_for_retry() -> None:
-    """Delivery failure keeps the event pending for retry (no extra Enter)."""
     output = {"actions": [], "_pending": {}}
     MOD.queue_goal(output, "engineer", "work")
-    failed = SimpleNamespace(returncode=1, stderr="session busy", stdout="")
-    with patch.object(MOD.subprocess, "run", return_value=failed):
+    sent = SimpleNamespace(returncode=0, stderr="", stdout="")
+    shown = SimpleNamespace(
+        returncode=0,
+        stderr="",
+        stdout='{"tmux_session":"agentdeck_engineer"}',
+    )
+    enter_failed = SimpleNamespace(returncode=1, stderr="no tmux", stdout="")
+    with patch.object(
+        MOD.subprocess, "run", side_effect=[sent, shown, enter_failed]
+    ):
         assert MOD.flush_goals(output) is False
     assert output["actions"][-1]["state"] == "pending_retry"
-    assert "FAILED" in output["actions"][-1]["result"]
+    assert "Enter submission failed" in output["actions"][-1]["result"]
 
 
 def test_graphql_failure_never_becomes_empty_graph() -> None:
