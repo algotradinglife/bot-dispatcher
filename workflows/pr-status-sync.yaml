@@ -1,17 +1,19 @@
 name: Sync PR Status to Project
 
-# Automatically moves the linked Issue's Project Status based on PR lifecycle
-# using ONLY native GitHub mechanisms:
-#   - event: pull_request ready_for_review / converted_to_draft / closed
-#   - mapping: CrossReferencedEvent from the PR timeline (native cross-reference)
-#   - update: updateProjectV2ItemFieldValue (official GraphQL mutation)
+# Pure-native GitHub automation: PR lifecycle → linked Issue Project Status.
+#   - event:        pull_request ready_for_review / converted_to_draft / closed
+#   - mapping:      closingIssuesReferences (official keyword linkage: Closes/Fixes/Resolves)
+#   - update:       updateProjectV2ItemFieldValue (official GraphQL mutation)
+#   - auto-close:   native — merge with "Closes #N" closes the issue automatically
 #
 # Rules:
-#   ready_for_review    → linked issue(s) → Review  (PR waiting for PI review)
-#   converted_to_draft  → linked issue(s) → In Progress (work resumed)
-#   closed (merged)     → linked issue(s) → Done (PI merge completes the work)
+#   ready_for_review    → linked issue(s) → Review       (PR waiting for PI review)
+#   converted_to_draft  → linked issue(s) → In Progress  (work resumed)
+#   closed (merged)     → linked issue(s) → Done         (native auto-close + status)
 #
-# Infrastructure owned by Hermes ops; deployed per-repo.
+# PR convention: body MUST reference the target issue with an official keyword,
+# e.g. "Closes #137". Deployed per-repo; config lives in the PROJECTS map below.
+# Infrastructure owned by Hermes ops.
 
 on:
   pull_request:
@@ -20,6 +22,10 @@ on:
 jobs:
   sync-status:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     steps:
       - name: Update linked issue project status
         env:
@@ -35,72 +41,76 @@ jobs:
           pr_num = int(os.environ["PR_NUMBER"])
           event = os.environ["EVENT_TYPE"]
 
-          # Per-repo project + Status field mapping (native ProjectV2)
+          # Per-repo projects + Status fields (native ProjectV2 IDs).
+          # An issue may live in several projects; every one is updated.
           PROJECTS = {
-              "algotradinglife/beijing-lot": {
-                  "project": "PVT_kwDOCnDY5c4Bed79",
-                  "field": "PVTSSF_lADOCnDY5c4Bed79zhY37FA",
-                  "options": {
-                      "ready_for_review": "7e18371b",    # Review
-                      "converted_to_draft": "95cfdf69",  # In Progress
-                      "closed": "96923e69",              # Done
-                  },
-              },
+              "algotradinglife/beijing-lot": [
+                  # BJ Prediction & Betting
+                  {"project": "PVT_kwDOCnDY5c4Bed79",
+                   "field": "PVTSSF_lADOCnDY5c4Bed79zhY37FA",
+                   "options": {
+                       "ready_for_review": "7e18371b",    # Review
+                       "converted_to_draft": "95cfdf69",  # In Progress
+                       "closed": "96923e69",              # Done
+                   }},
+              ],
           }
           if repo not in PROJECTS:
               print(f"No project mapping for {repo}, skipping")
               raise SystemExit(0)
-          cfg = PROJECTS[repo]
-          if event not in cfg["options"]:
-              print(f"No status action for event {event}, skipping")
-              raise SystemExit(0)
-          option_id = cfg["options"][event]
+          projs = PROJECTS[repo]
 
-          def gql(q):
-              r = subprocess.run(["gh", "api", "graphql", "-f", f"query={q}"],
-                                 capture_output=True, text=True, timeout=30)
+          def gql(q, **vars):
+              args = ["gh", "api", "graphql", "-f", f"query={q}"]
+              for k, v in vars.items():
+                  if isinstance(v, int):
+                      # -F infers Int! correctly from bare numbers.
+                      args += ["-F", f"{k}={v}"]
+                  else:
+                      # -f passes strings verbatim; numeric-looking option IDs
+                      # (e.g. "96923e69" is alnum but keep strings as strings)
+                      args += ["-f", f"{k}={v}"]
+              r = subprocess.run(args, capture_output=True, text=True, timeout=30)
               if r.returncode != 0:
                   raise RuntimeError(f"GraphQL failed: {r.stderr[:300]}")
               return json.loads(r.stdout)
 
-          # Native mapping: CrossReferencedEvent in the PR timeline → linked issues
+          # Native mapping: closingIssuesReferences (keyword-linked issues)
           owner, name = repo.split("/")
           q = (
-              'query { repository(owner: %s, name: %s) { pullRequest(number: %d) {'
-              ' timelineItems(first: 30) { nodes { __typename'
-              ' ... on CrossReferencedEvent { source { __typename'
-              ' ... on Issue { number } } } } } } }'
-          ) % (json.dumps(owner), json.dumps(name), pr_num)
-          data = gql(q)
-          nodes = data["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
-          linked = [n["source"]["number"] for n in nodes
-                    if n.get("__typename") == "CrossReferencedEvent"
-                    and n.get("source", {}).get("__typename") == "Issue"]
+              'query($owner: String!, $name: String!, $pr: Int!) {'
+              ' repository(owner: $owner, name: $name) { pullRequest(number: $pr) {'
+              ' closingIssuesReferences(first: 10) { nodes { number } } } } }'
+          )
+          data = gql(q, owner=owner, name=name, pr=pr_num)
+          linked = [n["number"] for n in data["data"]["repository"]["pullRequest"]
+                    ["closingIssuesReferences"]["nodes"]]
           if not linked:
-              print(f"PR #{pr_num}: no cross-referenced issues found")
+              print(f"PR #{pr_num}: no keyword-linked issues (need 'Closes #N')")
               raise SystemExit(0)
           print(f"PR #{pr_num}: linked issues = {linked} (event={event})")
 
-          # Find project items and update status for each linked issue
-          q2 = ('query { node(id: %s) { ... on ProjectV2 { items(first: 100) {'
-                ' nodes { id content { ... on Issue { number } } } } } } }'
-                ) % json.dumps(cfg["project"])
-          data2 = gql(q2)
-          items = {i["content"]["number"]: i["id"]
-                   for i in data2["data"]["node"]["items"]["nodes"]
-                   if i.get("content") and i["content"].get("number") in linked}
-
-          for num in linked:
-              item_id = items.get(num)
-              if not item_id:
-                  print(f"  Issue #{num}: not in project, skipping")
+          for proj in projs:
+              if event not in proj["options"]:
                   continue
-              q3 = (
-                  'mutation { updateProjectV2ItemFieldValue(input: {'
-                  ' projectId: %s, itemId: %s, fieldId: %s,'
-                  ' value: {singleSelectOptionId: %s}}) { projectV2Item { id } } }'
-              ) % (json.dumps(cfg["project"]), json.dumps(item_id),
-                   json.dumps(cfg["field"]), json.dumps(option_id))
-              gql(q3)
-              print(f"  Issue #{num}: → status updated ({event})")
+              option_id = proj["options"][event]
+              q2 = ('query($p: ID!) { node(id: $p) { ... on ProjectV2 { items(first: 100) {'
+                    ' nodes { id content { ... on Issue { number } } } } } } }')
+              data2 = gql(q2, p=proj["project"])
+              items = {i["content"]["number"]: i["id"]
+                       for i in data2["data"]["node"]["items"]["nodes"]
+                       if i.get("content") and i["content"].get("number") in linked}
+              for num in linked:
+                  item_id = items.get(num)
+                  if not item_id:
+                      print(f"  Issue #{num}: not in {proj['project'][:20]}..., skipping")
+                      continue
+                  q3 = (
+                      'mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {'
+                      ' updateProjectV2ItemFieldValue(input: {'
+                      ' projectId: $p, itemId: $i, fieldId: $f,'
+                      ' value: {singleSelectOptionId: $o}}) { projectV2Item { id } } }'
+                  )
+                  gql(q3, p=proj["project"], i=item_id, f=proj["field"], o=option_id)
+                  print(f"  Issue #{num}: -> {event} status updated")
           EOF
