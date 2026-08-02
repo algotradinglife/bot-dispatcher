@@ -181,10 +181,17 @@ def format_notice(title, url):
 
 
 def queue_goal(output, session, message):
-    """Retain every event; one session digest is emitted per tick."""
+    """Retain every distinct event; one session digest is emitted per tick.
+
+    Dedupes identical messages within the same tick: two comments on the same
+    PR/issue with the same [TO:] target produce the same goal text, and
+    sending both would duplicate work in the session digest.
+    """
     if not session:
         return
-    output.setdefault("_pending", {}).setdefault(session, []).append(message)
+    pending = output.setdefault("_pending", {}).setdefault(session, [])
+    if message not in pending:
+        pending.append(message)
 
 
 def queue_workflow_issue_transition(
