@@ -232,6 +232,18 @@ def test_every_event_is_kept_in_one_session_digest() -> None:
     assert output["actions"][-1]["result"] == "ok + Enter"
 
 
+def test_duplicate_goal_messages_are_deduped_within_tick() -> None:
+    """Identical goals for the same session are sent once, not twice."""
+    output = {"actions": [], "_pending": {}}
+    dup = "/goal [TO: Strategist] from @hh1985 on PR #143 — settle"
+    MOD.queue_goal(output, "strategy", dup)
+    MOD.queue_goal(output, "strategy", dup)  # same text, same session
+    MOD.queue_goal(output, "strategy", "different")
+    pending = output["_pending"]["strategy"]
+    assert pending.count(dup) == 1
+    assert len(pending) == 2
+
+
 def test_goal_messages_set_a_persistent_goal() -> None:
     assert MOD.format_goal("Do work", "https://example.test/1") == (
         "/goal Do work\nhttps://example.test/1"
