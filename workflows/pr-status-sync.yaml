@@ -1,0 +1,106 @@
+name: Sync PR Status to Project
+
+# Automatically moves the linked Issue's Project Status based on PR lifecycle
+# using ONLY native GitHub mechanisms:
+#   - event: pull_request ready_for_review / converted_to_draft / closed
+#   - mapping: CrossReferencedEvent from the PR timeline (native cross-reference)
+#   - update: updateProjectV2ItemFieldValue (official GraphQL mutation)
+#
+# Rules:
+#   ready_for_review    → linked issue(s) → Review  (PR waiting for PI review)
+#   converted_to_draft  → linked issue(s) → In Progress (work resumed)
+#   closed (merged)     → linked issue(s) → Done (PI merge completes the work)
+#
+# Infrastructure owned by Hermes ops; deployed per-repo.
+
+on:
+  pull_request:
+    types: [ready_for_review, converted_to_draft, closed]
+
+jobs:
+  sync-status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update linked issue project status
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_SYNC_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          EVENT_TYPE: ${{ github.event.action }}
+        run: |
+          python3 << 'EOF'
+          import json, os, subprocess
+
+          repo = os.environ["REPO"]
+          pr_num = int(os.environ["PR_NUMBER"])
+          event = os.environ["EVENT_TYPE"]
+
+          # Per-repo project + Status field mapping (native ProjectV2)
+          PROJECTS = {
+              "algotradinglife/beijing-lot": {
+                  "project": "PVT_kwDOCnDY5c4Bed79",
+                  "field": "PVTSSF_lADOCnDY5c4Bed79zhY37FA",
+                  "options": {
+                      "ready_for_review": "7e18371b",    # Review
+                      "converted_to_draft": "95cfdf69",  # In Progress
+                      "closed": "96923e69",              # Done
+                  },
+              },
+          }
+          if repo not in PROJECTS:
+              print(f"No project mapping for {repo}, skipping")
+              raise SystemExit(0)
+          cfg = PROJECTS[repo]
+          if event not in cfg["options"]:
+              print(f"No status action for event {event}, skipping")
+              raise SystemExit(0)
+          option_id = cfg["options"][event]
+
+          def gql(q):
+              r = subprocess.run(["gh", "api", "graphql", "-f", f"query={q}"],
+                                 capture_output=True, text=True, timeout=30)
+              if r.returncode != 0:
+                  raise RuntimeError(f"GraphQL failed: {r.stderr[:300]}")
+              return json.loads(r.stdout)
+
+          # Native mapping: CrossReferencedEvent in the PR timeline → linked issues
+          owner, name = repo.split("/")
+          q = (
+              'query { repository(owner: %s, name: %s) { pullRequest(number: %d) {'
+              ' timelineItems(first: 30) { nodes { __typename'
+              ' ... on CrossReferencedEvent { source { __typename'
+              ' ... on Issue { number } } } } } } }'
+          ) % (json.dumps(owner), json.dumps(name), pr_num)
+          data = gql(q)
+          nodes = data["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+          linked = [n["source"]["number"] for n in nodes
+                    if n.get("__typename") == "CrossReferencedEvent"
+                    and n.get("source", {}).get("__typename") == "Issue"]
+          if not linked:
+              print(f"PR #{pr_num}: no cross-referenced issues found")
+              raise SystemExit(0)
+          print(f"PR #{pr_num}: linked issues = {linked} (event={event})")
+
+          # Find project items and update status for each linked issue
+          q2 = ('query { node(id: %s) { ... on ProjectV2 { items(first: 100) {'
+                ' nodes { id content { ... on Issue { number } } } } } } }'
+                ) % json.dumps(cfg["project"])
+          data2 = gql(q2)
+          items = {i["content"]["number"]: i["id"]
+                   for i in data2["data"]["node"]["items"]["nodes"]
+                   if i.get("content") and i["content"].get("number") in linked}
+
+          for num in linked:
+              item_id = items.get(num)
+              if not item_id:
+                  print(f"  Issue #{num}: not in project, skipping")
+                  continue
+              q3 = (
+                  'mutation { updateProjectV2ItemFieldValue(input: {'
+                  ' projectId: %s, itemId: %s, fieldId: %s,'
+                  ' value: {singleSelectOptionId: %s}}) { projectV2Item { id } } }'
+              ) % (json.dumps(cfg["project"]), json.dumps(item_id),
+                   json.dumps(cfg["field"]), json.dumps(option_id))
+              gql(q3)
+              print(f"  Issue #{num}: → status updated ({event})")
+          EOF
