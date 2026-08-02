@@ -477,3 +477,206 @@ def test_merged_pr_notified_once_across_both_detection_paths() -> None:
         "expected exactly one merged notification, got %d: %s"
         % (len(merged_actions), merged_actions)
     )
+
+
+def test_unknown_to_alias_falls_back_to_project_owner() -> None:
+    """[TO: Worker] (not in mention_map) routes by linked Issue Project owner,
+    not by semantic alias guessing."""
+    pr = {
+        "number": 147,
+        "title": "research: settle #133 Gate B",
+        "author": {"login": "hh1985"},
+        "body": "Resolves #133",
+    }
+    proj_map = {133: 2}
+    projects = [{"number": 2, "owner": "strategist"}]
+    sm = {"pi": "sample-PI", "strategist": "sample-Strategy"}
+    assignee_map = {"hh1985": "pi"}
+    target, session = MOD.parse_to_directive(
+        "[TO: Worker]\nPI review correction required.", {"pi": "pi"}
+    )
+    assert target == "Worker"
+    assert session is None  # unknown alias — no semantic match
+    fallback = MOD.resolve_pr_session(pr, proj_map, projects, sm, assignee_map)
+    assert fallback == "sample-Strategy"  # project owner decides
+
+
+def test_known_to_alias_does_not_need_fallback() -> None:
+    """[TO: Strategist] resolves via mention_map directly."""
+    target, session = MOD.parse_to_directive(
+        "[TO: Strategist]\nPlease settle.", {"strategist": "sample-Strategy"}
+    )
+    assert (target, session) == ("Strategist", "sample-Strategy")
+
+
+def test_plain_comment_has_no_directive() -> None:
+    """A comment without [TO:] yields no target, no session."""
+    target, session = MOD.parse_to_directive(
+        "Reproducible package confirmed.", {"pi": "sample-PI"}
+    )
+    assert (target, session) == (None, None)
+
+
+def test_pr_to_worker_routes_by_project_owner_integration() -> None:
+    """Full-tick: a PR comment [TO: Worker] with no mention_map alias still
+    reaches the linked Issue's Project owner session."""
+    import sys
+    import io
+    import contextlib
+    import yaml
+    from pathlib import Path
+
+    repo_cfg = {
+        "repo": "example-org/sample-research",
+        "projects": [
+            {"number": 2, "node": "PVT_EXAMPLE2", "name": "Prediction", "owner": "strategist"},
+        ],
+        "session_map": {"pi": "sample-PI", "strategist": "sample-Strategy"},
+        "assignee_map": {"hh1985": "pi", "worker-bot": "strategist"},
+        "mention_map": {"pi": "pi", "strategist": "strategist"},
+    }
+
+    def fake_run(cmd, **kwargs):
+        cmd_s = " ".join(cmd)
+        ok = SimpleNamespace(returncode=0, stderr="", stdout="")
+        if cmd[:2] == ["gh", "api"]:
+            ok.stdout = json.dumps({"data": {"node": {"items": {
+                "nodes": [{
+                    "id": "ITEM_133",
+                    "content": {"__typename": "Issue", "number": 133, "title": "diversified allocator"},
+                    "fieldValues": {"nodes": [{
+                        "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                        "name": "Inbox",
+                        "field": {"name": "Status"},
+                    }]},
+                }],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}}})
+            return ok
+        if cmd[:3] == ["gh", "issue", "list"]:
+            ok.stdout = ""
+            return ok
+        if cmd[:3] == ["gh", "pr", "list"] and "--state" in cmd:
+            idx = cmd.index("--state")
+            if cmd[idx + 1] == "open":
+                ok.stdout = json.dumps([{
+                    "number": 147, "title": "settle #133 Gate B",
+                    "headRefName": "strategy/bj133-gate-b",
+                    "author": {"login": "hh1985"},
+                    "createdAt": "2026-08-02T12:00:00Z",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Resolves #133",
+                    "isDraft": False,
+                }])
+            else:
+                ok.stdout = "[]"
+            return ok
+        if cmd[:3] == ["gh", "pr", "view"]:
+            view_jq = " ".join(cmd)
+            if "reviewDecision" in view_jq:
+                ok.stdout = ""
+            elif "comments" in view_jq:
+                ok.stdout = json.dumps([{
+                    "id": "IC_147_C1",
+                    "author": {"login": "hh1985"},
+                    "body": "[TO: Worker][PI REVIEW — CORRECTION REQUIRED][PR #147]\nPackage reproducible but not aligned.",
+                }])
+            else:
+                ok.stdout = json.dumps({
+                    "state": "MERGED", "mergedAt": "2026-08-02T12:00:00Z",
+                    "author": "hh1985", "title": "settle #133 Gate B",
+                    "body": "Resolves #133",
+                })
+            return ok
+        ok.stdout = "{}"
+        return ok
+
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        cfg_file = Path(td) / "dispatcher.yaml"
+        cfg_file.write_text(yaml.safe_dump({"repos": {"sample": repo_cfg}}))
+        state_file = Path(td) / "dispatcher_sample_state.json"
+        # PR already open from previous tick; the [TO: Worker] comment is new.
+        state_file.write_text(json.dumps({"pr:147": "open", "prdraft:147": False}))
+
+        with contextlib.redirect_stdout(buf):
+            with patch.object(MOD.subprocess, "run", side_effect=fake_run):
+                with patch.object(sys, "argv", [
+                    "dispatcher.py", "--repo", "sample",
+                    "--config", str(cfg_file),
+                    "--state-dir", td, "--dry-run",
+                ]):
+                    MOD.main()
+    payload = json.loads(buf.getvalue())
+    forwarded = [a for a in payload.get("actions", [])
+                 if a.get("reason") == "to_directive_pr"]
+    assert len(forwarded) == 1, "expected one [TO:] forward, got %d: %s" % (
+        len(forwarded), [a.get("reason") for a in payload.get("actions", [])])
+    assert forwarded[0]["session"] == "sample-Strategy", forwarded[0]
+    assert forwarded[0]["target"] == "Worker", forwarded[0]
+
+
+def test_worker_session_no_linked_issue_fails_closed() -> None:
+    """Unknown [TO:] on a PR with no linked Issue must NOT fall back to the
+    PR author's assignee role — worker is Project ownership only."""
+    pr = {"number": 1, "body": "No linked issue here",
+          "author": {"login": "hh1985"}}
+    proj_map = {}
+    projects = []
+    sm = {"pi": "sample-PI"}
+    assert MOD.resolve_worker_session(pr, proj_map, projects, sm) is None
+
+
+def test_worker_session_multi_owner_fails_closed() -> None:
+    """A PR linking Issues owned by different Projects resolves to no unique
+    worker — fail closed rather than guessing."""
+    pr = {"number": 1, "body": "Fixes #1\nResolves #2"}
+    proj_map = {1: 2, 2: 3}
+    projects = [
+        {"number": 2, "owner": "strategist"},
+        {"number": 3, "owner": "engineer"},
+    ]
+    sm = {"strategist": "sample-Strategy", "engineer": "sample-Engineer"}
+    assert MOD.resolve_worker_session(pr, proj_map, projects, sm) is None
+
+
+def test_worker_session_single_owner_routes() -> None:
+    """Single linked Issue with one Project owner routes to that owner."""
+    pr = {"number": 1, "body": "Resolves #133"}
+    proj_map = {133: 2}
+    projects = [{"number": 2, "owner": "strategist"}]
+    sm = {"strategist": "sample-Strategy"}
+    assert MOD.resolve_worker_session(pr, proj_map, projects, sm) == "sample-Strategy"
+
+
+def test_worker_session_mixed_mapped_unmapped_fails_closed() -> None:
+    """A PR linking one Project-owned Issue and one unmapped Issue must not
+    route — every linked Issue must establish the same owner."""
+    pr = {"number": 1, "body": "Fixes #1\nResolves #2"}
+    proj_map = {1: 2}  # #2 has no Project mapping
+    projects = [{"number": 2, "owner": "strategist"}]
+    sm = {"strategist": "sample-Strategy"}
+    assert MOD.resolve_worker_session(pr, proj_map, projects, sm) is None
+
+
+def test_plain_comment_not_forwarded_with_fallback() -> None:
+    """A plain comment (no [TO:]) must not be routed via project-owner
+    fallback — only explicit [TO:] directives trigger worker resolution."""
+    pr = {
+        "number": 147,
+        "title": "settle #133 Gate B",
+        "author": {"login": "hh1985"},
+        "body": "Resolves #133",
+    }
+    proj_map = {133: 2}
+    projects = [{"number": 2, "owner": "strategist"}]
+    sm = {"pi": "sample-PI", "strategist": "sample-Strategy"}
+    assignee_map = {"hh1985": "pi"}
+    target, tsession = MOD.parse_to_directive(
+        "Package reproducible, confirming.", {"pi": "pi"}
+    )
+    assert target is None and tsession is None
+    # No [TO:] → no worker fallback, stays unresolved.
+    if target and not tsession:
+        tsession = MOD.resolve_worker_session(pr, proj_map, projects, sm)
+    assert tsession is None

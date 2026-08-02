@@ -465,6 +465,24 @@ def resolve_pr_session(pr, proj_map, projects, sm, assignee_map):
     return resolve_assignee_session(login, assignee_map, sm)
 
 
+def resolve_worker_session(pr, proj_map, projects, sm):
+    """Resolve the assigned worker for a PR strictly by linked-Issue Project
+    ownership. Unrecognized [TO:] aliases (e.g. \"Worker\") are routed by the
+    Project that owns the linked Issue — never by author/assignee semantics.
+    Returns None unless every linked Issue resolves to the same single
+    Project owner (fail closed on any unmapped or conflicting issue)."""
+    linked = linked_issue_numbers(pr.get("body", ""))
+    if not linked:
+        return None
+    sessions = {
+        find_owner_for_issue(number, proj_map, projects, sm)
+        for number in linked
+    }
+    if len(sessions) == 1 and None not in sessions:
+        return next(iter(sessions))
+    return None
+
+
 def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
     r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "open",
                         "--json", "number,title,author,reviewDecision,body",
@@ -1005,8 +1023,19 @@ def main():
                 ck = "prcomment:%d:%s:%s" % (pn, cid, target.lower()) if target else ock
                 if prev_state.get(ock) or prev_state.get(ck):
                     continue
-                if first_run or not tsession:
+                if first_run:
                     # Baseline mode (first run): remember, never replay.
+                    new_state[ck] = "seen"
+                    continue
+                if target and not tsession:
+                    # [TO: <alias>] that no mention_map alias resolves (e.g.
+                    # "Worker") — the assigned worker is decided by Project
+                    # ownership of the linked Issue, never by semantic
+                    # guessing or author/assignee fallback.
+                    tsession = resolve_worker_session(
+                        pr, proj_map, projects, sm
+                    )
+                if not tsession:
                     new_state[ck] = "seen"
                     continue
                 url = "https://github.com/%s/pull/%d" % (repo, pn)

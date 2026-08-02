@@ -89,6 +89,10 @@ The first non-empty, non-quoted line of an Issue or PR comment may contain:
 
 Role matching is case-insensitive and supports letters, digits, underscores,
 and hyphens. The role must resolve through `mention_map` and `session_map`.
+An explicitly targeted role that no `mention_map` alias resolves (e.g.
+`[TO: Worker]`) falls back to the linked Issue's Project ownership on pull
+requests — the worker assignment is decided by the owning Project, never by
+semantic guessing or the PR author's role.
 
 ## Safe onboarding
 
