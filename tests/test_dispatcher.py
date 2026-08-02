@@ -991,3 +991,33 @@ def test_inline_prose_to_reference_not_misread() -> None:
         {"pi": "sample-PI"},
     )
     assert (target, session) == (None, None)
+
+
+def test_to_directive_slash_annotation_resolves() -> None:
+    """[TO: PI / FRESH INDEPENDENT EVIDENCE REVIEW] — annotation after the
+    target (slash form) must resolve to the first token."""
+    target, session = MOD.parse_to_directive(
+        "[TO: PI / FRESH INDEPENDENT EVIDENCE REVIEW]\nReview needed.",
+        {"pi": "sample-PI"},
+    )
+    assert (target, session) == ("PI", "sample-PI")
+
+
+def test_to_directive_goal_prefix_resolves() -> None:
+    """/goal [TO: Worker][GATE B AUTHORIZED] — /goal command prefix before
+    [TO:] must not defeat parsing (the format PI actually uses)."""
+    target, session = MOD.parse_to_directive(
+        "/goal [TO: Worker][GATE B AUTHORIZED]\nProceed.",
+        {"worker": "sample-Worker"},
+    )
+    assert (target, session) == ("Worker", "sample-Worker")
+
+
+def test_to_directive_multi_target_takes_first() -> None:
+    """[TO: PI / STRATEGY] resolves to the first target (PI), not the
+    slash-separated remainder."""
+    target, session = MOD.parse_to_directive(
+        "[TO: PI / STRATEGY]\nBoth notified.",
+        {"pi": "sample-PI", "strategy": "sample-Strategy"},
+    )
+    assert (target, session) == ("PI", "sample-PI")

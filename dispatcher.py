@@ -179,10 +179,16 @@ def parse_to_directive(body, mention_map):
         s = line.strip()
         if s.startswith('>') or not s:
             continue
-        # [TO: X] may be preceded by zero or more bracketed labels on the
-        # same line, e.g. "[PI DEPENDENCY CLOSURE][TO: STRATEGY]". Anchor at
-        # line start so inline prose/code references are never misread.
-        m = re.match(r'(?:\[[^\]]*\])*\s*\[TO:\s*([A-Za-z0-9_-]+)\]', s, re.IGNORECASE)
+        # Recognized shapes on the first content line:
+        #   [TO: PI] | [PI DEPENDENCY CLOSURE][TO: STRATEGY]
+        #   /goal [TO: Worker][...] | [TO: PI / FRESH REVIEW]
+        # /goal and leading [label] groups are optional; the first token
+        # after [TO: is the target. Anchored so inline prose is never read
+        # as a directive.
+        m = re.match(
+            r'(?:/goal\s+)?(?:\[(?!TO:)[^\]]*\]\s*)*'
+            r'\[TO:\s*([A-Za-z0-9_-]+)(?:\s*/[^\]]*)?\]',
+            s, re.IGNORECASE)
         if m:
             t = m.group(1)
             return t, resolve_target_to_session(t, mention_map)
