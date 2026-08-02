@@ -28,6 +28,12 @@ The scheduler supplies the cadence. No repository-specific wrapper is needed.
 
 - Native Issue Graph fields define dependencies and decomposition.
 - Project V2 membership identifies the owner role.
+- **One Issue, one owner.** Every Issue belongs to exactly one Project, so
+  exactly one owner role owns it. Work that requires two owners (e.g. Data +
+  Strategy) MUST be split into separate Issues, each on its own Project,
+  linked by blockedBy/blocking — never mixed inside a single Issue. A PR
+  linking Issues owned by different Projects is ambiguous and dispatcher
+  routing fails closed on it.
 - `session_map` maps owner roles to delivery sessions.
 - `workflow_role`, when configured, identifies the dedicated operational
   coordinator. It defaults to `pi` when omitted.
