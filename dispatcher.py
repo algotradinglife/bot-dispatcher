@@ -957,6 +957,8 @@ def main():
                         if cl.returncode == 0:
                             info = json.loads(cl.stdout)
                             if info.get("state") == "MERGED":
+                                if new_state.get(key) == "merged":
+                                    continue  # already handled by recent-merges path
                                 new_state[key] = "merged"
                                 author = info.get("author", "")
                                 asession = resolve_pr_session(

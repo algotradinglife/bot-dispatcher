@@ -395,3 +395,85 @@ def test_first_run_marks_comments_seen_not_forwarded() -> None:
             if first_run:
                 new[ck] = "seen"
     assert new["comment:1:c1:engineer"] == "seen"
+
+
+def test_merged_pr_notified_once_across_both_detection_paths() -> None:
+    """A PR that merges between ticks is notified exactly once, even though
+    both the recent-merges scan and the per-key state sweep can see it."""
+    import sys
+    import yaml
+    from pathlib import Path
+
+    repo_cfg = {
+        "repo": "example-org/sample-research",
+        "projects": [
+            {"number": 1, "node": "PVT_EXAMPLE", "name": "Research", "owner": "researcher"},
+        ],
+        "session_map": {"pi": "sample-PI", "researcher": "sample-Researcher"},
+        "assignee_map": {"hh1985": "pi", "worker-bot": "researcher"},
+        "mention_map": {"pi": "pi", "PI": "pi", "researcher": "researcher"},
+    }
+
+    def fake_run(cmd, **kwargs):
+        cmd_s = " ".join(cmd)
+        ok = SimpleNamespace(returncode=0, stderr="", stdout="")
+        # 1. GraphQL project scan (build_issue_proj_map)
+        if cmd[:2] == ["gh", "api"]:
+            ok.stdout = json.dumps({"data": {"node": {"items": {
+                "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}}})
+            return ok
+        # 2. Issue list (comment scan) / milestone scan
+        if cmd[:3] == ["gh", "issue", "list"]:
+            ok.stdout = ""
+            return ok
+        # 3. Open PR list — #146 already merged, so it is absent
+        if cmd[:3] == ["gh", "pr", "list"] and "--state" in cmd:
+            idx = cmd.index("--state")
+            if cmd[idx + 1] == "open":
+                ok.stdout = "[]"
+            else:
+                ok.stdout = json.dumps([{
+                    "number": 146, "title": "research: freeze #133 Gate A",
+                    "mergedAt": "2026-08-02T11:45:56Z",
+                    "author": {"login": "hh1985"},
+                    "mergedBy": {"login": "hh1985"},
+                    "body": "Resolves #133",
+                }])
+            return ok
+        # 4. Per-key pr view sweep (path B)
+        if cmd[:3] == ["gh", "pr", "view"]:
+            ok.stdout = json.dumps({
+                "state": "MERGED", "mergedAt": "2026-08-02T11:45:56Z",
+                "author": "hh1985", "title": "research: freeze #133 Gate A",
+                "body": "Resolves #133",
+            })
+            return ok
+        ok.stdout = "{}"
+        return ok
+
+    # Both paths scan #146; the merged notice must be queued exactly once.
+    import io, contextlib
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as td2:
+        cfg_file = Path(td2) / "dispatcher.yaml"
+        cfg_file.write_text(yaml.safe_dump({"repos": {"sample": repo_cfg}}))
+        state_file = Path(td2) / "dispatcher_sample_state.json"
+        # Previous tick recorded #146 as open; it merged since.
+        state_file.write_text(json.dumps({"pr:146": "open"}))
+
+        with contextlib.redirect_stdout(buf):
+            with patch.object(MOD.subprocess, "run", side_effect=fake_run):
+                with patch.object(sys, "argv", [
+                    "dispatcher.py", "--repo", "sample",
+                    "--config", str(cfg_file),
+                    "--state-dir", td2, "--dry-run",
+                ]):
+                    MOD.main()
+    payload = json.loads(buf.getvalue())
+    merged_actions = [a for a in payload.get("actions", [])
+                      if a.get("reason", "").startswith("pr_merged")]
+    assert len(merged_actions) == 1, (
+        "expected exactly one merged notification, got %d: %s"
+        % (len(merged_actions), merged_actions)
+    )
