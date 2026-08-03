@@ -1021,3 +1021,44 @@ def test_to_directive_multi_target_takes_first() -> None:
         {"pi": "sample-PI", "strategy": "sample-Strategy"},
     )
     assert (target, session) == ("PI", "sample-PI")
+
+
+def test_extract_report_url_from_merged_pr_body() -> None:
+    """A completed Issue with a merged PR whose body names results/... gets
+    the report URL appended."""
+    with patch.object(MOD.subprocess, "run") as mocked:
+        mocked.side_effect = [
+            SimpleNamespace(returncode=0, stdout=json.dumps([
+                {"number": 162, "state": "MERGED",
+                 "body": "Resolves #145. Package: results/bj145_gate_b_summary.md"},
+            ]), stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),  # no comments
+        ]
+        url = MOD.extract_report_url("example-org/sample", 145)
+    assert url == "https://github.com/example-org/sample/blob/main/results/bj145_gate_b_summary.md"
+
+
+def test_extract_report_url_none_when_no_linked_pr() -> None:
+    """No linked PR carrying the issue number -> no report URL."""
+    with patch.object(MOD.subprocess, "run") as mocked:
+        mocked.side_effect = [
+            SimpleNamespace(returncode=0, stdout=json.dumps([
+                {"number": 200, "state": "MERGED", "body": "Unrelated work."},
+            ]), stderr=""),
+        ]
+        url = MOD.extract_report_url("example-org/sample", 999)
+    assert url is None
+
+
+def test_extract_report_url_wiki_link() -> None:
+    """Wiki links in PR text are returned as-is."""
+    with patch.object(MOD.subprocess, "run") as mocked:
+        mocked.side_effect = [
+            SimpleNamespace(returncode=0, stdout=json.dumps([
+                {"number": 162, "state": "MERGED",
+                 "body": "Fixes #145. Wiki: https://github.com/example-org/sample/wiki/BJ145"},
+            ]), stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ]
+        url = MOD.extract_report_url("example-org/sample", 145)
+    assert url == "https://github.com/example-org/sample/wiki/BJ145"

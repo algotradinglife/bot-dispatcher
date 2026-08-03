@@ -539,6 +539,54 @@ def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
     return None
 
 
+def extract_report_url(repo, issue_num):
+    """Find the analysis-report link for a completed Issue: inspect linked PR
+    bodies and comments for report paths (results/... or doc/repro/...) or
+    wiki links, preferring the most recently merged/open PR. Returns a
+    GitHub URL (report path or wiki link) or None."""
+    report_patterns = (
+        re.compile(r'(?:results|doc/repro)/(?!\.\.)[A-Za-z0-9_./-]+(?<![./])', re.IGNORECASE),
+        re.compile(r'https://github\.com/%s/wiki/[A-Za-z0-9_./#-]+' % re.escape(repo), re.IGNORECASE),
+    )
+    try:
+        r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "all",
+                            "--limit", "100",
+                            "--json", "number,title,state,body,mergedAt,updatedAt",
+                            "--jq", ".[] | select(.body != null)"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return None
+        candidates = []
+        for pr in json.loads(r.stdout):
+            if issue_num not in linked_issue_numbers(pr.get("body", "")):
+                continue
+            candidates.append(pr)
+        # Most recently updated/merged first.
+        candidates.sort(key=lambda p: p.get("mergedAt") or p.get("updatedAt") or "", reverse=True)
+        texts = []
+        for pr in candidates:
+            texts.append(pr.get("body", ""))
+            try:
+                cr = subprocess.run(["gh", "pr", "view", str(pr["number"]), "--repo", repo,
+                                     "--json", "comments", "--jq", ".comments[].body"],
+                                    capture_output=True, text=True, timeout=15)
+                if cr.returncode == 0 and cr.stdout.strip():
+                    texts.extend(json.loads(cr.stdout))
+            except Exception:
+                pass
+        for text in texts:
+            for pat in report_patterns:
+                m = pat.search(text or "")
+                if m:
+                    path = m.group(0)
+                    if path.startswith("http"):
+                        return path
+                    return "https://github.com/%s/blob/main/%s" % (repo, path)
+    except Exception:
+        pass
+    return None
+
+
 def submit_session_enter(session):
     """Submit a goal that agent-deck may have only pasted into the TUI.
 
@@ -797,6 +845,11 @@ def main():
                 if session:
                     msg = format_notice("Issue #%d is DONE — %s" % (issue_num, title),
                                         url)
+                    report = extract_report_url(repo, issue_num)
+                    if report:
+                        msg = format_notice(
+                            "Issue #%d is DONE — %s (report: %s)" % (issue_num, title, report),
+                            url)
                     reason = "issue_done"
 
             if session and msg:
