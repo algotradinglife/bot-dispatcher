@@ -220,6 +220,10 @@ def main() -> None:
     parser.add_argument("--board", default=None, help="kanban board/tenant slug")
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_HOME)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--archive", action="store_true",
+                        help="archive done cards after successful sync "
+                             "(keeps the board clean; default off for "
+                             "backward compatibility)")
     args = parser.parse_args()
 
     project = None
@@ -251,6 +255,10 @@ def main() -> None:
         results.append(outcome)
         if outcome["status"] == "synced" and not args.dry_run:
             synced.add(card["id"])
+            if args.archive:
+                subprocess.run(["hermes", "kanban", "archive", card["id"]],
+                               capture_output=True, text=True, timeout=15)
+                outcome["archived"] = True
     if not args.dry_run:
         save_synced(state_file, synced)
     print(json.dumps({"cards": len(cards), "new": len(results),
