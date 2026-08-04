@@ -619,12 +619,13 @@ def kanban_idempotency_key(repo, issue_num):
 
 
 def build_kanban_command(repo, issue_num, title, session, extra_body=None,
-                         kanban_bin="hermes", board=None):
+                         kanban_bin="hermes"):
     """Build a `hermes kanban create` argv for one source issue.
 
     Card title carries the issue link; the body carries the full goal digest
     plus a contract/evidence stub. The idempotency key anchors the card to
-    the source issue across ticks.
+    the source issue across ticks. Board selection happens via a global
+    `hermes kanban boards switch` before create (see flush_goals).
     """
     argv = [
         kanban_bin, "kanban", "create",
@@ -632,8 +633,6 @@ def build_kanban_command(repo, issue_num, title, session, extra_body=None,
         "--idempotency-key", kanban_idempotency_key(repo, issue_num),
         "--assignee", session,
     ]
-    if board:
-        argv += ["--project", board]
     argv.append("[Issue #%d] %s" % (issue_num, title))
     return argv
 
@@ -689,6 +688,18 @@ def flush_goals(output, dry_run=False, baseline=False, cfg=None):
         board = cfg.get("kanban_board")
     repo = cfg.get("repo") if cfg else None
 
+    if delivery_mode == "kanban" and board:
+        # Board selection is a global CLI switch, not a per-create flag.
+        r = subprocess.run(
+            [kanban_bin, "kanban", "boards", "switch", board],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            output["warnings"].append(
+                "kanban boards switch %s failed: %s"
+                % (board, r.stderr.strip()[:120])
+            )
+
     pending = output.pop("_pending", {})
     anchors = output.pop("_pending_issues", {})
     all_success = True
@@ -723,7 +734,6 @@ def flush_goals(output, dry_run=False, baseline=False, cfg=None):
                     session,
                     extra_body=message,
                     kanban_bin=kanban_bin,
-                    board=board,
                 )
                 result = subprocess.run(
                     argv, capture_output=True, text=True, timeout=30

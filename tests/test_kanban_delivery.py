@@ -110,22 +110,21 @@ def test_idempotency_key_differs_across_issues_and_repos() -> None:
 def test_build_kanban_command_shape() -> None:
     argv = MOD.build_kanban_command("org/repo", 42, "Do the thing", "researcher",
                                     extra_body="/goal Do the thing\nhttps://x/42",
-                                    kanban_bin="hermes", board="disease_survey")
+                                    kanban_bin="hermes")
     assert argv[0] == "hermes"
     assert argv[1:3] == ["kanban", "create"]
     assert "--idempotency-key" in argv
     assert "issue-org-repo-42" in argv
     assert "--assignee" in argv and "researcher" in argv
-    assert "--project" in argv and "disease_survey" in argv
     assert argv[-1] == "[Issue #42] Do the thing"
     body = argv[argv.index("--body") + 1]
     assert "https://x/42" in body
 
 
-def test_build_kanban_command_without_board() -> None:
+def test_build_kanban_command_minimal() -> None:
     argv = MOD.build_kanban_command("org/repo", 7, "Task", "pi")
-    assert "--project" not in argv
     assert argv[-1] == "[Issue #7] Task"
+    assert "--project" not in argv
 
 
 # ── L0-06/L1-01: flush_goals kanban branch ────────────────────────────

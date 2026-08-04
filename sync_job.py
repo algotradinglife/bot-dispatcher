@@ -110,7 +110,13 @@ def build_review_comment(card: dict) -> str:
 def list_done_cards(board: str | None = None) -> list[dict]:
     argv = ["hermes", "kanban", "list", "--status", "done", "--json"]
     if board:
-        argv += ["--tenant", board]
+        # Board selection is a global CLI switch (not a --tenant filter).
+        r = subprocess.run(
+            ["hermes", "kanban", "boards", "switch", board],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            raise RuntimeError("kanban boards switch failed: %s" % r.stderr.strip()[:200])
     r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         raise RuntimeError("kanban list failed: %s" % r.stderr.strip()[:200])
@@ -219,7 +225,14 @@ def main() -> None:
     project = None
     if args.config:
         raw = yaml.safe_load(Path(args.config).read_text()) or {}
-        repo_cfg = (raw.get("repos") or {}).get(args.repo)
+        repos = raw.get("repos") or {}
+        # match by GitHub repo (owner/name) OR by local repo key
+        repo_cfg = repos.get(args.repo)
+        if repo_cfg is None:
+            for _key, _cfg in repos.items():
+                if isinstance(_cfg, dict) and _cfg.get("repo") == args.repo:
+                    repo_cfg = _cfg
+                    break
         if repo_cfg:
             projects = repo_cfg.get("projects") or []
             for p in projects:
