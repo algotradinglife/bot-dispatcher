@@ -622,9 +622,14 @@ def flush_goals(output, dry_run=False, baseline=False):
     baseline=True (first run): the digest is reported but never delivered —
     a fresh repo joins from the moment of its first tick, historical events
     are recorded as seen without replay.
+
+    Returns (all_ok, failed): all_ok is True only when every session was
+    delivered; failed maps session -> digest for any undelivered goal so the
+    caller can persist them for retry without rolling back GitHub event state.
     """
     pending = output.pop("_pending", {})
     all_success = True
+    failed = {}
     for session, messages in pending.items():
         if isinstance(messages, str):
             messages = [messages]
@@ -645,6 +650,8 @@ def flush_goals(output, dry_run=False, baseline=False):
             if success:
                 success, enter_outcome = submit_session_enter(session)
                 outcome = "ok + Enter" if success else "FAILED: %s" % enter_outcome
+            if not success:
+                failed[session] = digest
         all_success = all_success and success
         output["actions"].append({
             "node": "goal:%s" % session,
@@ -654,7 +661,7 @@ def flush_goals(output, dry_run=False, baseline=False):
             "event_count": len(messages),
             "result": outcome,
         })
-    return all_success
+    return all_success, failed
 
 
 def main():
@@ -696,6 +703,20 @@ def main():
     first_run = not state_file.exists()
     proj_map = {}
     control_plane_ok = False
+
+    # Requeue undelivered agent-deck goals from the previous tick (see the
+    # save path at the bottom of main). GitHub event state already advanced,
+    # so these retries never re-trigger user-facing digests. They are tracked
+    # in a local retry_goals so a control-plane failure can restore them.
+    retry_goals = {}
+    if not first_run and not args.dry_run:
+        retry_goals = prev_state.get("_pending_goals")
+        if isinstance(retry_goals, dict):
+            for session, digest in retry_goals.items():
+                if isinstance(digest, str) and digest:
+                    queue_goal(output, session, digest)
+            retry_goals = dict(retry_goals)  # keep a restore copy
+    new_state.pop("_pending_goals", None)
 
     # ── 1. Project Status changes ──
     try:
@@ -879,7 +900,13 @@ def main():
 
         control_plane_ok = True
     except Exception as e:
+        # Keep retry goals requeued at the top of main; only drop goals
+        # queued during this failed control-plane pass.
+        retry_goals_local = retry_goals or {}
         output["_pending"] = {}
+        for session, digest in retry_goals_local.items():
+            if isinstance(digest, str) and digest:
+                queue_goal(output, session, digest)
         new_state = dict(prev_state)
         output["warnings"].append("%s control plane unavailable: %s" % (prefix, str(e)[:160]))
 
@@ -1273,17 +1300,20 @@ def main():
     except Exception as e:
         output["warnings"].append("%s milestone scan: %s" % (prefix, str(e)[:80]))
 
-    delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run)
+    delivery_ok, failed_goals = flush_goals(output, dry_run=args.dry_run, baseline=first_run)
     if first_run:
         output["warnings"].append(
             "%s first run: baseline recorded, historical events not replayed" % prefix)
     if not args.dry_run:
-        if delivery_ok:
-            save_state(state_file, new_state)
-        else:
+        # GitHub event state always advances: user-facing digests must not
+        # replay. Undelivered agent-deck goals are persisted under a
+        # dedicated key and retried next tick (see top of main).
+        if failed_goals:
+            new_state["_pending_goals"] = failed_goals
             output["warnings"].append(
-                "%s delivery failed; prior state retained for retry" % prefix)
-            save_state(state_file, prev_state)
+                "%s %d goal(s) undelivered; kept for retry" % (
+                    prefix, len(failed_goals)))
+        save_state(state_file, new_state)
     print(json.dumps(output))
 
 

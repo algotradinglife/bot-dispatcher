@@ -220,7 +220,8 @@ def test_every_event_is_kept_in_one_session_digest() -> None:
     with patch.object(
         MOD.subprocess, "run", side_effect=[completed, shown, completed]
     ) as run:
-        assert MOD.flush_goals(output) is True
+        ok, failed = MOD.flush_goals(output)
+        assert ok is True and failed == {}
     assert run.call_count == 3
     payload = run.call_args_list[0].args[0][-1]
     assert "first" in payload and "second" in payload
@@ -261,7 +262,8 @@ def test_dry_run_keeps_digest_but_never_calls_agent_deck() -> None:
     MOD.queue_goal(output, "sample-PI", "first")
     MOD.queue_goal(output, "sample-PI", "second")
     with patch.object(MOD.subprocess, "run") as run:
-        assert MOD.flush_goals(output, dry_run=True) is True
+        ok, failed = MOD.flush_goals(output, dry_run=True)
+        assert ok is True and failed == {}
     run.assert_not_called()
     assert output["actions"][-1]["event_count"] == 2
     assert output["actions"][-1]["state"] == "dry_run"
@@ -273,7 +275,8 @@ def test_delivery_failure_is_reported_for_retry() -> None:
     MOD.queue_goal(output, "engineer", "work")
     failed = SimpleNamespace(returncode=1, stderr="session unavailable")
     with patch.object(MOD.subprocess, "run", return_value=failed):
-        assert MOD.flush_goals(output) is False
+        ok, failed = MOD.flush_goals(output)
+        assert ok is False and len(failed) == 1
     assert output["actions"][-1]["state"] == "pending_retry"
 
 
@@ -290,7 +293,8 @@ def test_enter_submission_failure_is_reported_for_retry() -> None:
     with patch.object(
         MOD.subprocess, "run", side_effect=[sent, shown, enter_failed]
     ):
-        assert MOD.flush_goals(output) is False
+        ok, failed = MOD.flush_goals(output)
+        assert ok is False and len(failed) == 1
     assert output["actions"][-1]["state"] == "pending_retry"
     assert "Enter submission failed" in output["actions"][-1]["result"]
 
@@ -358,8 +362,8 @@ def test_flush_goals_baseline_never_sends() -> None:
     """Baseline flush records digests as baseline-skipped without agent-deck calls."""
     output = {"_pending": {"sample-PI": "historical event"}, "actions": []}
     with patch.object(MOD.subprocess, "run") as mocked:
-        ok = MOD.flush_goals(output, dry_run=False, baseline=True)
-    assert ok is True
+        ok, failed = MOD.flush_goals(output, dry_run=False, baseline=True)
+    assert ok is True and failed == {}
     mocked.assert_not_called()
     action = output["actions"][0]
     assert action["state"] == "baseline"
@@ -1062,3 +1066,44 @@ def test_extract_report_url_wiki_link() -> None:
         ]
         url = MOD.extract_report_url("example-org/sample", 145)
     assert url == "https://github.com/example-org/sample/wiki/BJ145"
+
+
+def test_flush_goals_returns_failed_sessions() -> None:
+    """Failed delivery returns (False, {session: digest}) so the caller can
+    persist goals for retry without rolling back GitHub event state."""
+    output = {"_pending": {"sample-Engineer": "goal one"}, "actions": []}
+    fail = SimpleNamespace(returncode=1, stderr="session not running", stdout="")
+    with patch.object(MOD.subprocess, "run", side_effect=[fail]):
+        ok, failed = MOD.flush_goals(output)
+    assert ok is False
+    assert failed == {"sample-Engineer": "goal one"}
+    action = output["actions"][0]
+    assert action["state"] == "pending_retry"
+    assert "session not running" in action["result"]
+
+
+def test_flush_goals_mixed_success_and_failure() -> None:
+    """One dead session does not mark healthy sessions as failed; only the
+    failed session is returned for retry."""
+    output = {
+        "_pending": {
+            "sample-Strategy": "goal a",
+            "sample-Engineer": "goal b",
+        },
+        "actions": [],
+    }
+    ok_send = SimpleNamespace(returncode=0, stderr="", stdout="")
+    ok_show = SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+        {"tmux_session": "agentdeck_x"}))
+    ok_enter = SimpleNamespace(returncode=0, stderr="", stdout="")
+    fail_send = SimpleNamespace(returncode=1, stderr="session not running", stdout="")
+    with patch.object(MOD.subprocess, "run", side_effect=[
+        ok_send, ok_show, ok_enter,   # Strategy: send + show + enter
+        fail_send,                    # Engineer: send fails
+    ]):
+        ok, failed = MOD.flush_goals(output)
+    assert ok is False
+    assert list(failed.keys()) == ["sample-Engineer"]
+    states = {a["session"]: a["state"] for a in output["actions"]}
+    assert states["sample-Strategy"] == "sent"
+    assert states["sample-Engineer"] == "pending_retry"
