@@ -93,6 +93,20 @@ def validate_repo_config(repo_name, cfg):
             raise ValueError("repo '%s' %s references unknown roles: %s" % (
                 repo_name, map_name, ", ".join(unknown_roles)))
 
+    delivery_mode = cfg.get("delivery_mode", "agent-deck")
+    if delivery_mode not in ("agent-deck", "kanban"):
+        raise ValueError(
+            "repo '%s' delivery_mode must be 'agent-deck' or 'kanban' (got %r)"
+            % (repo_name, delivery_mode)
+        )
+    if delivery_mode == "kanban":
+        kanban_bin = cfg.get("kanban_bin", "hermes")
+        if not isinstance(kanban_bin, str) or not kanban_bin:
+            raise ValueError("repo '%s' kanban_bin must be a non-empty string" % repo_name)
+        board = cfg.get("kanban_board")
+        if board is not None and not isinstance(board, str):
+            raise ValueError("repo '%s' kanban_board must be a string or omitted" % repo_name)
+
 
 def load_config(repo_name, config_file=DEFAULT_CONFIG_FILE):
     config_file = Path(config_file).expanduser()
@@ -206,18 +220,26 @@ def format_notice(title, url):
     return "%s\n%s" % (title, url)
 
 
-def queue_goal(output, session, message):
+def queue_goal(output, session, message, issue_num=None):
     """Retain every distinct event; one session digest is emitted per tick.
 
     Dedupes identical messages within the same tick: two comments on the same
     PR/issue with the same [TO:] target produce the same goal text, and
     sending both would duplicate work in the session digest.
+
+    issue_num (optional) anchors a kanban-delivery card to its source issue so
+    the idempotency key stays stable across ticks. The message list stays a
+    plain string list for backward compatibility; a parallel mapping records
+    issue anchors for kanban delivery.
     """
     if not session:
         return
     pending = output.setdefault("_pending", {}).setdefault(session, [])
     if message not in pending:
         pending.append(message)
+        if issue_num is not None:
+            anchors = output.setdefault("_pending_issues", {}).setdefault(session, {})
+            anchors[message] = issue_num
 
 
 def queue_workflow_issue_transition(
@@ -587,6 +609,35 @@ def extract_report_url(repo, issue_num):
     return None
 
 
+def kanban_idempotency_key(repo, issue_num):
+    """Deterministic idempotency key for a source issue.
+
+    Same issue + repo always maps to the same key, so repeated dispatcher
+    ticks never create a duplicate kanban card.
+    """
+    return "issue-%s-%s" % (repo.replace("/", "-"), issue_num)
+
+
+def build_kanban_command(repo, issue_num, title, session, extra_body=None,
+                         kanban_bin="hermes", board=None):
+    """Build a `hermes kanban create` argv for one source issue.
+
+    Card title carries the issue link; the body carries the full goal digest
+    plus a contract/evidence stub. The idempotency key anchors the card to
+    the source issue across ticks.
+    """
+    argv = [
+        kanban_bin, "kanban", "create",
+        "--body", (extra_body or title),
+        "--idempotency-key", kanban_idempotency_key(repo, issue_num),
+        "--assignee", session,
+    ]
+    if board:
+        argv += ["--project", board]
+    argv.append("[Issue #%d] %s" % (issue_num, title))
+    return argv
+
+
 def submit_session_enter(session):
     """Submit a goal that agent-deck may have only pasted into the TUI.
 
@@ -616,25 +667,74 @@ def submit_session_enter(session):
     return True, "ok"
 
 
-def flush_goals(output, dry_run=False, baseline=False):
+def flush_goals(output, dry_run=False, baseline=False, cfg=None):
     """Send one digest per session while retaining every queued event.
 
     baseline=True (first run): the digest is reported but never delivered —
     a fresh repo joins from the moment of its first tick, historical events
     are recorded as seen without replay.
+
+    cfg (optional) enables dual delivery:
+      - delivery_mode=kanban (default for new setups): one `hermes kanban
+        create` per queued event, idempotency-keyed by source issue.
+      - delivery_mode=agent-deck: legacy tmux digest delivery.
     """
+    delivery_mode = "agent-deck"
+    if cfg:
+        delivery_mode = cfg.get("delivery_mode", "agent-deck")
+    kanban_bin = "hermes"
+    board = None
+    if cfg:
+        kanban_bin = cfg.get("kanban_bin", "hermes")
+        board = cfg.get("kanban_board")
+    repo = cfg.get("repo") if cfg else None
+
     pending = output.pop("_pending", {})
+    anchors = output.pop("_pending_issues", {})
     all_success = True
     for session, messages in pending.items():
         if isinstance(messages, str):
             messages = [messages]
+        session_anchors = anchors.get(session, {})
         digest = "\n\n".join(messages)
         if baseline:
             success = True
             outcome = "baseline-skipped"
+            state = "baseline"
         elif dry_run:
             success = True
             outcome = "dry-run"
+            state = "dry_run"
+        elif delivery_mode == "kanban":
+            success = True
+            outcomes = []
+            for message in messages:
+                issue_num = session_anchors.get(message)
+                first_line = message.splitlines()[0] if message else ""
+                # strip a leading /goal marker for the card title
+                if first_line.startswith("/goal "):
+                    card_title = first_line[len("/goal "):]
+                else:
+                    card_title = first_line
+                argv = build_kanban_command(
+                    repo or "unknown-repo",
+                    issue_num or 0,
+                    card_title,
+                    session,
+                    extra_body=message,
+                    kanban_bin=kanban_bin,
+                    board=board,
+                )
+                result = subprocess.run(
+                    argv, capture_output=True, text=True, timeout=30
+                )
+                ok = result.returncode == 0
+                success = success and ok
+                outcomes.append(
+                    "ok" if ok else "FAILED: %s" % result.stderr.strip()[:160]
+                )
+            outcome = "; ".join(outcomes)
+            state = "sent" if success else "pending_retry"
         else:
             result = subprocess.run(
                 ["agent-deck", "session", "send", session, "--no-wait", digest],
@@ -645,10 +745,11 @@ def flush_goals(output, dry_run=False, baseline=False):
             if success:
                 success, enter_outcome = submit_session_enter(session)
                 outcome = "ok + Enter" if success else "FAILED: %s" % enter_outcome
+            state = "sent" if success else "pending_retry"
         all_success = all_success and success
         output["actions"].append({
             "node": "goal:%s" % session,
-            "state": "dry_run" if dry_run else ("baseline" if baseline else ("sent" if success else "pending_retry")),
+            "state": state,
             "session": session,
             "reason": "goal_digest",
             "event_count": len(messages),
@@ -768,7 +869,7 @@ def main():
                         msg = format_goal("PR #%d is in REVIEW — %s" % (issue_num, title),
                                           url)
                         reason = "pr_review_ready"
-                        queue_goal(output, session, msg)
+                        queue_goal(output, session, msg, issue_num=issue_num)
                         output["actions"].append({"node": sk, "state": cur_s, "session": session, "reason": reason,
                                                   "prev_status": prev_s, "sent": msg[:80], "result": "queued"})
                 new_state[sk] = cur_s
@@ -853,7 +954,7 @@ def main():
                     reason = "issue_done"
 
             if session and msg:
-                queue_goal(output, session, msg)
+                queue_goal(output, session, msg, issue_num=issue_num)
                 output["actions"].append({"node": sk, "state": cur_s, "session": session, "reason": reason,
                                           "prev_status": prev_s, "sent": msg[:80], "result": "queued"})
 
@@ -1273,7 +1374,7 @@ def main():
     except Exception as e:
         output["warnings"].append("%s milestone scan: %s" % (prefix, str(e)[:80]))
 
-    delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run)
+    delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run, cfg=cfg)
     if first_run:
         output["warnings"].append(
             "%s first run: baseline recorded, historical events not replayed" % prefix)
