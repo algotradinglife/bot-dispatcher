@@ -89,6 +89,22 @@ Issue #1 Inbox → Ready（dispatcher 建卡 t_efdb77c8）
    （issue comments、PR comments、review/merge、graph 通知、workflow 转换、milestone）
 2. **Project 必须与 repo 同 owner**: 跨账号无法链接 → 测试 repo 重建到 project 所有者名下
 3. **workflow YAML 缩进**: 本地替换脚本破坏 `run:` 块缩进（模板本身无 bug）
+4. **账号角色错位（重要教训）**: 测试初期 repo/Project 建在 bot 账号（everything-bot-engineer）
+   名下，且 merge 等 PI 决策动作由 bot 执行 → **角色颠倒**。修正：
+   - **PI（hh1985）**: 评审（驳回/批准）、merge、最终验收 —— 决策者
+   - **worker（bot 账号）**: 提交证据、PR、完成卡 —— 执行者
+   - 测试环境 repo/Project 归 bot 名下是 project-scope 约束的妥协（Project 必须与 repo
+     同 owner），但**角色行为纪律必须正确**：所有 PI 决策动作切 hh1985 执行
+
+### EV 驳回往返（L3-EV，真实 repo 验证）
+```
+Issue #7 Ready → 建卡 → worker PR #8 → Review
+→ EV(hh1985) CHANGES_REQUESTED → dispatcher 检测 → 通知 owner(researcher)
+→ worker 修订（rev2）→ EV APPROVED → dispatcher 检测 → 通知
+→ PI(hh1985) merge → Done + 自动关闭
+```
+物证: PR #8 MERGED（mergedBy=hh1985）、reviews 含 CHANGES_REQUESTED + APPROVED、
+issue #7 Done + CLOSED
 
 ---
 
@@ -125,8 +141,15 @@ Issue #1 Inbox → Ready（dispatcher 建卡 t_efdb77c8）
      配置 `PROJECTS` 映射（project/field/option 的 node ID）
    - PR 约定: body 必须含 `Closes #N`（原生关闭 + 状态联动）
 2. **凭据分离**（推荐，权限最小化）:
-   - PI 账号: repo scope（评审、merge、评论）
-   - 独立 bot 账号: project scope（Project V2 读写）+ repo collaborator
+   - **PI 账号**（决策者）: repo scope（评审、merge、最终验收）；如需管理
+     Project 则加 project scope
+   - **bot/worker 账号**（执行者）: project scope（Project V2 读写）+ repo
+     collaborator（write）
+   - **角色纪律（硬约束）**: repo/Project 的**所有权**归团队或 PI 名下；
+     bot 只做 worker 执行（提交 PR、完成卡）。merge、验收等 **PI 决策动作
+     必须由 PI 账号执行**，bot 绝不 merge。若 Project scope 限制导致 repo
+     建在 bot 名下（Project 必须与 repo 同 owner），这是基础设施托管妥协，
+     但角色行为纪律不变——决策动作一律切 PI 账号
    - 两个账号的 `gh` 通过 `gh auth switch` 切换
 3. **Hermes 侧**（执行面）:
    - 建 kanban board（如 `team-main`）
