@@ -382,7 +382,8 @@ def test_first_run_marks_comments_seen_not_forwarded() -> None:
         import tempfile, os
         with tempfile.TemporaryDirectory() as td:
             state_file = Path(td) / "dispatcher_test_state.json"
-            prev = MOD.load_state(state_file)
+            loaded = MOD.load_state(state_file)
+            prev = loaded if loaded is not None else {}
             new = dict(prev)
             # simulate the comment-scan branch for first run
             first_run = True
@@ -395,6 +396,21 @@ def test_first_run_marks_comments_seen_not_forwarded() -> None:
             if first_run:
                 new[ck] = "seen"
     assert new["comment:1:c1:engineer"] == "seen"
+
+
+def test_load_state_corrupt_file_returns_none_and_backs_up() -> None:
+    """A corrupt state file must yield None (fresh-baseline semantics), never
+    an empty dict — an empty dict would replay every historical event and
+    re-dispatch everything (duplicate dispatch, violates at-least-once)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        state_file = Path(td) / "dispatcher_test_state.json"
+        state_file.write_text("{broken json!!")
+        result = MOD.load_state(state_file)
+        assert result is None
+        # corrupt file was backed up, not silently dropped
+        assert not state_file.exists()
+        assert (Path(td) / "dispatcher_test_state.json.corrupt").exists()
 
 
 def test_merged_pr_notified_once_across_both_detection_paths() -> None:

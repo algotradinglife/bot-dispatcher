@@ -283,8 +283,16 @@ def load_state(state_file):
         try:
             return json.loads(state_file.read_text())
         except Exception:
-            return {}
-    return {}
+            # Corrupt state: back it up for forensics and return None so the
+            # caller treats this run as a fresh baseline (never replay events
+            # against an empty state — that would re-dispatch everything).
+            try:
+                backup = state_file.with_suffix(".json.corrupt")
+                state_file.rename(backup)
+            except Exception:
+                pass
+            return None
+    return None
 
 
 def save_state(state_file, state):
@@ -800,10 +808,12 @@ def main():
     prefix = "[%s]" % args.repo
 
     output = {"ts": time.time(), "actions": [], "warnings": [], "_pending": {}}
-    prev_state = load_state(state_file)
+    loaded_state = load_state(state_file)
+    prev_state = loaded_state if loaded_state is not None else {}
     new_state = dict(prev_state)
-    # First run (no state file): baseline only — never replay historical events.
-    # New repos join the dispatcher from the moment of first tick; backlog is dropped.
+    # First run (no state file, or corrupt state backed up): baseline only —
+    # never replay historical events. New repos join the dispatcher from the
+    # moment of first tick; backlog is dropped.
     first_run = not state_file.exists()
     proj_map = {}
     control_plane_ok = False
