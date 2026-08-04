@@ -266,7 +266,7 @@ def queue_workflow_issue_transition(
         % (issue_num, current_status, title),
         url,
     )
-    queue_goal(output, workflow_session, message)
+    queue_goal(output, workflow_session, message, issue_num=issue_num)
     output["actions"].append({
         "node": "workflow:%s" % state_key,
         "state": current_status,
@@ -430,7 +430,7 @@ def notify_graph_stakeholders(repo, issue_num, title, cur_s, url, graph,
         other_url = "https://github.com/%s/issues/%d" % (repo, other_num)
         msg = format_goal("Issue #%d → %s — affects #%d (%s)" % (issue_num, cur_s, other_num, rel_str),
                           other_url)
-        queue_goal(output, session, msg)
+        queue_goal(output, session, msg, issue_num=other_num)
 
 
 def get_project_items(cfg):
@@ -1066,7 +1066,7 @@ def main():
                                 msg = format_goal("[TO: %s] from @%s on Issue #%d — %s" % (target, author, num, title), url)
                             else:
                                 msg = format_notice("Comment by @%s on Issue #%d — %s" % (author, num, title), url)
-                            queue_goal(output, tsession, msg)
+                            queue_goal(output, tsession, msg, issue_num=num)
                             new_state[ck] = "forwarded"
                             output["actions"].append({"node": ck, "state": "forwarded", "session": tsession, "reason": "to_directive",
                                                       "target": target, "sent": msg[:80], "result": "queued"})
@@ -1099,7 +1099,7 @@ def main():
                 if was_draft is True and not is_draft:
                     msg = format_goal("PR #%d is now READY FOR REVIEW — %s" % (pn, pr["title"]),
                                       pu)
-                    queue_goal(output, coordinator_session, msg)
+                    queue_goal(output, coordinator_session, msg, issue_num=pn)
                     output["actions"].append({"node": dk, "state": "ready", "session": coordinator_session,
                                               "reason": "pr_draft_ready", "sent": msg[:80], "result": "queued"})
                 new_state[dk] = is_draft
@@ -1108,7 +1108,7 @@ def main():
                 if prev_state.get(pk) != "open":
                     msg = format_notice("New PR #%d: %s by @%s" % (pn, pr["title"], author),
                                       pu)
-                    queue_goal(output, coordinator_session, msg)
+                    queue_goal(output, coordinator_session, msg, issue_num=pn)
                     output["actions"].append({"node": pk, "state": "open", "session": coordinator_session, "reason": "new_pr",
                                               "sent": msg[:80], "result": "queued"})
                     new_state[pk] = "open"
@@ -1142,13 +1142,13 @@ def main():
                                     msg = format_goal(t, pu)  # action required
                                 else:
                                     msg = format_notice(t, pu)  # informational
-                                queue_goal(output, asession, msg)
+                                queue_goal(output, asession, msg, issue_num=pn)
                                 output["actions"].append({"node": rk, "state": decision, "session": asession, "reason": reason,
                                                           "sent": msg[:80], "result": "queued"})
                             else:
                                 msg = format_goal("PR #%d review: %s — unresolved owner" % (pn, decision),
                                                   pu)
-                                queue_goal(output, coordinator_session, msg)
+                                queue_goal(output, coordinator_session, msg, issue_num=pn)
                                 output["actions"].append({"node": rk, "state": decision, "session": coordinator_session,
                                                           "reason": "pr_unclear_owner", "sent": msg[:80], "result": "queued"})
 
@@ -1186,13 +1186,13 @@ def main():
                             if asession:
                                 msg = format_notice("PR #%d has been **MERGED**! — %s" % (pn, mp.get("title", "")),
                                                   pu)
-                                queue_goal(output, asession, msg)
+                                queue_goal(output, asession, msg, issue_num=pn)
                                 output["actions"].append({"node": mk, "state": "merged", "session": asession,
                                                           "reason": "pr_merged_recent", "sent": msg[:80], "result": "queued"})
                             else:
                                 msg = format_notice("PR #%d was merged — unclear who to notify" % pn,
                                                   pu)
-                                queue_goal(output, coordinator_session, msg)
+                                queue_goal(output, coordinator_session, msg, issue_num=pn)
                                 output["actions"].append({"node": mk, "state": "merged", "session": coordinator_session,
                                                           "reason": "pr_merged_unmapped_recent", "sent": msg[:80], "result": "queued"})
             except Exception:
@@ -1223,14 +1223,14 @@ def main():
                                     pu = "https://github.com/%s/pull/%d" % (repo, pn)
                                     msg = format_notice("PR #%d has been **MERGED**! — %s" % (pn, info.get("title", "")),
                                                       pu)
-                                    queue_goal(output, asession, msg)
+                                    queue_goal(output, asession, msg, issue_num=pn)
                                     output["actions"].append({"node": key, "state": "merged", "session": asession,
                                                               "reason": "pr_merged", "sent": msg[:80], "result": "queued"})
                                 elif not asession and prev_state.get(key) != "merged":
                                     pu = "https://github.com/%s/pull/%d" % (repo, pn)
                                     msg = format_notice("PR #%d was merged — unclear who to notify" % pn,
                                                       pu)
-                                    queue_goal(output, coordinator_session, msg)
+                                    queue_goal(output, coordinator_session, msg, issue_num=pn)
                                     output["actions"].append({"node": key, "state": "merged", "session": coordinator_session,
                                                               "reason": "pr_merged_unmapped", "sent": msg[:80], "result": "queued"})
                     except Exception:
@@ -1302,7 +1302,7 @@ def main():
                     msg = format_goal("[TO: %s] from @%s on PR #%d — %s" % (target, author, pn, pr["title"]), url)
                 else:
                     msg = format_notice("Comment by @%s on PR #%d — %s" % (author, pn, pr["title"]), url)
-                queue_goal(output, tsession, msg)
+                queue_goal(output, tsession, msg, issue_num=pn)
                 new_state[ck] = "forwarded"
                 output["actions"].append({"node": ck, "state": "forwarded", "session": tsession, "reason": "to_directive_pr",
                                           "target": target, "sent": msg[:80], "result": "queued"})
