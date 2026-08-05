@@ -493,3 +493,60 @@ def test_sync_all_segmented_idempotency_keys(monkeypatch) -> None:
 
     assert m_inprog.call_count == 1, "running segment should process"
     assert m_sync.call_count == 1, "done segment must still process same card"
+
+
+# ── codex 4th: 崩溃窗口 — 评论已发但 Review 失败 → 下轮不重发评论 ────
+
+def test_sync_all_comment_posted_persists_key_even_if_review_fails(monkeypatch, tmp_path) -> None:
+    """评论成功后立即写 done: 幂等键 + 落盘; Review 失败返回 failed,
+    但下轮 load_synced 能看到键 → 不再重发评论 (只重试 Review)."""
+    card = {"id": "t_77", "title": "[Issue #77] x", "body": "issue: 77",
+            "status": "done"}
+    state_file = tmp_path / "synced_org_repo.json"
+    state_file.write_text(json.dumps({"synced": []}))
+    calls = {"sync": 0}
+
+    def fake_list_done(board=None):
+        return [card]
+
+    def fake_list_running(board=None):
+        return []
+
+    def fake_list_all(board=None):
+        return []
+
+    def fake_switch(user):
+        return None
+
+    def fake_role(role):
+        return "bot-engineer"
+
+    def fake_sync_one_card(card_, repo, project, dry_run=False, gh_user=None,
+                           on_comment_posted=None):
+        # 第一次: 评论成功 (回调写键) + Review 失败 → failed
+        calls["sync"] += 1
+        if calls["sync"] == 1:
+            on_comment_posted(card_)  # 模拟评论成功后的回调
+            return {"card": card_["id"], "status": "failed",
+                    "reason": "review: boom"}
+        # 第二次 (下轮): 键已存在 → 不应再进来
+        return {"card": card_["id"], "status": "synced", "issue": 77}
+
+    with patch.object(MOD, "list_done_cards", side_effect=fake_list_done), \
+         patch.object(MOD, "list_running_cards", side_effect=fake_list_running), \
+         patch.object(MOD, "list_all_cards", side_effect=fake_list_all), \
+         patch.object(MOD, "switch_gh_user", side_effect=fake_switch), \
+         patch.object(MOD, "role_user", side_effect=fake_role), \
+         patch.object(MOD, "sync_one_card", side_effect=fake_sync_one_card), \
+         patch.object(MOD, "subprocess") as m_sub:
+        m_sub.run.return_value = SimpleNamespace(returncode=0, stderr="")
+        # 第一轮: Review 失败
+        out1 = MOD.sync_all("org/repo", None, "b", state_file)
+        # 幂等键已落盘 (评论成功即写)
+        loaded = MOD.load_synced(state_file)
+        assert "done:t_77" in loaded, loaded
+        # 第二轮: 键存在 → sync_one_card 不再被调用 (不重发评论)
+        out2 = MOD.sync_all("org/repo", None, "b", state_file)
+    assert calls["sync"] == 1, "第二轮必须跳过 (键已落盘), calls=%d" % calls["sync"]
+    # 第一轮结果: Review 失败 → failed (不归档)
+    assert out1["segments"][1]["results"][0]["status"] == "failed"

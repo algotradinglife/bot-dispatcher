@@ -351,11 +351,14 @@ def resolve_item_id(repo: str, issue_num: int, project_node: str) -> str:
 
 
 def sync_one_card(card: dict, repo: str, project: dict | None,
-                  dry_run: bool = False, gh_user: str | None = None) -> dict:
+                  dry_run: bool = False, gh_user: str | None = None,
+                  on_comment_posted=None) -> dict:
     """Post the evidence comment and (optionally) move the issue to Review.
 
     账号守卫 (P0-3): 证据评论是 worker 产出的汇报 → 必须以 worker 账号
     发布 (gh_user 必传, 环境变量预传递); 缺省 fail-closed.
+    on_comment_posted: 评论成功后立即回调 (写幂等键+落盘) — 即使后续
+    Review 失败, 下轮也不重发评论, 只重试 Review (codex 4th).
     """
     if not gh_user:
         raise RuntimeError("sync_one_card 必须指定 gh_user (worker 账号)")
@@ -378,6 +381,8 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
             return {"card": card["id"], "status": "failed",
                     "reason": "comment: %s" % r.stderr.strip()[:160]}
         actions.append({"action": "comment", "ok": True})
+        if on_comment_posted:
+            on_comment_posted(card)  # 评论已发 → 立即记键落盘
 
     # 2. Move to Review on the project board
     if project and issue_num:
@@ -480,6 +485,14 @@ def sync_all(repo: str, project: dict | None, board: str | None,
     synced = load_synced(state_file)
     segments = []
 
+    def _mark_done_synced(card: dict) -> None:
+        """评论已发 → 立即写 done: 幂等键 + 落盘.
+
+        即使后续 Review 失败, 下轮也不重发评论 (codex 4th 崩溃窗口).
+        """
+        synced.add("done:%s" % card["id"])
+        save_synced(state_file, synced)
+
     # 1. 执行态: running → In Progress (排除 EV 卡, 归 auditor 段)
     run_cards = [c for c in list_running_cards(board) if not is_ev_card(c)]
     run_results = []
@@ -494,6 +507,7 @@ def sync_all(repo: str, project: dict | None, board: str | None,
         run_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
             synced.add("inprogress:%s" % card["id"])
+            save_synced(state_file, synced)  # 每卡立即落盘 (防崩溃重放)
     segments.append({"segment": "inprogress", "cards": len(run_cards),
                      "results": run_results})
 
@@ -506,12 +520,11 @@ def sync_all(repo: str, project: dict | None, board: str | None,
         if not dry_run:
             switch_gh_user(worker_user)
         outcome = sync_one_card(card, repo, project, dry_run=dry_run,
-                                gh_user=worker_user)
+                                gh_user=worker_user,
+                                on_comment_posted=_mark_done_synced)
         done_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
-            # 评论/Review 成功即写幂等键 → 防下轮重复评论 (codex 3rd).
-            # 归档失败单独标记, 不阻塞同步幂等 (评论不重发).
-            synced.add("done:%s" % card["id"])
+            # 全成功 (评论+Review) → 键已由回调写入; 此处仅归档
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
@@ -535,9 +548,9 @@ def sync_all(repo: str, project: dict | None, board: str | None,
                                   gh_user=auditor_user)
         ev_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
-            # EV 评论成功即写幂等键 → 防下轮重复裁决评论 (codex 3rd).
-            # 归档失败单独标记, 不阻塞同步幂等.
+            # EV 评论成功即写幂等键 + 立即落盘 (防崩溃重放). 归档失败仅标记.
             synced.add("ev:%s" % card["id"])
+            save_synced(state_file, synced)  # 每卡立即落盘 (防崩溃重放)
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
