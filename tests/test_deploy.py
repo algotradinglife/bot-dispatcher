@@ -105,5 +105,5 @@ def test_templates_exist():
 
 def test_states_definition_complete():
     names = [s[0] for s in deploy.STATES]
-    assert names == ["Inbox", "Ready", "In Progress", "Review",
-                     "Blocked", "Human", "Done"]
+    assert names == ["Inbox", "Ready", "In Progress", "EV Review",
+                     "PI Review", "Blocked", "Human", "Done"]
