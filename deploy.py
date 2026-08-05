@@ -51,8 +51,8 @@ STATES = [
     ("EV Review", "YELLOW", "worker submitted evidence, awaiting independent auditor EV"),
     ("PI Review", "ORANGE", "EV passed, awaiting PI acceptance"),
     ("Blocked", "RED", "worker request: needs PI decision or unblock"),
-    ("Human", "PURPLE", "PI judged: needs human intervention (beyond AI loop)"),
-    ("Done", "BLACK", "accepted and merged"),
+    ("Human", "ORANGE", "PI judged: needs human intervention (beyond AI loop)"),
+    ("Done", "PURPLE", "accepted and merged"),
 ]
 
 
