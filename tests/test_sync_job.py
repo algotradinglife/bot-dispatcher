@@ -522,14 +522,16 @@ def test_sync_all_comment_posted_persists_key_even_if_review_fails(monkeypatch, 
         return "bot-engineer"
 
     def fake_sync_one_card(card_, repo, project, dry_run=False, gh_user=None,
-                           on_comment_posted=None):
+                           on_comment_posted=None, comment_posted_check=None):
         # 第一次: 评论成功 (回调写键) + Review 失败 → failed
         calls["sync"] += 1
         if calls["sync"] == 1:
             on_comment_posted(card_)  # 模拟评论成功后的回调
             return {"card": card_["id"], "status": "failed",
                     "reason": "review: boom"}
-        # 第二次 (下轮): 键已存在 → 不应再进来
+        # 第二次 (下轮): 评论已发 (check True) → 不再发评论, 只推进 Review
+        assert comment_posted_check is not None, "第二轮回调必须传入 check"
+        assert comment_posted_check(card_) is True, "评论应已发"
         return {"card": card_["id"], "status": "synced", "issue": 77}
 
     with patch.object(MOD, "list_done_cards", side_effect=fake_list_done), \
@@ -542,11 +544,18 @@ def test_sync_all_comment_posted_persists_key_even_if_review_fails(monkeypatch, 
         m_sub.run.return_value = SimpleNamespace(returncode=0, stderr="")
         # 第一轮: Review 失败
         out1 = MOD.sync_all("org/repo", None, "b", state_file)
-        # 幂等键已落盘 (评论成功即写)
+        # commented: 幂等键已落盘 (评论成功即写); reviewed: 未写
         loaded = MOD.load_synced(state_file)
-        assert "done:t_77" in loaded, loaded
-        # 第二轮: 键存在 → sync_one_card 不再被调用 (不重发评论)
+        assert "commented:t_77" in loaded, loaded
+        assert "reviewed:t_77" not in loaded, loaded
+        # 第二轮: commented 键存在 → sync_one_card 不再重发评论,
+        # 只重试 Review (fake 内断言 check=True)
         out2 = MOD.sync_all("org/repo", None, "b", state_file)
-    assert calls["sync"] == 1, "第二轮必须跳过 (键已落盘), calls=%d" % calls["sync"]
+    # sync_one_card 被调用 2 次 (每轮各 1 次): 第二轮是 Review 重试,
+    # 评论不重发 (fake 内已断言 comment_posted_check 为 True)
+    assert calls["sync"] == 2, "两轮各 1 次调用 (第二轮=Review 重试), calls=%d" % calls["sync"]
+    # 第二轮 Review 成功 → reviewed: 键已写
+    loaded2 = MOD.load_synced(state_file)
+    assert "reviewed:t_77" in loaded2, loaded2
     # 第一轮结果: Review 失败 → failed (不归档)
     assert out1["segments"][1]["results"][0]["status"] == "failed"

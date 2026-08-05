@@ -24,6 +24,7 @@ Eventual consistency: cards are read with `hermes kanban list --status done`
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -306,6 +307,13 @@ def sync_ev_verdict(card: dict, repo: str, dry_run: bool = False,
 
 
 def load_synced(state_file: Path) -> set[str]:
+    """带进程锁读 (codex 5th: 防并发读-改-写丢键)."""
+    lock_path = state_file.with_suffix(".lock")
+    with _state_lock(lock_path):
+        return _load_synced_unlocked(state_file)
+
+
+def _load_synced_unlocked(state_file: Path) -> set[str]:
     if state_file.exists():
         try:
             data = json.loads(state_file.read_text())
@@ -324,11 +332,39 @@ def load_synced(state_file: Path) -> set[str]:
 
 
 def save_synced(state_file: Path, synced: set[str]) -> None:
-    """原子写: tmp + rename, 防进程中断产生半文件 (损坏→重放的根因)."""
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = state_file.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"synced": sorted(synced)}, indent=2))
-    tmp.replace(state_file)  # POSIX 原子 rename
+    """原子写 + 进程锁: tmp + rename + flock (codex 5th 并发安全).
+
+    并发安全: 锁内重新 load 最新集合, 合并本次新增后再写 —
+    防并发进程互相覆盖丢键 (read-modify-write 原子化).
+    """
+    lock_path = state_file.with_suffix(".lock")
+    with _state_lock(lock_path):
+        latest = _load_synced_unlocked(state_file)
+        merged = latest | synced
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"synced": sorted(merged)}, indent=2))
+        tmp.replace(state_file)  # POSIX 原子 rename
+
+
+@contextlib.contextmanager
+def _state_lock(lock_path: Path):
+    """跨进程互斥锁 (fcntl.flock): 保护 state 读-改-写临界区.
+
+    NFS 等场景 flock 可能降级, 但本机 cron 轮询足够;
+    锁文件本身用原子写不会损坏.
+    """
+    import fcntl
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 
 def resolve_item_id(repo: str, issue_num: int, project_node: str) -> str:
@@ -352,13 +388,16 @@ def resolve_item_id(repo: str, issue_num: int, project_node: str) -> str:
 
 def sync_one_card(card: dict, repo: str, project: dict | None,
                   dry_run: bool = False, gh_user: str | None = None,
-                  on_comment_posted=None) -> dict:
+                  on_comment_posted=None,
+                  comment_posted_check=None) -> dict:
     """Post the evidence comment and (optionally) move the issue to Review.
 
     账号守卫 (P0-3): 证据评论是 worker 产出的汇报 → 必须以 worker 账号
     发布 (gh_user 必传, 环境变量预传递); 缺省 fail-closed.
     on_comment_posted: 评论成功后立即回调 (写幂等键+落盘) — 即使后续
-    Review 失败, 下轮也不重发评论, 只重试 Review (codex 4th).
+    Review 失败, 下轮也不重发评论 (codex 4th).
+    comment_posted_check: 评论是否已发 (查 commented: 键) — 已发则跳过
+    评论直接 Review (codex 5th: 评论/Review 状态分离).
     """
     if not gh_user:
         raise RuntimeError("sync_one_card 必须指定 gh_user (worker 账号)")
@@ -367,22 +406,26 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
         return {"card": card["id"], "status": "skipped", "reason": "no issue ref"}
     actions = []
 
-    # 1. Evidence comment
-    comment = build_review_comment(card)
-    if dry_run:
-        actions.append({"action": "comment", "dry_run": True, "body": comment[:80]})
+    # 1. Evidence comment (幂等: 已发过则跳过 — codex 5th 评论/Review 分离)
+    if comment_posted_check and comment_posted_check(card):
+        actions.append({"action": "comment", "status": "skipped",
+                        "reason": "already posted"})
     else:
-        guard_gh_user(gh_user)  # 账号守卫: 当前账号 == worker 账号
-        r = subprocess.run(
-            ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", comment],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode != 0:
-            return {"card": card["id"], "status": "failed",
-                    "reason": "comment: %s" % r.stderr.strip()[:160]}
-        actions.append({"action": "comment", "ok": True})
-        if on_comment_posted:
-            on_comment_posted(card)  # 评论已发 → 立即记键落盘
+        comment = build_review_comment(card)
+        if dry_run:
+            actions.append({"action": "comment", "dry_run": True, "body": comment[:80]})
+        else:
+            guard_gh_user(gh_user)  # 账号守卫: 当前账号 == worker 账号
+            r = subprocess.run(
+                ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", comment],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode != 0:
+                return {"card": card["id"], "status": "failed",
+                        "reason": "comment: %s" % r.stderr.strip()[:160]}
+            actions.append({"action": "comment", "ok": True})
+            if on_comment_posted:
+                on_comment_posted(card)  # 评论已发 → 立即记键落盘
 
     # 2. Move to Review on the project board
     if project and issue_num:
@@ -485,12 +528,13 @@ def sync_all(repo: str, project: dict | None, board: str | None,
     synced = load_synced(state_file)
     segments = []
 
-    def _mark_done_synced(card: dict) -> None:
-        """评论已发 → 立即写 done: 幂等键 + 落盘.
+    def _mark_done_comment(card: dict) -> None:
+        """评论已发 → 立即写 commented: 幂等键 + 落盘 (codex 5th).
 
-        即使后续 Review 失败, 下轮也不重发评论 (codex 4th 崩溃窗口).
+        防重发评论; 与 reviewed: 分离 — Review 失败下轮重试 Review
+        但不重发评论.
         """
-        synced.add("done:%s" % card["id"])
+        synced.add("commented:%s" % card["id"])
         save_synced(state_file, synced)
 
     # 1. 执行态: running → In Progress (排除 EV 卡, 归 auditor 段)
@@ -515,16 +559,20 @@ def sync_all(repo: str, project: dict | None, board: str | None,
     done_cards = [c for c in list_done_cards(board) if not is_ev_card(c)]
     done_results = []
     for card in done_cards:
-        if "done:%s" % card["id"] in synced:
-            continue
+        if "reviewed:%s" % card["id"] in synced:
+            continue  # 评论+Review 全完成 → 跳过 (codex 5th 拆分键)
         if not dry_run:
             switch_gh_user(worker_user)
         outcome = sync_one_card(card, repo, project, dry_run=dry_run,
                                 gh_user=worker_user,
-                                on_comment_posted=_mark_done_synced)
+                                on_comment_posted=_mark_done_comment,
+                                comment_posted_check=lambda c: (
+                                    "commented:%s" % c["id"]) in synced)
         done_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
-            # 全成功 (评论+Review) → 键已由回调写入; 此处仅归档
+            # 评论+Review 全成功 → 写 reviewed: 键 + 落盘
+            synced.add("reviewed:%s" % card["id"])
+            save_synced(state_file, synced)  # 每卡立即落盘 (防崩溃重放)
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
