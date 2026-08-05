@@ -443,8 +443,8 @@ def test_sync_all_ev_card_not_consumed_by_done_segment(monkeypatch) -> None:
          patch.object(MOD, "role_user", side_effect=fake_role), \
          patch.object(MOD, "sync_one_card") as m_sync, \
          patch.object(MOD, "sync_ev_verdict") as m_ev, \
-         patch.object(MOD, "load_synced", return_value=set()), \
-         patch.object(MOD, "save_synced"):
+         patch.object(MOD, "_load_synced_unlocked", return_value=set()), \
+         patch.object(MOD, "_save_synced_unlocked"):
         m_sync.return_value = {"card": "t_ev9", "status": "synced",
                                "issue": 9, "actions": [{"action": "comment", "ok": True}]}
         m_ev.return_value = {"card": "t_ev9", "status": "synced", "issue": 9,
@@ -485,8 +485,8 @@ def test_sync_all_segmented_idempotency_keys(monkeypatch) -> None:
          patch.object(MOD, "role_user", side_effect=fake_role), \
          patch.object(MOD, "set_issue_in_progress") as m_inprog, \
          patch.object(MOD, "sync_one_card") as m_sync, \
-         patch.object(MOD, "load_synced", return_value=set()), \
-         patch.object(MOD, "save_synced"):
+         patch.object(MOD, "_load_synced_unlocked", return_value=set()), \
+         patch.object(MOD, "_save_synced_unlocked"):
         m_inprog.return_value = {"card": "t_42", "status": "synced", "issue": 42}
         m_sync.return_value = {"card": "t_42", "status": "synced", "issue": 42}
         out = MOD.sync_all("org/repo", None, "b", Path("/tmp/x.json"))

@@ -339,12 +339,17 @@ def save_synced(state_file: Path, synced: set[str]) -> None:
     """
     lock_path = state_file.with_suffix(".lock")
     with _state_lock(lock_path):
-        latest = _load_synced_unlocked(state_file)
-        merged = latest | synced
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = state_file.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"synced": sorted(merged)}, indent=2))
-        tmp.replace(state_file)  # POSIX 原子 rename
+        _save_synced_unlocked(state_file, synced)
+
+
+def _save_synced_unlocked(state_file: Path, synced: set[str]) -> None:
+    """无锁原子写 (调用方必须已持锁; 防嵌套 flock 死锁)."""
+    latest = _load_synced_unlocked(state_file)
+    merged = latest | synced
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = state_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"synced": sorted(merged)}, indent=2))
+    tmp.replace(state_file)  # POSIX 原子 rename
 
 
 @contextlib.contextmanager
@@ -524,8 +529,18 @@ def sync_all(repo: str, project: dict | None, board: str | None,
     各段独立计数; 某段失败不影响其他段 (各自 fail-closed).
     幂等: 各段独立键 (inprogress:/done:/ev: 前缀) — 同一卡在不同阶段
     互不阻塞 (codex P0: 共用 ID 会让 done/EV 被 running 跳过).
+    并发: 整个主体持进程锁 — 检查-行动原子 (codex 6th: 评论检查与
+    GitHub 写入之间无锁 = 并发双发评论). cron 本机单任务场景下
+    持锁成本可接受.
     """
-    synced = load_synced(state_file)
+    lock_path = state_file.with_suffix(".lock")
+    with _state_lock(lock_path):
+        return _sync_all_locked(repo, project, board, state_file, dry_run)
+
+
+def _sync_all_locked(repo: str, project: dict | None, board: str | None,
+                     state_file: Path, dry_run: bool = False) -> dict:
+    synced = _load_synced_unlocked(state_file)  # 已持锁, 无锁读
     segments = []
 
     def _mark_done_comment(card: dict) -> None:
@@ -535,7 +550,7 @@ def sync_all(repo: str, project: dict | None, board: str | None,
         但不重发评论.
         """
         synced.add("commented:%s" % card["id"])
-        save_synced(state_file, synced)
+        _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
 
     # 1. 执行态: running → In Progress (排除 EV 卡, 归 auditor 段)
     run_cards = [c for c in list_running_cards(board) if not is_ev_card(c)]
@@ -551,7 +566,7 @@ def sync_all(repo: str, project: dict | None, board: str | None,
         run_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
             synced.add("inprogress:%s" % card["id"])
-            save_synced(state_file, synced)  # 每卡立即落盘 (防崩溃重放)
+            _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
     segments.append({"segment": "inprogress", "cards": len(run_cards),
                      "results": run_results})
 
@@ -572,7 +587,7 @@ def sync_all(repo: str, project: dict | None, board: str | None,
         if outcome["status"] == "synced" and not dry_run:
             # 评论+Review 全成功 → 写 reviewed: 键 + 落盘
             synced.add("reviewed:%s" % card["id"])
-            save_synced(state_file, synced)  # 每卡立即落盘 (防崩溃重放)
+            _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
@@ -598,7 +613,7 @@ def sync_all(repo: str, project: dict | None, board: str | None,
         if outcome["status"] == "synced" and not dry_run:
             # EV 评论成功即写幂等键 + 立即落盘 (防崩溃重放). 归档失败仅标记.
             synced.add("ev:%s" % card["id"])
-            save_synced(state_file, synced)  # 每卡立即落盘 (防崩溃重放)
+            _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
@@ -609,7 +624,7 @@ def sync_all(repo: str, project: dict | None, board: str | None,
                      "results": ev_results})
 
     if not dry_run:
-        save_synced(state_file, synced)
+        _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
     return {"segments": segments, "synced_count": len(synced)}
 
 
