@@ -44,7 +44,6 @@ def run_main(statuses, prev_state=None):
          patch.object(MOD, "save_state", return_value=None), \
          patch.object(MOD, "load_state", return_value=prev_state), \
          patch.object(MOD, "flush_goals", return_value=True), \
-         patch.object(MOD, "extract_report_url", return_value=None), \
          patch("sys.argv", ["dispatcher", "--repo", "o/r",
                             "--config", "/nonexistent.yaml", "--dry-run"]):
         # capture print

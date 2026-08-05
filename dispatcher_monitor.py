@@ -75,9 +75,31 @@ def _load_monitor_state(state_dir: Path) -> dict:
 
 def _save_monitor_state(state_dir: Path, state: dict) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
-    tmp = state_dir / (MONITOR_STATE + ".tmp")
+    tmp = state_dir / ("%s.tmp.%d" % (MONITOR_STATE, os.getpid()))
     tmp.write_text(json.dumps(state))
     tmp.replace(state_dir / MONITOR_STATE)
+
+
+def confirm_delivery(state_dir: Path, notifications: list[dict]) -> None:
+    """投递确认: Human 兜底通知实际发出后才递增计数.
+
+    解决 codex P1: 计数落盘过早 → 外部投递失败会吞掉兜底.
+    由 dispatcher 在 flush_goals 成功 (delivery_ok) 后调用.
+    """
+    human_issues = {n.get("issue") for n in notifications
+                    if "Human 状态超时" in n.get("message", "")}
+    if not human_issues:
+        return
+    state_dir = Path(state_dir)
+    mstate = _load_monitor_state(state_dir)
+    human_notify = mstate.setdefault("human_notify", {})
+    now = _now()
+    for num in human_issues:
+        if num is None:
+            continue
+        human_notify[str(num)] = human_notify.get(str(num), 0) + 1
+        human_notify[str(num) + ":last"] = now
+    _save_monitor_state(state_dir, mstate)
 
 
 def _disk_usage_pct() -> float | None:
@@ -136,8 +158,9 @@ def run_monitor(repo: str, project: dict | None, state_dir: Path,
     warnings: list[str] = []
     notifications: list[dict] = []
 
-    def emit(role, message, level=1):
-        notifications.append({"role": role, "message": message, "level": level})
+    def emit(role, message, level=1, issue=None):
+        notifications.append({"role": role, "message": message, "level": level,
+                              "issue": issue})
         if notify:
             notify(role, message)
 
@@ -200,6 +223,7 @@ def run_monitor(repo: str, project: dict | None, state_dir: Path,
                             num, st, int(age / 86400)), level=1)
 
     # Human 超时兜底: 持续 8h+ → 每小时 1 次, 上限 3 次
+    # 计数由 confirm_delivery 在投递确认后递增 (codex P1: 防投递失败吞掉兜底)
     for num, info in entered.items():
         if info.get("status") != "Human":
             continue
@@ -217,13 +241,13 @@ def run_monitor(repo: str, project: dict | None, state_dir: Path,
                 emit("user",
                      "⛔ Human 状态超时兜底: issue #%s 已 %d 小时无人处理 "
                      "(第 %d/3 次提醒, 邮件/短信通道)" % (
-                         num, int(age_h), count + 1), level=3)
-                human_notify[num] = count + 1
-                human_notify[num + ":last"] = now
+                         num, int(age_h), count + 1), level=3,
+                     issue=num)
     _save_monitor_state(state_dir, mstate)
 
-    # ── 2. 活性检测 (In Progress 但工作目录无活动) ──
-    if workdirs:
+    # ── 2. 活性检测 (仅当有 In Progress issue 时检查工作目录活动) ──
+    in_progress = [num for num, st in current.items() if st == "In Progress"]
+    if workdirs and in_progress:
         stale_dirs = _check_activity(state_dir, workdirs)
         if stale_dirs:
             emit("user", "⚠️ 活性消失: 工作目录无写入活动 %s "

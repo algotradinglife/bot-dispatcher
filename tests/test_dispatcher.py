@@ -141,30 +141,4 @@ def test_load_state_corrupt_file_returns_none_and_backs_up() -> None:
 
 
 
-def test_extract_report_url_none_when_no_template_field() -> None:
-    """自由文本提到 results/... 但不含模板字段 → None (不猜)."""
-    with patch.object(MOD.subprocess, "run") as mocked:
-        mocked.side_effect = [
-            SimpleNamespace(returncode=0, stdout=json.dumps([
-                {"number": 200, "state": "MERGED",
-                 "body": "Package: results/bj145_gate_b_summary.md"},
-            ]), stderr=""),
-        ]
-        url = MOD.extract_report_url("example-org/sample", 145)
-    assert url is None
-
-
-def test_extract_report_url_none_when_no_linked_pr() -> None:
-    """No linked PR carrying the issue number -> no report URL."""
-    with patch.object(MOD.subprocess, "run") as mocked:
-        mocked.side_effect = [
-            SimpleNamespace(returncode=0, stdout=json.dumps([
-                {"number": 200, "state": "MERGED", "body": "Unrelated work."},
-            ]), stderr=""),
-        ]
-        url = MOD.extract_report_url("example-org/sample", 999)
-    assert url is None
-
-
-# ── pr_linked_issue_numbers: API 结构化优先, 文本兜底 ──────────────────
 

@@ -224,6 +224,60 @@ def gql_query(query, retries=4, base_delay=1.0):
 
 
 
+def get_project_items(cfg):
+    """Fetch all items from configured Projects with cursor pagination."""
+    result = []
+    for proj in cfg.get("projects", []):
+        pn = proj["number"]
+        pid = proj["node"]
+        cursor = None
+        while True:
+            after = "null" if cursor is None else json.dumps(cursor)
+            query = (
+                '{node(id:%s){... on ProjectV2{items(first:%d,after:%s){'
+                'nodes{id content{__typename ... on Issue{number title} '
+                '... on PullRequest{number title}} fieldValues(first:20){nodes{'
+                '__typename ... on ProjectV2ItemFieldSingleSelectValue{name '
+                'field{... on ProjectV2SingleSelectField{name}}}}}} '
+                'pageInfo{hasNextPage endCursor}}}}}'
+            ) % (json.dumps(pid), GRAPH_PAGE_SIZE, after)
+            data = gql_query(query)
+            project = data.get("data", {}).get("node")
+            if not isinstance(project, dict):
+                raise ControlPlaneUnavailable("Project #%d unavailable" % pn)
+            connection = project.get("items")
+            if not isinstance(connection, dict):
+                raise ControlPlaneUnavailable("Project #%d items unavailable" % pn)
+            for node in connection.get("nodes", []):
+                content = node.get("content")
+                if not content or not content.get("number"):
+                    continue
+                status = "Inbox"
+                for value in node.get("fieldValues", {}).get("nodes", []):
+                    if not isinstance(value, dict):
+                        continue
+                    field = value.get("field")
+                    if (value.get("__typename") == "ProjectV2ItemFieldSingleSelectValue"
+                            and isinstance(field, dict) and field.get("name") == "Status"):
+                        status = value.get("name", "Inbox")
+                        break
+                result.append({
+                    "number": content["number"],
+                    "status": status,
+                    "project_num": pn,
+                    "project_name": proj.get("name", str(pn)),
+                    "_item_id": node["id"],
+                    "is_pr": content.get("__typename") == "PullRequest",
+                })
+            page = connection.get("pageInfo") or {}
+            if not page.get("hasNextPage"):
+                break
+            cursor = page.get("endCursor")
+            if not cursor:
+                raise ControlPlaneUnavailable("Project #%d pagination cursor missing" % pn)
+    return result
+
+
 def build_issue_proj_map(cfg):
     items = get_project_items(cfg)
     mm = {}
@@ -238,41 +292,6 @@ def build_issue_proj_map(cfg):
             )
         mm[number] = project_num
     return mm, items
-
-
-
-
-
-def extract_report_url(repo, issue_num):
-    """Find the analysis-report link for a completed Issue.
-
-    状态表示原则: 只解析 worker 按模板写入的 `**报告**: <url>` 字段
-    (结构化约定, 模板生成), 不扫任意自由文本找链接. 无模板字段 → None.
-    """
-    try:
-        r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "all",
-                            "--limit", "100",
-                            "--json",
-                            "number,title,state,body,mergedAt,updatedAt,"
-                            "closingIssuesReferences",
-                            "--jq", ".[] | select(.body != null)"],
-                           capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            return None
-        candidates = []
-        for pr in json.loads(r.stdout):
-            if issue_num not in pr_linked_issue_numbers(pr):
-                continue
-            candidates.append(pr)
-        # Most recently updated/merged first.
-        candidates.sort(key=lambda p: p.get("mergedAt") or p.get("updatedAt") or "", reverse=True)
-        for pr in candidates:
-            m = REPORT_FIELD_RE.search(pr.get("body", "") or "")
-            if m:
-                return m.group(1)
-    except Exception:
-        pass
-    return None
 
 
 
@@ -420,9 +439,10 @@ def main():
     # ── 2. 滞留监控 (WARN) + 活性检测 + 资源监控 ──
     # (v0_3: dispatcher 监控职责; 详见 monitor.py / tick 脚本)
     try:
-        from dispatcher_monitor import run_monitor
+        from dispatcher_monitor import run_monitor, confirm_delivery
         mon = run_monitor(repo, project=projects[0] if projects else None,
-                          state_dir=args.state_dir, notify=queue_goal)
+                          state_dir=args.state_dir, notify=queue_goal,
+                          items=items if control_plane_ok else None)
         for w in mon.get("warnings", []):
             output["warnings"].append("%s %s" % (prefix, w))
         for n in mon.get("notifications", []):
@@ -431,6 +451,13 @@ def main():
         output["warnings"].append("%s monitor: %s" % (prefix, str(e)[:120]))
 
     delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run, cfg=cfg)
+    # Human 兜底计数延迟到投递确认后 (投递失败不计数, 下次可重发)
+    if not args.dry_run and delivery_ok:
+        try:
+            from dispatcher_monitor import confirm_delivery
+            confirm_delivery(args.state_dir, output.get("notifications", []))
+        except Exception:
+            pass
     if first_run:
         output["warnings"].append(
             "%s first run: baseline recorded, historical events not replayed" % prefix)
