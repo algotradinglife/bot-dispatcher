@@ -25,6 +25,12 @@ kanban 是执行态（工作卡），单向映射、不双写。
 - **PI** owns routing policy, business and research decisions, final domain
   acceptance, and deployment authorization. PI 决策动作（评审、merge、验收）
   必须由 PI 账号执行。
+- **PI Review 是对抗性审查，不是盖章**：EV 验证证据链与代码质量，
+  但**结论正确性、推理强度、过度外推只有 PI 能挑战**。PI 必须假设 worker
+  可能错了，主动进攻：结论边界与反面情形、过度外推（样本→总体/相关→因果/
+  单中心→普适）、选择性汇报与隐藏反例、反事实检验、逻辑链完整、方法适当、
+  假设显式、数字可交叉戳穿、换位质疑、文献真实。**形式完整（模板齐全、EV
+  PASS）≠ 结论正确**——对抗性拷问不过 → CHANGES_REQUESTED 打回。
 - **PI 维护路线图**（`docs/ROADMAP.md`）：路线图是 PI 的职责，worker 不做
   方案设计。每次 worker 产出评审 merge 后，PI 必须更新路线图（将已验证的
   产出纳入 §2 当前路线 / §3 已验证资产，追加 §5 更新记录）。版本 v0_N
