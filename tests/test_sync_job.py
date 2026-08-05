@@ -196,3 +196,89 @@ def test_extract_issue_number_prefers_explicit_issue_field() -> None:
     card = done_card(title="[Issue #99] Different",
                      body="issue: 42\nContract here")
     assert MOD.extract_issue_number(card) == 42
+
+
+# ── EV verdict sync (auditor → GitHub, 账号即物证) ─────────────────────
+
+def ev_card(verdict: str = "REJECT: 缺 §7 附录", title: str = "[EV] issue #1 审计",
+            status: str = "done") -> dict:
+    return {
+        "id": "t_ev1",
+        "title": title,
+        "body": "issue: 1\nEV for #1",
+        "result": verdict,
+        "status": status,
+    }
+
+
+def test_is_ev_card_detects_prefix() -> None:
+    assert MOD.is_ev_card(ev_card()) is True
+    assert MOD.is_ev_card(done_card()) is False
+
+
+def test_sync_ev_verdict_reject_posts_comment() -> None:
+    card = ev_card(verdict="REJECT: 缺 §7 附录, 请补齐")
+    with patch.object(MOD.subprocess, "run",
+                      return_value=SimpleNamespace(returncode=0,
+                                                   stdout="ok", stderr="")) as m:
+        out = MOD.sync_ev_verdict(card, "org/repo")
+    assert out["status"] == "synced"
+    assert "REJECT" in out["verdict"]
+    argv = m.call_args.args[0]
+    assert argv[:3] == ["gh", "issue", "comment"]
+    body = argv[argv.index("--body") + 1]
+    assert "REJECT" in body
+    assert "EV 裁决" in body
+
+
+def test_sync_ev_verdict_pass_label() -> None:
+    card = ev_card(verdict="PASS: 证据链完整")
+    with patch.object(MOD.subprocess, "run",
+                      return_value=SimpleNamespace(returncode=0,
+                                                   stdout="ok", stderr="")):
+        out = MOD.sync_ev_verdict(card, "org/repo")
+    assert "PASS" in out["verdict"]
+    assert "REJECT" not in out["verdict"]
+
+
+def test_sync_ev_verdict_no_issue_ref_skipped() -> None:
+    card = ev_card(title="[EV] no ref here")
+    card["body"] = "no issue link"
+    out = MOD.sync_ev_verdict(card, "org/repo")
+    assert out["status"] == "skipped"
+
+
+def test_sync_ev_verdict_no_result_skipped() -> None:
+    card = ev_card(verdict="")
+    out = MOD.sync_ev_verdict(card, "org/repo")
+    assert out["status"] == "skipped"
+    assert "no verdict" in out["reason"]
+
+
+def test_main_ev_mode_switches_to_pi_account(tmp_path: Path) -> None:
+    """--sync-ev 模式: EV 卡裁决以 hh1985 账号发 (账号即物证)."""
+    state_file = tmp_path / "synced_org_repo.json"
+    calls: list[list[str]] = []
+
+    def fake_run(argv, capture_output=False, text=False, timeout=30,
+                 input=None, env=None):
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    with patch.object(MOD, "list_all_cards", return_value=[ev_card()]), \
+         patch.object(MOD, "list_done_cards", return_value=[]), \
+         patch.object(MOD.subprocess, "run", side_effect=fake_run), \
+         patch.object(MOD, "save_synced"):
+        # simulate the --sync-ev branch (as main does)
+        ev_cards = [c for c in MOD.list_all_cards()
+                    if MOD.is_ev_card(c) and c.get("status") == "done"]
+        gh_user = "hh1985"
+        for card in ev_cards:
+            MOD.subprocess.run(["gh", "auth", "switch", "--user", gh_user],
+                               capture_output=True, text=True, timeout=30)
+            MOD.sync_ev_verdict(card, "org/repo")
+    auth_switch = [a for a in calls if a[:2] == ["gh", "auth"]]
+    comment_call = [a for a in calls if a[:3] == ["gh", "issue", "comment"]]
+    assert auth_switch, "必须切换账号"
+    assert "hh1985" in auth_switch[0]
+    assert comment_call, "必须发评论"

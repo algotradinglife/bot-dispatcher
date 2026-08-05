@@ -267,11 +267,15 @@ OUT=$(cd $BASE && python3 bot-dispatcher/dispatcher.py \\
 SYNC_OUT=$(cd $BASE && python3 bot-dispatcher/sync_job.py \\
   --repo $REPO --config $CFG --board $BOARD --state-dir $STATE --archive 2>&1)
 
-python3 - "$OUT" "$SYNC_OUT" <<'PY'
+EV_OUT=$(cd $BASE && python3 bot-dispatcher/sync_job.py \\
+  --repo $REPO --config $CFG --board $BOARD --state-dir $STATE \\
+  --sync-ev --gh-user hh1985 --archive 2>&1)
+
+python3 - "$OUT" "$SYNC_OUT" "$EV_OUT" <<'PY'
 import json, sys
 
 lines = []
-disp_raw, sync_raw = sys.argv[1], sys.argv[2]
+disp_raw, sync_raw, ev_raw = sys.argv[1], sys.argv[2], sys.argv[3]
 
 try:
     d = json.loads(disp_raw)
@@ -296,6 +300,18 @@ try:
             if r.get('status') == 'synced':
                 lines.append('  - issue #%s → %s %s' % (
                     r.get('issue'), [a.get('action') for a in r.get('actions', [])],
+                    '🗂' if r.get('archived') else ''))
+except Exception:
+    pass
+
+try:
+    e = json.loads(ev_raw)
+    if e.get('new'):
+        lines.append('🔍 %d 条 EV 裁决已同步 (hh1985)'.format(len(e['results'])))
+        for r in e['results']:
+            if r.get('status') == 'synced':
+                lines.append('  - issue #%s: %s %s' % (
+                    r.get('issue'), r.get('verdict', ''),
                     '🗂' if r.get('archived') else ''))
 except Exception:
     pass

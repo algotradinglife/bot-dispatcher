@@ -123,6 +123,78 @@ def list_done_cards(board: str | None = None) -> list[dict]:
     return json.loads(r.stdout or "[]")
 
 
+def list_all_cards(board: str | None = None) -> list[dict]:
+    """All cards regardless of status (for EV verdict sync)."""
+    argv = ["hermes", "kanban", "list", "--json"]
+    if board:
+        r = subprocess.run(
+            ["hermes", "kanban", "boards", "switch", board],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            raise RuntimeError("kanban boards switch failed: %s" % r.stderr.strip()[:200])
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError("kanban list failed: %s" % r.stderr.strip()[:200])
+    return json.loads(r.stdout or "[]")
+
+
+def is_ev_card(card: dict) -> bool:
+    """EV 卡约定: title 以 [EV] 开头 (dispatcher 建 EV 卡时使用)."""
+    return str(card.get("title") or "").strip().startswith("[EV]")
+
+
+def sync_ev_verdict(card: dict, repo: str, dry_run: bool = False) -> dict:
+    """把 Alan 的 EV 裁决 (result 字段) 作为 issue comment 同步到 GitHub.
+
+    EV 卡完成 (status=done) 时, result 含裁决文本 (PASS/REJECT + 缺失项).
+    此同步是汇报通道的一部分 (与证据摘要同步同一哲学):
+    - 评论贴到 EV 卡关联的 issue
+    - 评论即 PI Review 的输入; REJECT 时 PI 据此驳回回卡, 不置 Review
+    """
+    issue_num = extract_issue_number(card)
+    if issue_num is None:
+        return {"card": card["id"], "status": "skipped", "reason": "no issue ref"}
+    verdict = card.get("result") or ""
+    if not verdict.strip():
+        return {"card": card["id"], "status": "skipped", "reason": "no verdict in result"}
+
+    # 裁决判定 (宽松: 看正文是否含 REJECT/PASS)
+    upper = verdict.upper()
+    if "REJECT" in upper and "PASS" not in upper.split("REJECT")[0]:
+        verdict_label = "❌ **REJECT**（驳回回卡）"
+    elif "PASS" in upper:
+        verdict_label = "✅ **PASS**（通过）"
+    else:
+        verdict_label = "⚪ 裁决未明确（需人工确认）"
+
+    comment = [
+        "## 🔍 EV 裁决（auditor 自动同步）",
+        "",
+        "**审计对象**: %s" % (card.get("title") or "(untitled)"),
+        "**裁决**: %s" % verdict_label,
+        "",
+        "**裁决详情**:",
+        "",
+        verdict,
+    ]
+    body = "\n".join(comment)
+    actions = []
+    if dry_run:
+        actions.append({"action": "ev_comment", "dry_run": True, "body": body[:100]})
+    else:
+        r = subprocess.run(
+            ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", body],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return {"card": card["id"], "status": "failed",
+                    "reason": "ev_comment: %s" % r.stderr.strip()[:160]}
+        actions.append({"action": "ev_comment", "ok": True})
+    return {"card": card["id"], "status": "synced", "issue": issue_num,
+            "verdict": verdict_label, "actions": actions}
+
+
 def load_synced(state_file: Path) -> set[str]:
     if state_file.exists():
         try:
@@ -224,6 +296,13 @@ def main() -> None:
                         help="archive done cards after successful sync "
                              "(keeps the board clean; default off for "
                              "backward compatibility)")
+    parser.add_argument("--sync-ev", action="store_true",
+                        help="sync EV verdicts ([EV] cards with a result) to "
+                             "GitHub issue comments instead of the done-card "
+                             "evidence sync")
+    parser.add_argument("--gh-user", default=None,
+                        help="GitHub account for EV verdict comments "
+                             "(default hh1985 — 账号即物证: 审计独立于 bot)")
     args = parser.parse_args()
 
     project = None
@@ -248,6 +327,33 @@ def main() -> None:
     state_file = args.state_dir / ("synced_%s.json" % args.repo.replace("/", "_"))
     synced = load_synced(state_file)
     results = []
+
+    # EV 同步模式: 读 [EV] 卡 (含 result 裁决), 以独立账号 (默认 hh1985)
+    # 把裁决发到 GitHub issue comment —— 账号即物证: 产出=bot, 审计=hh1985
+    if args.sync_ev:
+        ev_cards = [c for c in list_all_cards(args.board)
+                    if is_ev_card(c) and c.get("status") == "done"]
+        gh_user = args.gh_user or "hh1985"
+        for card in ev_cards:
+            if card["id"] in synced:
+                continue
+            if not args.dry_run:
+                subprocess.run(["gh", "auth", "switch", "--user", gh_user],
+                               capture_output=True, text=True, timeout=30)
+            outcome = sync_ev_verdict(card, args.repo, dry_run=args.dry_run)
+            results.append(outcome)
+            if outcome["status"] == "synced" and not args.dry_run:
+                synced.add(card["id"])
+                if args.archive:
+                    subprocess.run(["hermes", "kanban", "archive", card["id"]],
+                                   capture_output=True, text=True, timeout=15)
+                    outcome["archived"] = True
+        if not args.dry_run:
+            save_synced(state_file, synced)
+        print(json.dumps({"cards": len(ev_cards), "new": len(results),
+                          "results": results}, ensure_ascii=False, indent=2))
+        return
+
     for card in cards:
         if card["id"] in synced:
             continue
