@@ -188,7 +188,7 @@ def gen_workflow(project_id: str, field_id: str, opts: dict, repo: str,
         f'                      "project": "{project_id}",\n'
         f'                      "field": "{field_id}",\n'
         '                      "options": {\n'
-        f'                          "ready_for_review": "{opts["Review"]}",    # Review\n'
+        f'                          "ready_for_review": "{opts["EV Review"]}",    # EV Review\n'
         f'                          "converted_to_draft": "{opts["Ready"]}",   # Ready\n'
         f'                          "closed": "{opts["Done"]}",                # Done\n'
         '                      },\n'
@@ -213,44 +213,31 @@ def gen_workflow(project_id: str, field_id: str, opts: dict, repo: str,
 def gen_dispatcher_yaml(key: str, repo: str, board: str, project_id: str,
                         project_num: int, field_id: str, opts: dict,
                         out: Path, dry: bool) -> Path:
-    body = f"""# {key} dispatcher 配置 — GitHub 控制面 → kanban 执行面
+    body = f"""# {key} dispatcher 配置 — GitHub 控制面 (v0_3: 纯通知+监控)
 # 由 deploy.py 生成; 角色纪律见 templates/AGENTS.md
 repos:
   {key}:
     repo: {repo}
-    delivery_mode: kanban
-    kanban_bin: hermes
-    kanban_board: {board}
     projects:
       - number: {project_num}
         node: "{project_id}"
         name: "{key.title()} Board"
         owner: researcher
         review_field: "{field_id}"
-        review_option: "{opts['Review']}"   # Review
-        inprogress_option: "{opts['In Progress']}"   # In Progress (执行态同步)
-    # worker 角色 → (board, assignee_profile)
+        # 八态 option id (v0_3 契约层)
+        status_options:
+{chr(10).join('          %s: "%s"' % (n, opts[n]) for n in ("Inbox", "Ready", "In Progress", "EV Review", "PI Review", "Blocked", "Human", "Done") if n in opts)}
+    # 角色 → 通知目标 (v0_3: PI 不接收通知, 主动轮询)
     # researcher=Dr. Strange(文献/策略/模型/报告), engineer=Adam(全栈),
     # auditor=Alan(独立 EV, Engineering validation)
     session_map:
-      pi: pi-profile            # PI 评审队列 (常驻 codex session 经原生通道拉取)
-      pm: pm-profile            # 协调 (drwho)
+      pi: pi-profile            # PI (远端 codex, 主动轮询 GitHub, 不接收通知)
       researcher: researcher    # Dr. Strange
       engineer: engineer        # Adam
       auditor: auditor          # Alan (EV)
-    workflow_role: pm
     assignee_map:
       hh1985: pi
       everything-bot-engineer: engineer
-    mention_map:
-      pi: pi
-      pm: pm
-      research: researcher
-      researcher: researcher
-      engineering: engineer
-      engineer: engineer
-      audit: auditor
-      auditor: auditor
 """
     p = out / "dispatcher.yaml"
     if not dry:

@@ -19,7 +19,8 @@ spec.loader.exec_module(deploy)
 
 
 FAKE_OPTS = {"Inbox": "i1", "Ready": "r1", "In Progress": "ip1",
-             "Review": "v1", "Blocked": "b1", "Human": "h1", "Done": "d1"}
+             "EV Review": "v4", "PI Review": "v5",
+             "Blocked": "b1", "Human": "h1", "Done": "d1"}
 
 
 def test_gen_workflow_fills_real_ids(tmp_path):
@@ -30,7 +31,7 @@ def test_gen_workflow_fills_real_ids(tmp_path):
     assert '"acme/algotrading"' in text
     assert '"PVT_PROJ"' in text
     assert '"PVTSSF_FIELD"' in text
-    assert '"ready_for_review": "v1"' in text
+    assert '"ready_for_review": "v4"' in text
     assert '"converted_to_draft": "r1"' in text
     assert '"closed": "d1"' in text
     # template's placeholder repo must be gone
@@ -58,13 +59,18 @@ def test_gen_dispatcher_yaml_structure(tmp_path):
         "PVTSSF_F", FAKE_OPTS, tmp_path, dry=False)
     text = cfg.read_text()
     assert "repo: acme/repo" in text
-    assert "kanban_board: acme-board" in text
     assert 'node: "PVT_PROJ"' in text
-    assert 'review_option: "v1"' in text
+    assert "status_options:" in text
+    assert 'EV Review: "v4"' in text
+    assert 'PI Review: "v5"' in text
     assert "researcher: researcher    # Dr. Strange" in text
     assert "engineer: engineer        # Adam" in text
     assert "auditor: auditor          # Alan (EV)" in text
-    assert "delivery_mode: kanban" in text
+    # v0_3: 无 kanban/mention_map/workflow_role/delivery_mode
+    assert "delivery_mode" not in text
+    assert "kanban_board" not in text
+    assert "mention_map" not in text
+    assert "workflow_role" not in text
 
 
 def test_gen_dispatcher_yaml_dry_run(tmp_path):

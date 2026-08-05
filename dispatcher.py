@@ -60,12 +60,6 @@ def validate_repo_config(repo_name, cfg):
            for role, session in session_map.items()):
         raise ValueError("repo '%s' session_map entries must be non-empty strings" % repo_name)
 
-    workflow_role = cfg.get("workflow_role", "pi")
-    if not isinstance(workflow_role, str) or workflow_role not in session_map:
-        raise ValueError(
-            "repo '%s' workflow_role is not in session_map" % repo_name
-        )
-
     projects = cfg.get("projects", [])
     if not isinstance(projects, list):
         raise ValueError("repo '%s' projects must be a list" % repo_name)
