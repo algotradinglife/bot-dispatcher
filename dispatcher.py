@@ -589,15 +589,18 @@ def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
     return None
 
 
+# 报告链接结构化约定: worker 按输出模板在 PR 描述写 `**报告**: <url>`.
+# dispatcher 只解析这个模板字段 (机器约定), 不扫任意自由文本.
+REPORT_FIELD_RE = re.compile(
+    r"\*\*报告\*\*\s*:\s*(https?://[^\s\)\]]+)", re.IGNORECASE)
+
+
 def extract_report_url(repo, issue_num):
-    """Find the analysis-report link for a completed Issue: inspect linked PR
-    bodies and comments for report paths (results/... or doc/repro/...) or
-    wiki links, preferring the most recently merged/open PR. Returns a
-    GitHub URL (report path or wiki link) or None."""
-    report_patterns = (
-        re.compile(r'(?:results|doc/repro)/(?!\.\.)[A-Za-z0-9_./-]+(?<![./])', re.IGNORECASE),
-        re.compile(r'https://github\.com/%s/wiki/[A-Za-z0-9_./#-]+' % re.escape(repo), re.IGNORECASE),
-    )
+    """Find the analysis-report link for a completed Issue.
+
+    状态表示原则: 只解析 worker 按模板写入的 `**报告**: <url>` 字段
+    (结构化约定, 模板生成), 不扫任意自由文本找链接. 无模板字段 → None.
+    """
     try:
         r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "all",
                             "--limit", "100",
@@ -615,25 +618,10 @@ def extract_report_url(repo, issue_num):
             candidates.append(pr)
         # Most recently updated/merged first.
         candidates.sort(key=lambda p: p.get("mergedAt") or p.get("updatedAt") or "", reverse=True)
-        texts = []
         for pr in candidates:
-            texts.append(pr.get("body", ""))
-            try:
-                cr = subprocess.run(["gh", "pr", "view", str(pr["number"]), "--repo", repo,
-                                     "--json", "comments", "--jq", ".comments[].body"],
-                                    capture_output=True, text=True, timeout=15)
-                if cr.returncode == 0 and cr.stdout.strip():
-                    texts.extend(json.loads(cr.stdout))
-            except Exception:
-                pass
-        for text in texts:
-            for pat in report_patterns:
-                m = pat.search(text or "")
-                if m:
-                    path = m.group(0)
-                    if path.startswith("http"):
-                        return path
-                    return "https://github.com/%s/blob/main/%s" % (repo, path)
+            m = REPORT_FIELD_RE.search(pr.get("body", "") or "")
+            if m:
+                return m.group(1)
     except Exception:
         pass
     return None
