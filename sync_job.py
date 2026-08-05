@@ -465,11 +465,12 @@ def sync_all(repo: str, project: dict | None, board: str | None,
 
     按执行顺序 (账号切换最少化):
       1) running 卡 → GitHub In Progress (worker 账号)
-      2) done 卡 → 证据评论 + Review (worker 账号)
+      2) done 卡 → 证据评论 + Review (worker 账号, 排除 EV 卡)
       3) [EV] done 卡 → EV 裁决评论 (auditor 账号, 账号即物证)
 
     各段独立计数; 某段失败不影响其他段 (各自 fail-closed).
-    幂等: synced 集合跨段共享, 已同步不重复.
+    幂等: 各段独立键 (inprogress:/done:/ev: 前缀) — 同一卡在不同阶段
+    互不阻塞 (codex P0: 共用 ID 会让 done/EV 被 running 跳过).
     """
     synced = load_synced(state_file)
     segments = []
@@ -479,7 +480,7 @@ def sync_all(repo: str, project: dict | None, board: str | None,
     run_results = []
     worker_user = role_user("worker")
     for card in run_cards:
-        if card["id"] in synced:
+        if "inprogress:%s" % card["id"] in synced:
             continue
         if not dry_run:
             switch_gh_user(worker_user)
@@ -487,15 +488,15 @@ def sync_all(repo: str, project: dict | None, board: str | None,
                                         dry_run=dry_run, gh_user=worker_user)
         run_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
-            synced.add(card["id"])
+            synced.add("inprogress:%s" % card["id"])
     segments.append({"segment": "inprogress", "cards": len(run_cards),
                      "results": run_results})
 
-    # 2. 完成态: done → 证据评论 + Review
-    done_cards = list_done_cards(board)
+    # 2. 完成态: done → 证据评论 + Review (排除 EV 卡, 归 auditor 段)
+    done_cards = [c for c in list_done_cards(board) if not is_ev_card(c)]
     done_results = []
     for card in done_cards:
-        if card["id"] in synced:
+        if "done:%s" % card["id"] in synced:
             continue
         if not dry_run:
             switch_gh_user(worker_user)
@@ -503,11 +504,13 @@ def sync_all(repo: str, project: dict | None, board: str | None,
                                 gh_user=worker_user)
         done_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
-            synced.add(card["id"])
-            if not dry_run:
-                subprocess.run(["hermes", "kanban", "archive", card["id"]],
+            synced.add("done:%s" % card["id"])
+            r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
                 outcome["archived"] = True
+            else:
+                outcome["archive_failed"] = r.stderr.strip()[:120]
     segments.append({"segment": "done", "cards": len(done_cards),
                      "results": done_results})
 
@@ -517,7 +520,7 @@ def sync_all(repo: str, project: dict | None, board: str | None,
     ev_results = []
     auditor_user = role_user("auditor")
     for card in ev_cards:
-        if card["id"] in synced:
+        if "ev:%s" % card["id"] in synced:
             continue
         if not dry_run:
             switch_gh_user(auditor_user)
@@ -525,10 +528,13 @@ def sync_all(repo: str, project: dict | None, board: str | None,
                                   gh_user=auditor_user)
         ev_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
-            synced.add(card["id"])
-            subprocess.run(["hermes", "kanban", "archive", card["id"]],
-                           capture_output=True, text=True, timeout=15)
-            outcome["archived"] = True
+            synced.add("ev:%s" % card["id"])
+            r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                outcome["archived"] = True
+            else:
+                outcome["archive_failed"] = r.stderr.strip()[:120]
     segments.append({"segment": "ev", "cards": len(ev_cards),
                      "results": ev_results})
 

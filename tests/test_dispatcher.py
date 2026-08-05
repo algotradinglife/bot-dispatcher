@@ -399,18 +399,16 @@ def test_first_run_marks_comments_seen_not_forwarded() -> None:
 
 
 def test_load_state_corrupt_file_returns_none_and_backs_up() -> None:
-    """A corrupt state file must yield None (fresh-baseline semantics), never
-    an empty dict — an empty dict would replay every historical event and
-    re-dispatch everything (duplicate dispatch, violates at-least-once)."""
+    """损坏 state 文件 → fail-closed 抛错 (人工处理), 不静默转 baseline."""
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         state_file = Path(td) / "dispatcher_test_state.json"
         state_file.write_text("{broken json!!")
-        result = MOD.load_state(state_file)
-        assert result is None
-        # corrupt file was backed up, not silently dropped
-        assert not state_file.exists()
-        assert (Path(td) / "dispatcher_test_state.json.corrupt").exists()
+        try:
+            MOD.load_state(state_file)
+            assert False, "should raise on corrupt state"
+        except RuntimeError as e:
+            assert "损坏" in str(e)
 
 
 def test_merged_pr_notified_once_across_both_detection_paths() -> None:

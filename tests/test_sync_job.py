@@ -403,3 +403,93 @@ def test_set_issue_in_progress_skips_without_config() -> None:
                                     gh_user="bot-engineer")
     assert out["status"] == "skipped"
     assert "inprogress_option" in out["reason"]
+
+
+# ── sync_all P0 回归 (codex 复核): EV 不被 done 消费 + 分阶段幂等 ─────
+
+def test_sync_all_ev_card_not_consumed_by_done_segment(monkeypatch) -> None:
+    """EV done 卡不能被普通 done 段消费 (worker 账号评论+Review);
+    必须留给 auditor 段发 EV 裁决 (账号即物证)."""
+    ev_card_obj = {
+        "id": "t_ev9", "title": "[EV] issue #9 审计",
+        "body": "issue: 9", "status": "done",
+        "result": "VERDICT: PASS\n证据链完整",
+    }
+    done_cards = [ev_card_obj]
+    run_cards = []
+    all_cards = [ev_card_obj]
+    calls = []
+
+    def fake_list(board=None):
+        return done_cards
+
+    def fake_list_running(board=None):
+        return run_cards
+
+    def fake_list_all(board=None):
+        return all_cards
+
+    def fake_switch(user):
+        calls.append(("switch", user))
+        return None
+
+    def fake_role(role):
+        return "bot-engineer" if role == "worker" else "hh1985"
+
+    with patch.object(MOD, "list_done_cards", side_effect=fake_list), \
+         patch.object(MOD, "list_running_cards", side_effect=fake_list_running), \
+         patch.object(MOD, "list_all_cards", side_effect=fake_list_all), \
+         patch.object(MOD, "switch_gh_user", side_effect=fake_switch), \
+         patch.object(MOD, "role_user", side_effect=fake_role), \
+         patch.object(MOD, "sync_one_card") as m_sync, \
+         patch.object(MOD, "sync_ev_verdict") as m_ev, \
+         patch.object(MOD, "load_synced", return_value=set()), \
+         patch.object(MOD, "save_synced"):
+        m_sync.return_value = {"card": "t_ev9", "status": "synced",
+                               "issue": 9, "actions": [{"action": "comment", "ok": True}]}
+        m_ev.return_value = {"card": "t_ev9", "status": "synced", "issue": 9,
+                             "verdict": "PASS", "actions": [{"action": "ev_comment", "ok": True}]}
+        out = MOD.sync_all("org/repo", None, "b", Path("/tmp/x.json"))
+
+    assert m_sync.call_count == 0, "EV card must NOT go through done segment: %d" % m_sync.call_count
+    assert m_ev.call_count == 1, "EV card must go to EV segment"
+    # auditor 账号 (hh1985) 被用于 EV
+    assert ("switch", "hh1985") in calls, calls
+
+
+def test_sync_all_segmented_idempotency_keys(monkeypatch) -> None:
+    """三段幂等键独立: running 同步过的卡, done 阶段仍可处理 (不共用 ID)."""
+    card = {"id": "t_42", "title": "[Issue #42] x", "body": "issue: 42",
+            "status": "running"}
+    done_card = dict(card, status="done")
+
+    def fake_list_running(board=None):
+        return [card]
+
+    def fake_list_done(board=None):
+        return [done_card]
+
+    def fake_list_all(board=None):
+        return []
+
+    def fake_switch(user):
+        return None
+
+    def fake_role(role):
+        return "bot-engineer"
+
+    with patch.object(MOD, "list_running_cards", side_effect=fake_list_running), \
+         patch.object(MOD, "list_done_cards", side_effect=fake_list_done), \
+         patch.object(MOD, "list_all_cards", side_effect=fake_list_all), \
+         patch.object(MOD, "switch_gh_user", side_effect=fake_switch), \
+         patch.object(MOD, "role_user", side_effect=fake_role), \
+         patch.object(MOD, "set_issue_in_progress") as m_inprog, \
+         patch.object(MOD, "sync_one_card") as m_sync, \
+         patch.object(MOD, "load_synced", return_value=set()), \
+         patch.object(MOD, "save_synced"):
+        m_inprog.return_value = {"card": "t_42", "status": "synced", "issue": 42}
+        m_sync.return_value = {"card": "t_42", "status": "synced", "issue": 42}
+        out = MOD.sync_all("org/repo", None, "b", Path("/tmp/x.json"))
+
+    assert m_inprog.call_count == 1, "running segment should process"
+    assert m_sync.call_count == 1, "done segment must still process same card"

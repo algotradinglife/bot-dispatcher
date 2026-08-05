@@ -283,16 +283,12 @@ def load_state(state_file):
     if state_file.exists():
         try:
             return json.loads(state_file.read_text())
-        except Exception:
-            # Corrupt state: back it up for forensics and return None so the
-            # caller treats this run as a fresh baseline (never replay events
-            # against an empty state — that would re-dispatch everything).
-            try:
-                backup = state_file.with_suffix(".json.corrupt")
-                state_file.rename(backup)
-            except Exception:
-                pass
-            return None
+        except Exception as exc:
+            # 损坏 → fail-closed: 直接退出要求人工处理 (codex P1-5).
+            # 不静默转 baseline (会吞掉此前的历史状态变化).
+            raise RuntimeError(
+                "state 文件损坏 (%s): %s — 已停止, 需人工检查 %s "
+                "(勿自动转 baseline)" % (state_file.name, exc, state_file))
     return None
 
 
