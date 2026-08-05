@@ -282,7 +282,10 @@ def queue_workflow_issue_transition(
 def load_state(state_file):
     if state_file.exists():
         try:
-            return json.loads(state_file.read_text())
+            data = json.loads(state_file.read_text())
+            if not isinstance(data, dict):
+                raise ValueError("顶层必须是 JSON 对象")
+            return data
         except Exception as exc:
             # 损坏 → fail-closed: 直接退出要求人工处理 (codex P1-5).
             # 不静默转 baseline (会吞掉此前的历史状态变化).

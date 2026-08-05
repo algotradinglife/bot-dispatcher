@@ -308,9 +308,12 @@ def sync_ev_verdict(card: dict, repo: str, dry_run: bool = False,
 def load_synced(state_file: Path) -> set[str]:
     if state_file.exists():
         try:
-            return set(json.loads(state_file.read_text()).get("synced", []))
-        except (json.JSONDecodeError, OSError) as exc:
-            # 损坏 → fail-closed: 退出而非返回空集合重放历史 (codex #18).
+            data = json.loads(state_file.read_text())
+            if not isinstance(data, dict) or not isinstance(data.get("synced"), list):
+                raise ValueError("结构非法: 期望 {\"synced\": [..]}")
+            return set(data["synced"])
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            # 损坏/结构非法 → fail-closed: 退出而非返回空集合重放历史 (codex #18).
             # 原子写保证主文件损坏极罕见; 真损坏需人工检查.
             raise RuntimeError(
                 "state 文件损坏 (%s): %s — 已停止, 需人工检查 %s "
@@ -475,8 +478,8 @@ def sync_all(repo: str, project: dict | None, board: str | None,
     synced = load_synced(state_file)
     segments = []
 
-    # 1. 执行态: running → In Progress
-    run_cards = list_running_cards(board)
+    # 1. 执行态: running → In Progress (排除 EV 卡, 归 auditor 段)
+    run_cards = [c for c in list_running_cards(board) if not is_ev_card(c)]
     run_results = []
     worker_user = role_user("worker")
     for card in run_cards:
@@ -504,11 +507,12 @@ def sync_all(repo: str, project: dict | None, board: str | None,
                                 gh_user=worker_user)
         done_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
-            synced.add("done:%s" % card["id"])
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
                 outcome["archived"] = True
+                # 归档成功才记幂等键 → 归档失败下轮可重试 (codex 2nd)
+                synced.add("done:%s" % card["id"])
             else:
                 outcome["archive_failed"] = r.stderr.strip()[:120]
     segments.append({"segment": "done", "cards": len(done_cards),
@@ -528,11 +532,12 @@ def sync_all(repo: str, project: dict | None, board: str | None,
                                   gh_user=auditor_user)
         ev_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
-            synced.add("ev:%s" % card["id"])
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
                 outcome["archived"] = True
+                # 归档成功才记幂等键 → 归档失败下轮可重试 (codex 2nd)
+                synced.add("ev:%s" % card["id"])
             else:
                 outcome["archive_failed"] = r.stderr.strip()[:120]
     segments.append({"segment": "ev", "cards": len(ev_cards),
@@ -640,9 +645,12 @@ def main() -> None:
             if outcome["status"] == "synced" and not args.dry_run:
                 synced.add(card["id"])
                 if args.archive:
-                    subprocess.run(["hermes", "kanban", "archive", card["id"]],
-                                   capture_output=True, text=True, timeout=15)
-                    outcome["archived"] = True
+                    r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
+                                       capture_output=True, text=True, timeout=15)
+                    if r.returncode == 0:
+                        outcome["archived"] = True
+                    else:
+                        outcome["archive_failed"] = r.stderr.strip()[:120]
         if not args.dry_run:
             save_synced(state_file, synced)
         print(json.dumps({"cards": len(ev_cards), "new": len(results),
@@ -663,9 +671,12 @@ def main() -> None:
         if outcome["status"] == "synced" and not args.dry_run:
             synced.add(card["id"])
             if args.archive:
-                subprocess.run(["hermes", "kanban", "archive", card["id"]],
-                               capture_output=True, text=True, timeout=15)
-                outcome["archived"] = True
+                r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
+                                   capture_output=True, text=True, timeout=15)
+                if r.returncode == 0:
+                    outcome["archived"] = True
+                else:
+                    outcome["archive_failed"] = r.stderr.strip()[:120]
     if not args.dry_run:
         save_synced(state_file, synced)
     print(json.dumps({"cards": len(cards), "new": len(results),
