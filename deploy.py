@@ -22,7 +22,7 @@
     2. 创建/复用 GitHub Project V2 (四态 Inbox/Ready/Review/Done)
     3. 生成 pr-status-sync workflow (参数化 PROJECTS 块)
     4. 生成 dispatcher.yaml (session_map / assignee_map / mention_map)
-    5. 生成 tick 脚本 (观察者 cron, 含 sync_job --archive)
+    5. 生成 tick 脚本 (观察者 cron, 只跑 dispatcher)
     6. 初始化团队模板资产 (AGENTS.md / ROADMAP.md / README.md)
 
 --dry-run: 只打印将执行的动作, 不产生任何外部副作用 (不调 gh、不写文件)。
@@ -261,12 +261,10 @@ repos:
 
 # ── 5. tick 脚本生成 ───────────────────────────────────────────────────
 def gen_tick(key: str, repo: str, board: str, deploy_dir: Path, dry: bool) -> Path:
-    repo_name = repo.split("/")[-1]  # e.g. helixatlas (用于目录归属校验)
+    repo_name = repo.split("/")[-1]
     script = f"""#!/bin/bash
-# {key} dispatcher + sync loop — no_agent observer.
-# 1) dispatcher: GitHub read -> kanban cards (never writes GitHub)
-# 2) sync_job --archive: done cards -> evidence comment + Review -> archive
-# 3) sync_job --sync-ev: EV 裁决以独立账号 (hh1985) 发到 GitHub (账号即物证)
+# {key} dispatcher observer tick — no_agent watchdog.
+# v0_3: dispatcher 纯通知+监控 — 读 GitHub 状态, 输出通知事件, 不写 GitHub.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
@@ -275,87 +273,30 @@ BASE={deploy_dir.parent}
 CFG=$BASE/{deploy_dir.name}/dispatcher.yaml
 STATE=$BASE/{deploy_dir.name}/dispatcher-state
 REPO={repo}
-BOARD={board}
-EXPECTED_REPO="{repo}"
 
-# ── 角色账号 (环境变量预传递, 调用方注入, 无默认值) ──
-GH_USER_PI="${{GH_USER_PI:-}}"
-GH_USER_AUDITOR="${{GH_USER_AUDITOR:-}}"
-if [ -z "$GH_USER_PI" ] || [ -z "$GH_USER_AUDITOR" ]; then
-  echo "⚠️ 账号缺失: 必须预传递 GH_USER_PI 和 GH_USER_AUDITOR 环境变量"
-  exit 1
-fi
-
-# ── 守卫 1: 当前账号必须是 PI 账号 — dispatcher/sync 是观察+汇报通道 ──
+# ── 账号守卫: 观察者只读, 不写 GitHub — 用 PI 账号读 (物证: 只读无副作用) ──
 ACTUAL_USER=$($GH api user --jq .login 2>/dev/null || echo "unknown")
-if [ "$ACTUAL_USER" != "$GH_USER_PI" ]; then
-  echo "⚠️ 账号守卫失败: 期望 $GH_USER_PI, 实际 $ACTUAL_USER — 拒绝运行"
+if [ -z "${{ACTUAL_USER:-}}" ] || [ "$ACTUAL_USER" = "unknown" ]; then
+  echo "⚠️ gh 不可用 (账号未登录) — 跳过本轮"
   exit 1
 fi
-
-# ── 守卫 2: 工作目录归属校验 — 防止在错误 repo 执行 git 操作 ──
-if [ -d "$BASE" ] && [ -d "$BASE/.git" ]; then
-  ACTUAL_REPO=$(git -C "$BASE" remote get-url origin 2>/dev/null || echo "no-remote")
-  case "$ACTUAL_REPO" in
-    *"{repo}"*|*"{repo_name}"*) : ;;
-    *)
-      echo "⚠️ 目录守卫失败: $BASE remote ($ACTUAL_REPO) ≠ $EXPECTED_REPO — 拒绝运行"
-      exit 1
-      ;;
-  esac
-fi
-
-$GH auth switch --user hh1985 >/dev/null 2>&1
 
 OUT=$(cd $BASE && python3 bot-dispatcher/dispatcher.py \\
   --repo {key} --config $CFG --state-dir $STATE 2>&1)
 
-SYNC_OUT=$(cd $BASE && GH_USER_WORKER="$GH_USER_WORKER" GH_USER_AUDITOR="$GH_USER_AUDITOR" python3 bot-dispatcher/sync_job.py \
-  --repo $REPO --config $CFG --board $BOARD --state-dir $STATE --sync-all 2>&1)
-
-python3 - "$OUT" "$SYNC_OUT" <<'PY'
+python3 - "$OUT" <<'PY'
 import json, sys
 
 lines = []
-disp_raw, sync_raw = sys.argv[1], sys.argv[2]
-
 try:
-    d = json.loads(disp_raw)
-    sent = [a for a in d.get('actions', []) if a.get('state') == 'sent']
-    warns = d.get('warnings', [])
-    if sent:
-        lines.append('🤖 {{}}: %d 张卡已投递'.format(len(sent)))
-        for a in sent:
-            lines.append('  - %s → %s' % (a.get('session'), a.get('result', '')[:40]))
-    if warns:
-        lines.append('⚠️ %d 条警告'.format(len(warns)))
-        for w in warns[:3]:
-            lines.append('  ! %s' % w[:80])
-except Exception:
-    pass
-
-try:
-    s = json.loads(sync_raw)
-    for seg in s.get('segments', []):
-        new = [r for r in seg.get('results', [])
-               if r.get('status') == 'synced']
-        if not new:
-            continue
-        if seg.get('segment') == 'inprogress':
-            lines.append('▶️ %d 张执行卡已同步 (In Progress)'.format(len(new)))
-            for r in new:
-                lines.append('  - issue #%s → In Progress' % r.get('issue'))
-        elif seg.get('segment') == 'done':
-            lines.append('🔄 %d 张完成卡已同步 + 归档'.format(len(new)))
-            for r in new:
-                lines.append('  - issue #%s → Review %s' % (
-                    r.get('issue'),
-                    '🗂' if r.get('archived') else ''))
-        elif seg.get('segment') == 'ev':
-            lines.append('🔍 %d 条 EV 裁决已同步 (auditor)'.format(len(new)))
-            for r in new:
-                lines.append('  - issue #%s %s' % (
-                    r.get('issue'), r.get('verdict', '')))
+    d = json.loads(sys.argv[1])
+    # v0_3: 通知事件 (role: worker/auditor/user)
+    for n in d.get('notifications', []):
+        role = n.get('role', '?')
+        icon = {{'worker': '🛠', 'auditor': '🔍', 'user': '⛔'}}.get(role, '•')
+        lines.append('%s [%s] %s' % (icon, role, n.get('message', '')[:100]))
+    for w in d.get('warnings', [])[:3]:
+        lines.append('⚠️ %s' % w[:80])
 except Exception:
     pass
 
@@ -363,6 +304,7 @@ if lines:
     print('\\n'.join(lines))
 PY
 """
+
     p = deploy_dir / f"{key}_tick.sh"
     if not dry:
         p.write_text(script)
@@ -370,7 +312,7 @@ PY
     return p
 
 
-# ── main ───────────────────────────────────────────────────────────────
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)

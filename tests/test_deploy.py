@@ -78,8 +78,10 @@ def test_gen_tick_contains_key_and_board(tmp_path):
     text = tk.read_text()
     assert "--repo acme" in text
     assert "acme/repo" in text
-    assert "BOARD=acme-board" in text
-    assert "--archive" in text
+    # v0_3: tick 只跑 dispatcher — 无 sync_job / kanban / --archive
+    assert "sync_job" not in text
+    assert "--archive" not in text
+    assert "notifications" in text
     assert tk.stat().st_mode & 0o111  # executable
 
 
