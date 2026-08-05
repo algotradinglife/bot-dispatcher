@@ -440,8 +440,10 @@ def main():
     # (v0_3: dispatcher 监控职责; 详见 monitor.py / tick 脚本)
     try:
         from dispatcher_monitor import run_monitor
+        # notify 不传回调: 避免 queue_goal 先以 issue=None 写入再被带 issue
+        # 的去重 (codex P1 r3: 锚点丢失). 统一从返回值取通知.
         mon = run_monitor(repo, project=projects[0] if projects else None,
-                          state_dir=args.state_dir, notify=queue_goal,
+                          state_dir=args.state_dir, notify=None,
                           items=items if control_plane_ok else None)
         for w in mon.get("warnings", []):
             output["warnings"].append("%s %s" % (prefix, w))

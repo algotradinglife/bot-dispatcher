@@ -114,29 +114,6 @@ def test_human_escape_count_delayed_until_confirm(tmp_path):
     MOD.HUMAN_ESCAPE_HOURS = 8
 
 
-
-def test_human_escape_count_delayed_until_confirm(tmp_path):
-    """投递未确认不计数 → 下次仍会重发 (codex P1 修复)."""
-    MOD.HUMAN_ESCAPE_HOURS = 0
-    MOD.HUMAN_ESCAPE_MAX = 3
-    items = [{"number": 11, "status": "Human"}]
-    MOD.run_monitor("o/r", None, tmp_path, items=items)
-    st = MOD._load_monitor_state(tmp_path)
-    st["entered"]["11"]["since"] = time.time() - 9 * 3600
-    MOD._save_monitor_state(tmp_path, st)
-    # 两次检测都不 confirm → 每次都发 (计数仍是 0)
-    for _ in range(2):
-        out = MOD.run_monitor("o/r", None, tmp_path, items=items)
-        esc = [n for n in out["notifications"] if "Human 状态超时" in n["message"]]
-        assert esc, "未确认投递时必须重发"
-    # confirm 后 → 计数 1, 下次不重发 (除非 1h 后)
-    MOD.confirm_human_notify(tmp_path, 11)
-    out2 = MOD.run_monitor("o/r", None, tmp_path, items=items)
-    esc2 = [n for n in out2["notifications"] if "Human 状态超时" in n["message"]]
-    assert not esc2, "确认投递后 1h 内不应重发"
-    MOD.HUMAN_ESCAPE_HOURS = 8
-
-
 def test_disk_warn_emitted(tmp_path):
     with patch.object(MOD, "_disk_usage_pct", return_value=95.0):
         out = MOD.run_monitor("o/r", None, tmp_path, items=[])
