@@ -439,25 +439,22 @@ def main():
     # ── 2. 滞留监控 (WARN) + 活性检测 + 资源监控 ──
     # (v0_3: dispatcher 监控职责; 详见 monitor.py / tick 脚本)
     try:
-        from dispatcher_monitor import run_monitor, confirm_delivery
+        from dispatcher_monitor import run_monitor
         mon = run_monitor(repo, project=projects[0] if projects else None,
                           state_dir=args.state_dir, notify=queue_goal,
                           items=items if control_plane_ok else None)
         for w in mon.get("warnings", []):
             output["warnings"].append("%s %s" % (prefix, w))
         for n in mon.get("notifications", []):
-            queue_goal(output, n["role"], n["message"])
+            # 保留 issue 锚点: Human 兜底计数依赖它 (codex P1)
+            queue_goal(output, n["role"], n["message"], issue_num=n.get("issue"))
     except Exception as e:
         output["warnings"].append("%s monitor: %s" % (prefix, str(e)[:120]))
 
     delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run, cfg=cfg)
-    # Human 兜底计数延迟到投递确认后 (投递失败不计数, 下次可重发)
-    if not args.dry_run and delivery_ok:
-        try:
-            from dispatcher_monitor import confirm_delivery
-            confirm_delivery(args.state_dir, output.get("notifications", []))
-        except Exception:
-            pass
+    # Human 兜底计数由外部投递方 (tick 脚本) 在飞书投递成功后调用
+    # dispatcher_monitor.confirm_human_notify(issue) 递增 — dispatcher 无法
+    # 感知外部投递结果, 不做假确认 (codex P1)
     if first_run:
         output["warnings"].append(
             "%s first run: baseline recorded, historical events not replayed" % prefix)

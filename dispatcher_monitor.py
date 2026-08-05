@@ -80,26 +80,48 @@ def _save_monitor_state(state_dir: Path, state: dict) -> None:
     tmp.replace(state_dir / MONITOR_STATE)
 
 
-def confirm_delivery(state_dir: Path, notifications: list[dict]) -> None:
-    """投递确认: Human 兜底通知实际发出后才递增计数.
+def _with_state_lock(state_dir: Path, fn):
+    """flock 包裹状态读改写, 防并发覆盖 (codex P1: 无锁竞态).
 
-    解决 codex P1: 计数落盘过早 → 外部投递失败会吞掉兜底.
-    由 dispatcher 在 flush_goals 成功 (delivery_ok) 后调用.
+    macOS flock 同进程二次 open 会阻塞自己 (不可重入) — 锁内
+    不得再调用本函数或嵌套 flock. 调用方必须一次性完成读-改-写.
     """
-    human_issues = {n.get("issue") for n in notifications
-                    if "Human 状态超时" in n.get("message", "")}
-    if not human_issues:
-        return
     state_dir = Path(state_dir)
-    mstate = _load_monitor_state(state_dir)
-    human_notify = mstate.setdefault("human_notify", {})
-    now = _now()
-    for num in human_issues:
-        if num is None:
-            continue
-        human_notify[str(num)] = human_notify.get(str(num), 0) + 1
-        human_notify[str(num) + ":last"] = now
-    _save_monitor_state(state_dir, mstate)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    lock_f = open(state_dir / (MONITOR_STATE + ".lock"), "w")
+    try:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        return fn()
+    finally:
+        try:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)
+        finally:
+            lock_f.close()
+
+
+def _bump_human_count(state_dir: Path, issue_num) -> None:
+    """在锁内读-改-写 human_notify 计数."""
+    def _inner():
+        mstate = _load_monitor_state(state_dir)
+        human_notify = mstate.setdefault("human_notify", {})
+        now = _now()
+        human_notify[str(issue_num)] = human_notify.get(str(issue_num), 0) + 1
+        human_notify[str(issue_num) + ":last"] = now
+        _save_monitor_state(state_dir, mstate)
+        return human_notify[str(issue_num)]
+    return _with_state_lock(state_dir, _inner)
+
+
+def confirm_human_notify(state_dir: Path, issue_num) -> int:
+    """外部投递确认: tick 脚本在飞书投递成功后调用, 递增 Human 兜底计数.
+
+    替代旧的 confirm_delivery (假确认 — dispatcher 无法感知外部投递结果).
+    返回递增后的计数.
+    """
+    if issue_num is None:
+        return 0
+    return _bump_human_count(state_dir, issue_num)
 
 
 def _disk_usage_pct() -> float | None:
@@ -167,9 +189,6 @@ def run_monitor(repo: str, project: dict | None, state_dir: Path,
     _write_heartbeat(state_dir)
 
     # ── 1. 滞留 WARN + Human 超时兜底 (基于 state 里的 entered 时间) ──
-    mstate = _load_monitor_state(state_dir)
-    entered = mstate.setdefault("entered", {})
-    human_notify = mstate.setdefault("human_notify", {})
     now = _now()
 
     # items: [{number, status}] — 来自 dispatcher 或独立查询
@@ -200,50 +219,65 @@ def run_monitor(repo: str, project: dict | None, state_dir: Path,
     current = {str(it.get("number")): it.get("status", "Inbox")
                for it in items if it.get("number") is not None}
 
-    # 记录状态进入时间 (状态未变则保留原 since)
-    for num, st in current.items():
-        prev = entered.get(num)
-        if not isinstance(prev, dict) or prev.get("status") != st:
-            entered[num] = {"status": st, "since": now}
+    # ── 状态读-改-写原子化 (codex P1: 无锁并发覆盖) ──
+    # 锁内: 加载 mstate → 更新 entered → 判断滞留/Human → 写回;
+    # 锁外: emit 通知 (不阻塞锁, 回调可能慢).
+    def _judge():
+        mstate = _load_monitor_state(state_dir)
+        entered = mstate.setdefault("entered", {})
+        human_notify = mstate.setdefault("human_notify", {})
+        pending = []
 
-    # 滞留 WARN (状态超阈值且仍在该状态)
-    for num, info in entered.items():
-        st = info.get("status")
-        since = info.get("since", now)
-        thr = STALE_THRESHOLDS.get(st)
-        if not thr:
-            continue
-        if current.get(num) != st:
-            continue  # 状态已变
-        age = now - since
-        if age > thr:
-            # WARN: token 成本提示, 不介入
-            emit("user", "⚠️ 滞留 WARN: issue #%s 在 [%s] 已 %d 天 "
-                        "(token 成本提示, 不介入)" % (
-                            num, st, int(age / 86400)), level=1)
+        # 记录状态进入时间 (状态未变则保留原 since)
+        for num, st in current.items():
+            prev = entered.get(num)
+            if not isinstance(prev, dict) or prev.get("status") != st:
+                entered[num] = {"status": st, "since": now}
 
-    # Human 超时兜底: 持续 8h+ → 每小时 1 次, 上限 3 次
-    # 计数由 confirm_delivery 在投递确认后递增 (codex P1: 防投递失败吞掉兜底)
-    for num, info in entered.items():
-        if info.get("status") != "Human":
-            continue
-        if current.get(num) != "Human":
-            continue
-        since = info.get("since", now)
-        age_h = (now - since) / 3600
-        if age_h >= HUMAN_ESCAPE_HOURS:
-            count = human_notify.get(num, 0)
-            if count < HUMAN_ESCAPE_MAX:
-                # 已发过且距上次 <1h 则跳过
-                last = human_notify.get(num + ":last", 0)
-                if count > 0 and (now - last) < 3600:
-                    continue
-                emit("user",
-                     "⛔ Human 状态超时兜底: issue #%s 已 %d 小时无人处理 "
-                     "(第 %d/3 次提醒, 邮件/短信通道)" % (
-                         num, int(age_h), count + 1), level=3,
-                     issue=num)
-    _save_monitor_state(state_dir, mstate)
+        # 滞留 WARN (状态超阈值且仍在该状态)
+        for num, info in entered.items():
+            st = info.get("status")
+            since = info.get("since", now)
+            thr = STALE_THRESHOLDS.get(st)
+            if not thr:
+                continue
+            if current.get(num) != st:
+                continue  # 状态已变
+            age = now - since
+            if age > thr:
+                # WARN: token 成本提示, 不介入
+                pending.append(("user",
+                    "⚠️ 滞留 WARN: issue #%s 在 [%s] 已 %d 天 "
+                    "(token 成本提示, 不介入)" % (num, st, int(age / 86400)),
+                    1, num))
+
+        # Human 超时兜底: 持续 8h+ → 每小时 1 次, 上限 3 次
+        # 计数由外部投递方 confirm_human_notify 递增 (codex P1: 防投递失败吞掉)
+        for num, info in entered.items():
+            if info.get("status") != "Human":
+                continue
+            if current.get(num) != "Human":
+                continue
+            since = info.get("since", now)
+            age_h = (now - since) / 3600
+            if age_h >= HUMAN_ESCAPE_HOURS:
+                count = human_notify.get(num, 0)
+                if count < HUMAN_ESCAPE_MAX:
+                    # 已发过且距上次 <1h 则跳过
+                    last = human_notify.get(num + ":last", 0)
+                    if count > 0 and (now - last) < 3600:
+                        continue
+                    pending.append(("user",
+                        "⛔ Human 状态超时兜底: issue #%s 已 %d 小时无人处理 "
+                        "(第 %d/3 次提醒, 邮件/短信通道)" % (
+                            num, int(age_h), count + 1), 3, num))
+
+        _save_monitor_state(state_dir, mstate)
+        return pending
+
+    pending = _with_state_lock(state_dir, _judge)
+    for role, message, level, issue in pending:
+        emit(role, message, level=level, issue=issue)
 
     # ── 2. 活性检测 (仅当有 In Progress issue 时检查工作目录活动) ──
     in_progress = [num for num, st in current.items() if st == "In Progress"]
@@ -281,7 +315,16 @@ def main() -> None:
     parser.add_argument("--state-dir", type=Path,
                         default=Path("~/.hermes/bot-dispatcher").expanduser())
     parser.add_argument("--workdirs", nargs="*", default=[])
+    parser.add_argument("--confirm-issue", type=int, default=None,
+                        help="外部投递确认: 飞书投递成功后递增 Human 兜底计数")
     args = parser.parse_args()
+
+    if args.confirm_issue is not None:
+        count = confirm_human_notify(args.state_dir, args.confirm_issue)
+        print(json.dumps({"confirmed": args.confirm_issue,
+                          "count": count}, ensure_ascii=False))
+        return
+
     out = run_monitor(args.repo, None, args.state_dir,
                       workdirs=[Path(w) for w in args.workdirs])
     print(json.dumps(out, ensure_ascii=False, indent=2))

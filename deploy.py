@@ -295,6 +295,9 @@ try:
         role = n.get('role', '?')
         icon = {{'worker': '🛠', 'auditor': '🔍', 'user': '⛔'}}.get(role, '•')
         lines.append('%s [%s] %s' % (icon, role, n.get('message', '')[:100]))
+        # Human 兜底通知: 投递后须外部确认 (codex P1: 防假确认吞掉计数)
+        if 'Human 状态超时' in n.get('message', '') and n.get('issue'):
+            print('CONFIRM_ISSUE=%s' % n['issue'])
     for w in d.get('warnings', [])[:3]:
         lines.append('⚠️ %s' % w[:80])
 except Exception:
@@ -303,6 +306,15 @@ except Exception:
 if lines:
     print('\\n'.join(lines))
 PY
+
+# ── Human 兜底: 投递确认 (真实投递成功后计数, 防投递失败吞掉 3 次机会) ──
+CONFIRM_ISSUES=$(echo "$OUT" | grep '^CONFIRM_ISSUE=' | cut -d= -f2 | sort -u || true)
+if [ -n "$CONFIRM_ISSUES" ]; then
+  for ISSUE in $CONFIRM_ISSUES; do
+    python3 bot-dispatcher/dispatcher_monitor.py --repo {key} \
+      --state-dir $STATE --confirm-issue "$ISSUE" >/dev/null 2>&1 || true
+  done
+fi
 """
 
     p = deploy_dir / f"{key}_tick.sh"

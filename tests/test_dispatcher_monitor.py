@@ -45,44 +45,47 @@ def test_stale_warn_emitted(tmp_path):
         MOD.STALE_THRESHOLDS["Ready"] = 3 * 86400
 
 
+def _confirm_human(notifications):
+    """确认所有 Human 兜底通知 (模拟 tick 脚本投递后确认)."""
+    for n in notifications:
+        if "Human 状态超时" in n.get("message", ""):
+            return n.get("issue")
+    return None
+
+
 def test_human_escape_notifies_max_3(tmp_path):
-    """Human 持续 8h+ → 每小时 1 次, 上限 3 次 (计数由 confirm_delivery 递增)."""
+    """Human 持续 8h+ → 每小时 1 次, 上限 3 次 (计数由 confirm_human_notify 递增)."""
     MOD.HUMAN_ESCAPE_HOURS = 0  # 立即触发
     MOD.HUMAN_ESCAPE_MAX = 3
     notif = []
     items = [{"number": 9, "status": "Human"}]
+
+    def run():
+        return MOD.run_monitor("o/r", None, tmp_path,
+                               notify=lambda r, m: notif.append((r, m)),
+                               items=items)
+
     # 首次调用记录进入时间 (HOURS=0 会立即触发一次, 先确认掉)
-    out0 = MOD.run_monitor("o/r", None, tmp_path,
-                           notify=lambda r, m: notif.append((r, m)), items=items)
-    MOD.confirm_delivery(tmp_path, out0["notifications"])
+    out0 = run()
+    if _confirm_human(out0["notifications"]):
+        MOD.confirm_human_notify(tmp_path, 9)
     # 模拟 8h 过去: 改 entered 时间
     st = MOD._load_monitor_state(tmp_path)
     st["entered"]["9"]["since"] = time.time() - 9 * 3600
     MOD._save_monitor_state(tmp_path, st)
-    # 第 1 次 (8h+) → 通知; 确认投递 → 计数 1
-    out = MOD.run_monitor("o/r", None, tmp_path,
-                          notify=lambda r, m: notif.append((r, m)), items=items)
-    MOD.confirm_delivery(tmp_path, out["notifications"])
-    # 第 2 次 (1h 后) → 通知; 确认 → 计数 2
-    st = MOD._load_monitor_state(tmp_path)
-    st["human_notify"]["9:last"] = time.time() - 3600
-    MOD._save_monitor_state(tmp_path, st)
-    out = MOD.run_monitor("o/r", None, tmp_path,
-                          notify=lambda r, m: notif.append((r, m)), items=items)
-    MOD.confirm_delivery(tmp_path, out["notifications"])
-    # 第 3 次 → 通知; 确认 → 计数 3
-    st = MOD._load_monitor_state(tmp_path)
-    st["human_notify"]["9:last"] = time.time() - 3600
-    MOD._save_monitor_state(tmp_path, st)
-    out = MOD.run_monitor("o/r", None, tmp_path,
-                          notify=lambda r, m: notif.append((r, m)), items=items)
-    MOD.confirm_delivery(tmp_path, out["notifications"])
+    # 第 1-3 次: 通知 + 确认投递 → 计数 1/2/3
+    for _ in range(3):
+        st = MOD._load_monitor_state(tmp_path)
+        st["human_notify"]["9:last"] = time.time() - 3600
+        MOD._save_monitor_state(tmp_path, st)
+        out = run()
+        if _confirm_human(out["notifications"]):
+            MOD.confirm_human_notify(tmp_path, 9)
     # 第 4 次 — 应停止 (上限 3)
     st = MOD._load_monitor_state(tmp_path)
     st["human_notify"]["9:last"] = time.time() - 3600
     MOD._save_monitor_state(tmp_path, st)
-    MOD.run_monitor("o/r", None, tmp_path,
-                    notify=lambda r, m: notif.append((r, m)), items=items)
+    run()
     esc = [m for _, m in notif if "Human 状态超时" in m]
     assert len(esc) == 3, "上限 3 次, 实际 %d" % len(esc)
     assert all("邮件/短信" in m for m in esc)
@@ -104,7 +107,30 @@ def test_human_escape_count_delayed_until_confirm(tmp_path):
         esc = [n for n in out["notifications"] if "Human 状态超时" in n["message"]]
         assert esc, "未确认投递时必须重发"
     # confirm 后 → 计数 1, 下次不重发 (除非 1h 后)
-    MOD.confirm_delivery(tmp_path, out["notifications"])
+    MOD.confirm_human_notify(tmp_path, 11)
+    out2 = MOD.run_monitor("o/r", None, tmp_path, items=items)
+    esc2 = [n for n in out2["notifications"] if "Human 状态超时" in n["message"]]
+    assert not esc2, "确认投递后 1h 内不应重发"
+    MOD.HUMAN_ESCAPE_HOURS = 8
+
+
+
+def test_human_escape_count_delayed_until_confirm(tmp_path):
+    """投递未确认不计数 → 下次仍会重发 (codex P1 修复)."""
+    MOD.HUMAN_ESCAPE_HOURS = 0
+    MOD.HUMAN_ESCAPE_MAX = 3
+    items = [{"number": 11, "status": "Human"}]
+    MOD.run_monitor("o/r", None, tmp_path, items=items)
+    st = MOD._load_monitor_state(tmp_path)
+    st["entered"]["11"]["since"] = time.time() - 9 * 3600
+    MOD._save_monitor_state(tmp_path, st)
+    # 两次检测都不 confirm → 每次都发 (计数仍是 0)
+    for _ in range(2):
+        out = MOD.run_monitor("o/r", None, tmp_path, items=items)
+        esc = [n for n in out["notifications"] if "Human 状态超时" in n["message"]]
+        assert esc, "未确认投递时必须重发"
+    # confirm 后 → 计数 1, 下次不重发 (除非 1h 后)
+    MOD.confirm_human_notify(tmp_path, 11)
     out2 = MOD.run_monitor("o/r", None, tmp_path, items=items)
     esc2 = [n for n in out2["notifications"] if "Human 状态超时" in n["message"]]
     assert not esc2, "确认投递后 1h 内不应重发"
