@@ -261,7 +261,6 @@ repos:
 
 # ── 5. tick 脚本生成 ───────────────────────────────────────────────────
 def gen_tick(key: str, repo: str, board: str, deploy_dir: Path, dry: bool) -> Path:
-    repo_name = repo.split("/")[-1]
     script = f"""#!/bin/bash
 # {key} dispatcher observer tick — no_agent watchdog.
 # v0_3: dispatcher 纯通知+监控 — 读 GitHub 状态, 输出通知事件, 不写 GitHub.
@@ -272,7 +271,6 @@ GH=/opt/homebrew/bin/gh
 BASE={deploy_dir.parent}
 CFG=$BASE/{deploy_dir.name}/dispatcher.yaml
 STATE=$BASE/{deploy_dir.name}/dispatcher-state
-REPO={repo}
 
 # ── 账号守卫: 观察者只读, 不写 GitHub — 用 PI 账号读 (物证: 只读无副作用) ──
 ACTUAL_USER=$($GH api user --jq .login 2>/dev/null || echo "unknown")

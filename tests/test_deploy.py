@@ -77,7 +77,8 @@ def test_gen_tick_contains_key_and_board(tmp_path):
     tk = deploy.gen_tick("acme", "acme/repo", "acme-board", tmp_path, dry=False)
     text = tk.read_text()
     assert "--repo acme" in text
-    assert "acme/repo" in text
+    assert "dispatcher.yaml" in text  # CFG 指向配置
+    assert "--state-dir" in text      # STATE 传给 dispatcher
     # v0_3: tick 只跑 dispatcher — 无 sync_job / kanban / --archive
     assert "sync_job" not in text
     assert "--archive" not in text
