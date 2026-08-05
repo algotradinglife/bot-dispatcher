@@ -100,30 +100,6 @@ def _with_state_lock(state_dir: Path, fn):
             lock_f.close()
 
 
-def _bump_human_count(state_dir: Path, issue_num) -> None:
-    """在锁内读-改-写 human_notify 计数."""
-    def _inner():
-        mstate = _load_monitor_state(state_dir)
-        human_notify = mstate.setdefault("human_notify", {})
-        now = _now()
-        human_notify[str(issue_num)] = human_notify.get(str(issue_num), 0) + 1
-        human_notify[str(issue_num) + ":last"] = now
-        _save_monitor_state(state_dir, mstate)
-        return human_notify[str(issue_num)]
-    return _with_state_lock(state_dir, _inner)
-
-
-def confirm_human_notify(state_dir: Path, issue_num) -> int:
-    """外部投递确认: tick 脚本在飞书投递成功后调用, 递增 Human 兜底计数.
-
-    替代旧的 confirm_delivery (假确认 — dispatcher 无法感知外部投递结果).
-    返回递增后的计数.
-    """
-    if issue_num is None:
-        return 0
-    return _bump_human_count(state_dir, issue_num)
-
-
 def _disk_usage_pct() -> float | None:
     try:
         usage = shutil.disk_usage(os.path.expanduser("~"))
@@ -252,7 +228,9 @@ def run_monitor(repo: str, project: dict | None, state_dir: Path,
                     1, num))
 
         # Human 超时兜底: 持续 8h+ → 每小时 1 次, 上限 3 次
-        # 计数由外部投递方 confirm_human_notify 递增 (codex P1: 防投递失败吞掉)
+        # 计数在锁内自增 (尽力而为的提醒限频, 防每 tick 刷屏).
+        # 真正的 8h×3 邮件/短信兜底由 PI 第二通道负责 (独立轮询 GitHub,
+        # 不依赖 dispatcher — 防 dispatcher 失灵). 见 docs/architecture-v0_3.md.
         for num, info in entered.items():
             if info.get("status") != "Human":
                 continue
@@ -267,6 +245,9 @@ def run_monitor(repo: str, project: dict | None, state_dir: Path,
                     last = human_notify.get(num + ":last", 0)
                     if count > 0 and (now - last) < 3600:
                         continue
+                    # 锁内自增计数 + 记录时间
+                    human_notify[num] = count + 1
+                    human_notify[num + ":last"] = now
                     pending.append(("user",
                         "⛔ Human 状态超时兜底: issue #%s 已 %d 小时无人处理 "
                         "(第 %d/3 次提醒, 邮件/短信通道)" % (
@@ -315,15 +296,7 @@ def main() -> None:
     parser.add_argument("--state-dir", type=Path,
                         default=Path("~/.hermes/bot-dispatcher").expanduser())
     parser.add_argument("--workdirs", nargs="*", default=[])
-    parser.add_argument("--confirm-issue", type=int, default=None,
-                        help="外部投递确认: 飞书投递成功后递增 Human 兜底计数")
     args = parser.parse_args()
-
-    if args.confirm_issue is not None:
-        count = confirm_human_notify(args.state_dir, args.confirm_issue)
-        print(json.dumps({"confirmed": args.confirm_issue,
-                          "count": count}, ensure_ascii=False))
-        return
 
     out = run_monitor(args.repo, None, args.state_dir,
                       workdirs=[Path(w) for w in args.workdirs])

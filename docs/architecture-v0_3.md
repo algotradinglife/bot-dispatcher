@@ -173,3 +173,30 @@ PI 检测 Human 超时 8h → 邮件/短信通知用户 (兜底)
 | Human 超时兜底 (8h×3) | 待实施 |
 | 测试更新 | 待实施 |
 | codex 复核 | 待实施 |
+
+
+---
+
+## 五、Human 兜底双通道 (2026-08-05 收敛定案)
+
+dispatcher 是 no_agent cron 脚本, 投递发生在脚本进程之外 (cron 调度层),
+**脚本内无法感知真实投递结果** — "投递后确认"在脚本内是假命题 (codex r2-r4 教训).
+
+收敛设计:
+
+```
+通道 1 (dispatcher 尽力而为): 飞书提醒
+  monitor 检测 Human 超时 (8h+) → 锁内自增计数 (上限 3 次, 1h 窗口)
+  → 通知输出到 cron 投递管道 (飞书主通道)
+  → 外部投递失败由 cron error 告警兜底 (平台机制)
+
+通道 2 (PI 兜底, 真实保障): 邮件/短信
+  PI (远端 codex) 独立轮询 GitHub → 发现 Human 持续 8h+
+  → 每小时 1 次, 上限 3 次, 邮件/短信直达用户
+  → 不依赖 dispatcher (dispatcher 失灵时仍有效)
+```
+
+职责边界:
+- dispatcher 的 Human 提醒是"限频提醒" (防每 tick 刷屏), 不是关键投递
+- 真正防 dispatcher 失灵的兜底 = PI 第二通道 (用户定案)
+- 邮件/短信通道占位: notify level=3 已留, 接 SMTP/短信网关时填入

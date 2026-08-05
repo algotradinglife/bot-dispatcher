@@ -454,9 +454,9 @@ def main():
         output["warnings"].append("%s monitor: %s" % (prefix, str(e)[:120]))
 
     delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run, cfg=cfg)
-    # Human 兜底计数由外部投递方 (tick 脚本) 在飞书投递成功后调用
-    # dispatcher_monitor.confirm_human_notify(issue) 递增 — dispatcher 无法
-    # 感知外部投递结果, 不做假确认 (codex P1)
+    # Human 兜底: dispatcher 侧仅尽力而为的飞书提醒 (monitor 锁内计数限频);
+    # 真正的 8h×3 邮件/短信兜底由 PI 第二通道负责 (独立轮询 GitHub,
+    # 不依赖 dispatcher — 防 dispatcher 失灵). 见 docs/architecture-v0_3.md.
     if first_run:
         output["warnings"].append(
             "%s first run: baseline recorded, historical events not replayed" % prefix)

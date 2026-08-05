@@ -284,42 +284,24 @@ fi
 OUT=$(cd $BASE && python3 bot-dispatcher/dispatcher.py \\
   --repo {key} --config $CFG --state-dir $STATE 2>&1)
 
-python3 - "$OUT" "$STATE" <<'PY'
-import json, subprocess, sys
+python3 - "$OUT" <<'PY'
+import json, sys
 
 lines = []
-human_issues = []
 try:
     d = json.loads(sys.argv[1])
-    state_dir = sys.argv[2] if len(sys.argv) > 2 else None
     # v0_3: 通知事件 (role: worker/auditor/user)
     for n in d.get('notifications', []):
         role = n.get('role', '?')
         icon = {{'worker': '🛠', 'auditor': '🔍', 'user': '⛔'}}.get(role, '•')
         lines.append('%s [%s] %s' % (icon, role, n.get('message', '')[:100]))
-        # Human 兜底通知: 收集待确认 issue (确认在输出到投递管道后统一做)
-        if 'Human 状态超时' in n.get('message', '') and n.get('issue'):
-            human_issues.append(str(n['issue']))
     for w in d.get('warnings', [])[:3]:
         lines.append('⚠️ %s' % w[:80])
 except Exception:
     pass
 
-# 先输出通知 (进入 cron 投递管道)
 if lines:
     print('\\n'.join(lines))
-
-# 输出成功后再确认 Human 兜底计数 (codex P1 r3: 投递管道后确认;
-# 通知已生成并输出, 外部投递失败由 cron error 告警兜底)
-for issue in human_issues:
-    try:
-        subprocess.run(
-            ['python3', 'bot-dispatcher/dispatcher_monitor.py',
-             '--repo', '{key}', '--state-dir', state_dir,
-             '--confirm-issue', issue],
-            capture_output=True, timeout=15)
-    except Exception:
-        pass
 PY
 """
 
