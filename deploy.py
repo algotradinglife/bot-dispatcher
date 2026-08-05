@@ -48,10 +48,11 @@ STATES = [
     ("Inbox", "GRAY", "planning, not yet dispatched"),
     ("Ready", "GREEN", "contract approved, ready to dispatch"),
     ("In Progress", "BLUE", "executing: kanban card running (synced)"),
-    ("Review", "YELLOW", "evidence submitted, awaiting PI review"),
+    ("EV Review", "YELLOW", "worker submitted evidence, awaiting independent auditor EV"),
+    ("PI Review", "ORANGE", "EV passed, awaiting PI acceptance"),
     ("Blocked", "RED", "worker request: needs PI decision or unblock"),
-    ("Human", "ORANGE", "PI judged: needs human intervention (beyond AI loop)"),
-    ("Done", "PURPLE", "accepted and merged"),
+    ("Human", "PURPLE", "PI judged: needs human intervention (beyond AI loop)"),
+    ("Done", "BLACK", "accepted and merged"),
 ]
 
 
