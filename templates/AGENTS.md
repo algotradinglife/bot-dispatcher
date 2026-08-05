@@ -14,7 +14,9 @@ kanban 是执行态（工作卡），单向映射、不双写。
 3. 唯一 owner worker（researcher/engineer 二选一）执行 → 完成卡 →
    提交证据 PR（body 含 `Closes #N`）
 4. draft→ready → pr-status-sync workflow 置 issue `Review`
-5. EV（auditor=Alan）：独立 fresh checkout 验证 → EV 裁决（PASS/REJECT）
+5. EV（auditor=Alan）：独立 fresh checkout 验证 → **含代码质量与数据工程
+   检查**（数据 IO 用 pandas/numpy 非原生 csv、写前 dry-run 预检、读入
+   fail-fast 校验、原子写）→ EV 裁决（PASS/REJECT）
 6. PI 评审 → merge → 自动 `Done` + 关闭 issue
 7. PI 更新路线图（`docs/ROADMAP.md`，v0_N 递增，追加更新记录）
 
@@ -32,7 +34,8 @@ kanban 是执行态（工作卡），单向映射、不双写。
     分析报告撰写。**不做方案设计/路线图**（路线图由 PI 画）。
   - `engineer` (Adam)：全栈工程师——数据库、网站网页、性能优化、运维。
   - `auditor` (Alan)：独立审计员，**Engineering validation**——独立重跑
-    验证、证据链审计、边界检查（assignee ≠ 产出方）。
+    验证、证据链审计、边界检查、**代码质量与数据工程检查**（assignee ≠
+    产出方）。
 - **PM** (drwho) owns operational coordination: lifecycle tracking,
   dependency follow-up, review scheduling, merge/closure follow-up, and
   dispatcher exception handling. PM escalates business decisions to PI and
