@@ -167,10 +167,11 @@ def is_ev_card(card: dict) -> bool:
     return bool(EV_TITLE_RE.match(str(card.get("title") or "").strip()))
 
 
-def current_gh_user() -> str:
-    """当前 gh 登录账号 (用于角色守卫)."""
+def current_gh_user(env=None) -> str:
+    """当前 gh 登录账号 (用于角色守卫; env 可带 GH_TOKEN 指定身份)."""
     r = subprocess.run(["gh", "api", "user", "--jq", ".login"],
-                       capture_output=True, text=True, timeout=30)
+                       capture_output=True, text=True, timeout=30,
+                       env=env)
     if r.returncode != 0:
         raise RuntimeError("gh user lookup failed: %s" % r.stderr.strip()[:160])
     return r.stdout.strip()
@@ -198,30 +199,39 @@ def role_user(role: str) -> str:
     return user
 
 
-def switch_gh_user(gh_user: str) -> None:
-    """切换到指定账号, 并验证切换成功 (fail-closed: 失败即抛错, 不静默).
+def role_token(role: str) -> str:
+    """获取角色账号的认证 token (从 keyring 动态取, 不落盘).
 
-    全局锁由调用方 (sync_all / main 旧入口) 统一持有 — 账号切换与
-    全部 GitHub 写操作在同一锁内, 跨 repo 互斥 (codex 8th).
-    本函数不再自加锁, 防嵌套 flock 死锁 (macOS 同进程二次 open 阻塞).
+    GH_TOKEN 是 gh 认证最高优先级 → 每个进程带自己的 token,
+    无需 gh auth switch (零全局状态, 并发安全, 无锁).
     """
-    r = subprocess.run(["gh", "auth", "switch", "--user", gh_user],
+    user = role_user(role)
+    r = subprocess.run(["gh", "auth", "token", "--user", user],
                        capture_output=True, text=True, timeout=30)
-    if r.returncode != 0:
+    if r.returncode != 0 or not r.stdout.strip():
         raise RuntimeError(
-            "gh auth switch 到 %s 失败: %s" % (gh_user, r.stderr.strip()[:160]))
-    actual = current_gh_user()
-    if actual != gh_user:
-        raise RuntimeError(
-            "账号守卫: 期望 %s, 实际 %s — 拒绝继续 (防角色错位)" % (gh_user, actual))
+            "无法获取 %s (%s) 的 token: %s — 该账号需已 gh auth login"
+            % (role, user, r.stderr.strip()[:160]))
+    return r.stdout.strip()
 
 
-def guard_gh_user(expected: str) -> None:
-    """发评论前守卫: 当前账号必须是期望账号, 否则 fail-closed."""
-    actual = current_gh_user()
+def gh_env(token: str) -> dict:
+    """构造带 GH_TOKEN 的 env (GH_TOKEN 覆盖默认 keyring active 账号)."""
+    env = os.environ.copy()
+    env["GH_TOKEN"] = token
+    return env
+
+
+def guard_gh_user(expected: str, token: str) -> None:
+    """发评论前守卫 (账号确认保留): GH_TOKEN 身份必须是期望账号.
+
+    token 即身份 — 每个进程独立认证, 无全局切换; 此守卫防御
+    token 过期/被 revoke/环境变量误覆盖.
+    """
+    actual = current_gh_user(gh_env(token))
     if actual != expected:
         raise RuntimeError(
-            "账号守卫: EV 评论应由 %s 发布, 但当前账号是 %s — 拒绝写入 "
+            "账号守卫: 评论应由 %s 发布, 但 GH_TOKEN 身份是 %s — 拒绝写入 "
             "(账号即物证, 防止审计身份错位)" % (expected, actual))
 
 
@@ -250,7 +260,8 @@ def parse_verdict(result: str) -> str | None:
 
 
 def sync_ev_verdict(card: dict, repo: str, dry_run: bool = False,
-                    gh_user: str | None = None) -> dict:
+                    gh_user: str | None = None,
+                    gh_token: str | None = None) -> dict:
     """把 Alan 的 EV 裁决作为 issue comment 同步到 GitHub.
 
     EV 卡完成 (status=done) 时, result 必须含结构化裁决标记
@@ -264,6 +275,8 @@ def sync_ev_verdict(card: dict, repo: str, dry_run: bool = False,
     """
     if not gh_user:
         raise RuntimeError("sync_ev_verdict 必须指定 gh_user (auditor 账号)")
+    if not gh_token:
+        raise RuntimeError("sync_ev_verdict 必须指定 gh_token (auditor 认证)")
     issue_num = extract_issue_number(card)
     if issue_num is None:
         return {"card": card["id"], "status": "skipped", "reason": "no issue ref"}
@@ -298,10 +311,11 @@ def sync_ev_verdict(card: dict, repo: str, dry_run: bool = False,
         actions.append({"action": "ev_comment", "dry_run": True, "body": body[:100]})
     else:
         # 账号守卫: 审计评论必须以 auditor 账号发布, 防止身份错位
-        guard_gh_user(gh_user)
+        guard_gh_user(gh_user, gh_token)
         r = subprocess.run(
             ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", body],
             capture_output=True, text=True, timeout=30,
+            env=gh_env(gh_token),
         )
         if r.returncode != 0:
             return {"card": card["id"], "status": "failed",
@@ -398,12 +412,13 @@ def resolve_item_id(repo: str, issue_num: int, project_node: str) -> str:
 
 def sync_one_card(card: dict, repo: str, project: dict | None,
                   dry_run: bool = False, gh_user: str | None = None,
+                  gh_token: str | None = None,
                   on_comment_posted=None,
                   comment_posted_check=None) -> dict:
     """Post the evidence comment and (optionally) move the issue to Review.
 
     账号守卫 (P0-3): 证据评论是 worker 产出的汇报 → 必须以 worker 账号
-    发布 (gh_user 必传, 环境变量预传递); 缺省 fail-closed.
+    发布 (gh_user+gh_token 必传, 环境变量预传递); 缺省 fail-closed.
     on_comment_posted: 评论成功后立即回调 (写幂等键+落盘) — 即使后续
     Review 失败, 下轮也不重发评论 (codex 4th).
     comment_posted_check: 评论是否已发 (查 commented: 键) — 已发则跳过
@@ -411,6 +426,8 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
     """
     if not gh_user:
         raise RuntimeError("sync_one_card 必须指定 gh_user (worker 账号)")
+    if not gh_token:
+        raise RuntimeError("sync_one_card 必须指定 gh_token (worker 认证)")
     issue_num = extract_issue_number(card)
     if issue_num is None:
         return {"card": card["id"], "status": "skipped", "reason": "no issue ref"}
@@ -425,10 +442,11 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
         if dry_run:
             actions.append({"action": "comment", "dry_run": True, "body": comment[:80]})
         else:
-            guard_gh_user(gh_user)  # 账号守卫: 当前账号 == worker 账号
+            guard_gh_user(gh_user, gh_token)  # 账号确认: GH_TOKEN == worker
             r = subprocess.run(
                 ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", comment],
                 capture_output=True, text=True, timeout=30,
+                env=gh_env(gh_token),
             )
             if r.returncode != 0:
                 return {"card": card["id"], "status": "failed",
@@ -461,6 +479,7 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
                      "-F", "f=%s" % project["review_field"],
                      "-F", "o=%s" % project["review_option"]],
                     capture_output=True, text=True, timeout=30,
+                    env=gh_env(gh_token),
                 )
                 if r.returncode != 0:
                     return {"card": card["id"], "status": "failed",
@@ -476,7 +495,8 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
 
 
 def set_issue_in_progress(card: dict, repo: str, project: dict | None,
-                          dry_run: bool = False, gh_user: str | None = None) -> dict:
+                          dry_run: bool = False, gh_user: str | None = None,
+                          gh_token: str | None = None) -> dict:
     """执行态同步: kanban 卡 running → 置 GitHub issue In Progress.
 
     账号守卫: 执行态同步是 worker 产出的状态反映 → worker 账号.
@@ -485,6 +505,8 @@ def set_issue_in_progress(card: dict, repo: str, project: dict | None,
     """
     if not gh_user:
         raise RuntimeError("set_issue_in_progress 必须指定 gh_user (worker 账号)")
+    if not gh_token:
+        raise RuntimeError("set_issue_in_progress 必须指定 gh_token (worker 认证)")
     issue_num = extract_issue_number(card)
     if issue_num is None:
         return {"card": card["id"], "status": "skipped", "reason": "no issue ref"}
@@ -494,7 +516,7 @@ def set_issue_in_progress(card: dict, repo: str, project: dict | None,
     if dry_run:
         return {"card": card["id"], "status": "synced", "issue": issue_num,
                 "actions": [{"action": "inprogress", "dry_run": True}]}
-    guard_gh_user(gh_user)
+    guard_gh_user(gh_user, gh_token)
     try:
         item_id = resolve_item_id(repo, issue_num, project["node"])
         if not item_id:
@@ -511,6 +533,7 @@ def set_issue_in_progress(card: dict, repo: str, project: dict | None,
              "-F", "f=%s" % project["review_field"],
              "-F", "o=%s" % project["inprogress_option"]],
             capture_output=True, text=True, timeout=30,
+            env=gh_env(gh_token),
         )
         if r.returncode != 0:
             return {"card": card["id"], "status": "failed",
@@ -526,54 +549,44 @@ def sync_all(repo: str, project: dict | None, board: str | None,
              state_file: Path, dry_run: bool = False) -> dict:
     """统一状态同步入口: 一次调用同步全部 kanban↔GitHub 状态.
 
-    按执行顺序 (账号切换最少化):
+    按执行顺序:
       1) running 卡 → GitHub In Progress (worker 账号)
       2) done 卡 → 证据评论 + Review (worker 账号, 排除 EV 卡)
       3) [EV] done 卡 → EV 裁决评论 (auditor 账号, 账号即物证)
 
     各段独立计数; 某段失败不影响其他段 (各自 fail-closed).
-    幂等: 各段独立键 (inprogress:/done:/ev: 前缀) — 同一卡在不同阶段
-    互不阻塞 (codex P0: 共用 ID 会让 done/EV 被 running 跳过).
-    并发: 整个主体持全局账号锁 — 账号切换与全部 GitHub 写操作原子,
-    跨 repo 互斥 (codex 8th: 锁只保护 switch 不覆盖写 = 身份错位).
-    cron 本机单任务场景下串行成本可接受.
+    幂等: 各段独立键 (inprogress:/commented:/reviewed:/ev: 前缀).
+    认证: 每进程带自己的 GH_TOKEN (role_token 从 keyring 取) —
+    无 gh auth switch, 零全局状态, 并发安全, 无需锁.
     """
-    global_lock = Path(os.path.expanduser(
-        "~/.hermes/bot-dispatcher-gh-switch.lock"))
-    global_lock.parent.mkdir(parents=True, exist_ok=True)
-    with _state_lock(global_lock):
-        return _sync_all_locked(repo, project, board, state_file, dry_run)
-
-
-def _sync_all_locked(repo: str, project: dict | None, board: str | None,
-                     state_file: Path, dry_run: bool = False) -> dict:
-    synced = _load_synced_unlocked(state_file)  # 已持锁, 无锁读
+    synced = load_synced(state_file)
     segments = []
 
     def _mark_done_comment(card: dict) -> None:
-        """评论已发 → 立即写 commented: 幂等键 + 落盘 (codex 5th).
+        """评论已发 → 立即写 commented: 幂等键 + 落盘.
 
         防重发评论; 与 reviewed: 分离 — Review 失败下轮重试 Review
         但不重发评论.
         """
         synced.add("commented:%s" % card["id"])
-        _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
+        save_synced(state_file, synced)
 
     # 1. 执行态: running → In Progress (排除 EV 卡, 归 auditor 段)
     run_cards = [c for c in list_running_cards(board) if not is_ev_card(c)]
     run_results = []
     worker_user = role_user("worker")
+    worker_token = role_token("worker")
     for card in run_cards:
         if "inprogress:%s" % card["id"] in synced:
             continue
-        if not dry_run:
-            switch_gh_user(worker_user)
         outcome = set_issue_in_progress(card, repo, project,
-                                        dry_run=dry_run, gh_user=worker_user)
+                                        dry_run=dry_run,
+                                        gh_user=worker_user,
+                                        gh_token=worker_token)
         run_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
             synced.add("inprogress:%s" % card["id"])
-            _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
+            save_synced(state_file, synced)  # 每卡立即落盘 (防崩溃重放)
     segments.append({"segment": "inprogress", "cards": len(run_cards),
                      "results": run_results})
 
@@ -582,11 +595,9 @@ def _sync_all_locked(repo: str, project: dict | None, board: str | None,
     done_results = []
     for card in done_cards:
         if "reviewed:%s" % card["id"] in synced:
-            continue  # 评论+Review 全完成 → 跳过 (codex 5th 拆分键)
-        if not dry_run:
-            switch_gh_user(worker_user)
+            continue  # 评论+Review 全完成 → 跳过
         outcome = sync_one_card(card, repo, project, dry_run=dry_run,
-                                gh_user=worker_user,
+                                gh_user=worker_user, gh_token=worker_token,
                                 on_comment_posted=_mark_done_comment,
                                 comment_posted_check=lambda c: (
                                     "commented:%s" % c["id"]) in synced)
@@ -594,7 +605,7 @@ def _sync_all_locked(repo: str, project: dict | None, board: str | None,
         if outcome["status"] == "synced" and not dry_run:
             # 评论+Review 全成功 → 写 reviewed: 键 + 落盘
             synced.add("reviewed:%s" % card["id"])
-            _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
+            save_synced(state_file, synced)  # 每卡立即落盘 (防崩溃重放)
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
@@ -609,18 +620,18 @@ def _sync_all_locked(repo: str, project: dict | None, board: str | None,
                 if is_ev_card(c) and c.get("status") == "done"]
     ev_results = []
     auditor_user = role_user("auditor")
+    auditor_token = role_token("auditor")
     for card in ev_cards:
         if "ev:%s" % card["id"] in synced:
             continue
-        if not dry_run:
-            switch_gh_user(auditor_user)
         outcome = sync_ev_verdict(card, repo, dry_run=dry_run,
-                                  gh_user=auditor_user)
+                                  gh_user=auditor_user,
+                                  gh_token=auditor_token)
         ev_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
             # EV 评论成功即写幂等键 + 立即落盘 (防崩溃重放). 归档失败仅标记.
             synced.add("ev:%s" % card["id"])
-            _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
+            save_synced(state_file, synced)  # 每卡立即落盘 (防崩溃重放)
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
@@ -631,7 +642,7 @@ def _sync_all_locked(repo: str, project: dict | None, board: str | None,
                      "results": ev_results})
 
     if not dry_run:
-        _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
+        save_synced(state_file, synced)
     return {"segments": segments, "synced_count": len(synced)}
 
 
@@ -689,79 +700,48 @@ def main() -> None:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return
 
-    # 旧入口 (兼容): 同样持全局账号锁 — 检查-行动原子 + 账号身份一致
-    # (codex 7th/8th: 锁外检查-行动可并发双发; 锁不覆盖写=身份错位)
-    global_lock = Path(os.path.expanduser(
-        "~/.hermes/bot-dispatcher-gh-switch.lock"))
-    global_lock.parent.mkdir(parents=True, exist_ok=True)
-    with _state_lock(global_lock):
-        synced = _load_synced_unlocked(state_file)
-        results = []
-        cards = list_done_cards(args.board)
+    # 旧入口 (兼容): 与 sync_all 同一认证模型 — 每进程 GH_TOKEN,
+    # 无 switch/锁 (零全局状态, 并发安全).
+    synced = load_synced(state_file)
+    results = []
+    cards = list_done_cards(args.board)
 
-        # 执行态同步: 读 running 卡 → 置 GitHub In Progress (worker 账号;
-        # 排除 EV 卡, EV 归 auditor 段)
-        if args.sync_inprogress:
-            run_cards = [c for c in list_running_cards(args.board)
-                         if not is_ev_card(c)]
-            gh_user = role_user("worker")  # 环境变量预传递, 无默认账号 (fail-closed)
-            for card in run_cards:
-                if card["id"] in synced:
-                    continue
-                if not args.dry_run:
-                    switch_gh_user(gh_user)  # 切换 + 验证 (fail-closed)
-                outcome = set_issue_in_progress(card, args.repo, project,
-                                                dry_run=args.dry_run,
-                                                gh_user=gh_user)
-                results.append(outcome)
-                if outcome["status"] == "synced" and not args.dry_run:
-                    synced.add(card["id"])
-            if not args.dry_run:
-                _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
-            print(json.dumps({"cards": len(run_cards), "new": len(results),
-                              "results": results}, ensure_ascii=False, indent=2))
-            return
-
-        # EV 同步模式: 读 [EV] 卡 (含 result 裁决), 以 auditor 账号
-        # (GH_USER_AUDITOR 环境变量预传递) 把裁决发到 GitHub issue comment
-        # —— 账号即物证: 产出=worker 账号, 审计=auditor 账号
-        if args.sync_ev:
-            ev_cards = [c for c in list_all_cards(args.board)
-                        if is_ev_card(c) and c.get("status") == "done"]
-            gh_user = role_user("auditor")  # 环境变量预传递, 无默认账号 (fail-closed)
-            for card in ev_cards:
-                if card["id"] in synced:
-                    continue
-                if not args.dry_run:
-                    switch_gh_user(gh_user)  # 切换 + 验证 (fail-closed)
-                outcome = sync_ev_verdict(card, args.repo, dry_run=args.dry_run,
-                                          gh_user=gh_user)
-                results.append(outcome)
-                if outcome["status"] == "synced" and not args.dry_run:
-                    synced.add(card["id"])
-                    if args.archive:
-                        r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
-                                           capture_output=True, text=True, timeout=15)
-                        if r.returncode == 0:
-                            outcome["archived"] = True
-                        else:
-                            outcome["archive_failed"] = r.stderr.strip()[:120]
-            if not args.dry_run:
-                _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
-            print(json.dumps({"cards": len(ev_cards), "new": len(results),
-                              "results": results}, ensure_ascii=False, indent=2))
-            return
-
-        for card in cards:
+    # 执行态同步: 读 running 卡 → 置 GitHub In Progress (worker 账号;
+    # 排除 EV 卡, EV 归 auditor 段)
+    if args.sync_inprogress:
+        run_cards = [c for c in list_running_cards(args.board)
+                     if not is_ev_card(c)]
+        gh_user = role_user("worker")  # 环境变量预传递, 无默认账号 (fail-closed)
+        gh_token = role_token("worker")
+        for card in run_cards:
             if card["id"] in synced:
                 continue
-            # 账号守卫 (P0-3): 证据评论是 worker 产出的汇报 → worker 账号.
-            # 环境变量预传递, 无默认账号 (fail-closed); 与 EV 分支同一模型.
-            worker_user = role_user("worker")
-            if not args.dry_run:
-                switch_gh_user(worker_user)  # 切换 + 验证 (fail-closed)
-            outcome = sync_one_card(card, args.repo, project, dry_run=args.dry_run,
-                                    gh_user=worker_user)
+            outcome = set_issue_in_progress(card, args.repo, project,
+                                            dry_run=args.dry_run,
+                                            gh_user=gh_user,
+                                            gh_token=gh_token)
+            results.append(outcome)
+            if outcome["status"] == "synced" and not args.dry_run:
+                synced.add(card["id"])
+        if not args.dry_run:
+            save_synced(state_file, synced)
+        print(json.dumps({"cards": len(run_cards), "new": len(results),
+                          "results": results}, ensure_ascii=False, indent=2))
+        return
+
+    # EV 同步模式: 读 [EV] 卡 (含 result 裁决), 以 auditor 账号
+    # (GH_USER_AUDITOR 环境变量预传递) 把裁决发到 GitHub issue comment
+    # —— 账号即物证: 产出=worker 账号, 审计=auditor 账号
+    if args.sync_ev:
+        ev_cards = [c for c in list_all_cards(args.board)
+                    if is_ev_card(c) and c.get("status") == "done"]
+        gh_user = role_user("auditor")  # 环境变量预传递, 无默认账号 (fail-closed)
+        gh_token = role_token("auditor")
+        for card in ev_cards:
+            if card["id"] in synced:
+                continue
+            outcome = sync_ev_verdict(card, args.repo, dry_run=args.dry_run,
+                                      gh_user=gh_user, gh_token=gh_token)
             results.append(outcome)
             if outcome["status"] == "synced" and not args.dry_run:
                 synced.add(card["id"])
@@ -773,9 +753,34 @@ def main() -> None:
                     else:
                         outcome["archive_failed"] = r.stderr.strip()[:120]
         if not args.dry_run:
-            _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
-        print(json.dumps({"cards": len(cards), "new": len(results),
+            save_synced(state_file, synced)
+        print(json.dumps({"cards": len(ev_cards), "new": len(results),
                           "results": results}, ensure_ascii=False, indent=2))
+        return
+
+    for card in cards:
+        if card["id"] in synced:
+            continue
+        # 账号守卫 (P0-3): 证据评论是 worker 产出的汇报 → worker 账号.
+        # 环境变量预传递, 无默认账号 (fail-closed); 与 EV 分支同一模型.
+        worker_user = role_user("worker")
+        worker_token = role_token("worker")
+        outcome = sync_one_card(card, args.repo, project, dry_run=args.dry_run,
+                                gh_user=worker_user, gh_token=worker_token)
+        results.append(outcome)
+        if outcome["status"] == "synced" and not args.dry_run:
+            synced.add(card["id"])
+            if args.archive:
+                r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
+                                   capture_output=True, text=True, timeout=15)
+                if r.returncode == 0:
+                    outcome["archived"] = True
+                else:
+                    outcome["archive_failed"] = r.stderr.strip()[:120]
+    if not args.dry_run:
+        save_synced(state_file, synced)
+    print(json.dumps({"cards": len(cards), "new": len(results),
+                      "results": results}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

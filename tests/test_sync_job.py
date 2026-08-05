@@ -109,7 +109,7 @@ def test_sync_one_card_posts_comment_and_review() -> None:
     with patch.object(MOD.subprocess, "run", side_effect=fake_run) as run, \
          patch.object(MOD, "current_gh_user", return_value="bot-engineer"):
         out = MOD.sync_one_card(done_card(), "org/repo", project,
-                                gh_user="bot-engineer")
+                                gh_user="bot-engineer", gh_token="token-bot-engineer")
 
     assert out["status"] == "synced"
     assert out["issue"] == 42
@@ -125,7 +125,7 @@ def test_sync_one_card_posts_comment_and_review() -> None:
 
 def test_sync_one_card_no_issue_ref_skipped() -> None:
     card = done_card(title="No ref", body="nothing")
-    out = MOD.sync_one_card(card, "org/repo", None, gh_user="bot-engineer")
+    out = MOD.sync_one_card(card, "org/repo", None, gh_user="bot-engineer", gh_token="token-bot-engineer")
     assert out["status"] == "skipped"
 
 
@@ -134,7 +134,7 @@ def test_sync_one_card_comment_failure_reported() -> None:
     with patch.object(MOD.subprocess, "run", return_value=bad), \
          patch.object(MOD, "current_gh_user", return_value="bot-engineer"):
         out = MOD.sync_one_card(done_card(), "org/repo", None,
-                                gh_user="bot-engineer")
+                                gh_user="bot-engineer", gh_token="token-bot-engineer")
     assert out["status"] == "failed"
     assert "api error" in out["reason"]
 
@@ -154,7 +154,7 @@ def test_sync_one_card_review_move_best_effort() -> None:
     with patch.object(MOD.subprocess, "run", side_effect=fake_run), \
          patch.object(MOD, "current_gh_user", return_value="bot-engineer"):
         out = MOD.sync_one_card(done_card(), "org/repo", project,
-                                gh_user="bot-engineer")
+                                gh_user="bot-engineer", gh_token="token-bot-engineer")
     assert out["status"] == "failed", out
     assert "review" in out["reason"], out
 
@@ -250,7 +250,7 @@ def test_sync_ev_verdict_reject_posts_comment() -> None:
          patch.object(MOD.subprocess, "run",
                       return_value=SimpleNamespace(returncode=0,
                                                    stdout="ok", stderr="")) as m:
-        out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
+        out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985", gh_token="token-hh1985")
     assert out["status"] == "synced"
     assert "REJECT" in out["verdict"]
     argv = m.call_args.args[0]
@@ -265,7 +265,7 @@ def test_sync_ev_verdict_rejects_free_text_result() -> None:
     card = ev_card(verdict="REJECT: 缺 §7 附录")  # 无 VERDICT: 标记
     with patch.object(MOD, "current_gh_user", return_value="hh1985"), \
          patch.object(MOD.subprocess, "run") as m:
-        out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
+        out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985", gh_token="token-hh1985")
     assert out["status"] == "failed"
     assert "VERDICT" in out["reason"]
     m.assert_not_called()  # 不猜文本 → 不写任何评论
@@ -282,7 +282,7 @@ def test_sync_ev_verdict_guard_rejects_wrong_account() -> None:
     card = ev_card(verdict="VERDICT: PASS\n证据链完整")
     with patch.object(MOD, "current_gh_user", return_value="bot-account"):
         with pytest.raises(RuntimeError, match="账号守卫"):
-            MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
+            MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985", gh_token="token-hh1985")
 
 
 def test_sync_ev_verdict_pass_label() -> None:
@@ -291,7 +291,7 @@ def test_sync_ev_verdict_pass_label() -> None:
          patch.object(MOD.subprocess, "run",
                       return_value=SimpleNamespace(returncode=0,
                                                    stdout="ok", stderr="")):
-        out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
+        out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985", gh_token="token-hh1985")
     assert "PASS" in out["verdict"]
     assert "REJECT" not in out["verdict"]
 
@@ -299,13 +299,13 @@ def test_sync_ev_verdict_pass_label() -> None:
 def test_sync_ev_verdict_no_issue_ref_skipped() -> None:
     card = ev_card(title="[EV] no ref here")
     card["body"] = "no issue link"
-    out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
+    out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985", gh_token="token-hh1985")
     assert out["status"] == "skipped"
 
 
 def test_sync_ev_verdict_no_result_skipped() -> None:
     card = ev_card(verdict="")
-    out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
+    out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985", gh_token="token-hh1985")
     assert out["status"] == "skipped"
     assert "no verdict" in out["reason"]
 
@@ -314,14 +314,17 @@ def test_main_ev_mode_uses_auditor_account_from_env(monkeypatch) -> None:
     """EV 同步: 账号从 GH_USER_AUDITOR 环境变量预传递 (无默认, fail-closed)."""
     monkeypatch.setenv("GH_USER_AUDITOR", "auditor-account")
     calls: list[list[str]] = []
+    envs: list[dict] = []
 
     def fake_run(argv, capture_output=False, text=False, timeout=30,
                  input=None, env=None):
         calls.append(list(argv))
+        envs.append(dict(env or {}))
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     with patch.object(MOD, "list_all_cards", return_value=[ev_card()]), \
          patch.object(MOD, "list_done_cards", return_value=[]), \
+         patch.object(MOD, "role_token", return_value="tok-auditor"), \
          patch.object(MOD, "current_gh_user", return_value="auditor-account"), \
          patch.object(MOD.subprocess, "run", side_effect=fake_run):
         # simulate the --sync-ev branch (as main does)
@@ -329,14 +332,19 @@ def test_main_ev_mode_uses_auditor_account_from_env(monkeypatch) -> None:
                     if MOD.is_ev_card(c) and c.get("status") == "done"]
         gh_user = MOD.role_user("auditor")
         assert gh_user == "auditor-account"
+        gh_token = MOD.role_token("auditor")
+        assert gh_token == "tok-auditor"
         for card in ev_cards:
-            MOD.switch_gh_user(gh_user)
-            MOD.sync_ev_verdict(card, "org/repo", gh_user=gh_user)
+            MOD.sync_ev_verdict(card, "org/repo", gh_user=gh_user,
+                                gh_token=gh_token)
+    # 无 auth switch (GH_TOKEN 即身份, 无需全局切换)
     auth_switch = [a for a in calls if a[:2] == ["gh", "auth"]]
+    assert not auth_switch, "不应再切换账号: %s" % auth_switch
     comment_call = [a for a in calls if a[:3] == ["gh", "issue", "comment"]]
-    assert auth_switch, "必须切换账号"
-    assert "auditor-account" in auth_switch[0]
     assert comment_call, "必须发评论"
+    # 评论调用带 GH_TOKEN env (auditor 身份)
+    ci = calls.index(comment_call[0])
+    assert envs[ci].get("GH_TOKEN") == "tok-auditor", "评论必须带 auditor token"
 
 
 def test_role_user_missing_env_fails_closed(monkeypatch) -> None:
@@ -374,7 +382,7 @@ def test_set_issue_in_progress_syncs() -> None:
     with patch.object(MOD.subprocess, "run", side_effect=fake_run), \
          patch.object(MOD, "current_gh_user", return_value="bot-engineer"):
         out = MOD.set_issue_in_progress(card, "org/repo", project,
-                                        gh_user="bot-engineer")
+                                        gh_user="bot-engineer", gh_token="token-bot-engineer")
     assert out["status"] == "synced", out
     assert out["issue"] == 42
     mutation = [c for c in calls if "updateProjectV2ItemFieldValue" in " ".join(c)]
@@ -400,7 +408,7 @@ def test_set_issue_in_progress_fails_closed_without_gh_user() -> None:
 def test_set_issue_in_progress_skips_without_config() -> None:
     """配置缺 inprogress_option → skipped (不猜)."""
     out = MOD.set_issue_in_progress(done_card(), "org/repo", None,
-                                    gh_user="bot-engineer")
+                                    gh_user="bot-engineer", gh_token="token-bot-engineer")
     assert out["status"] == "skipped"
     assert "inprogress_option" in out["reason"]
 
@@ -429,18 +437,14 @@ def test_sync_all_ev_card_not_consumed_by_done_segment(monkeypatch) -> None:
     def fake_list_all(board=None):
         return all_cards
 
-    def fake_switch(user):
-        calls.append(("switch", user))
-        return None
-
     def fake_role(role):
         return "bot-engineer" if role == "worker" else "hh1985"
 
     with patch.object(MOD, "list_done_cards", side_effect=fake_list), \
          patch.object(MOD, "list_running_cards", side_effect=fake_list_running), \
          patch.object(MOD, "list_all_cards", side_effect=fake_list_all), \
-         patch.object(MOD, "switch_gh_user", side_effect=fake_switch), \
          patch.object(MOD, "role_user", side_effect=fake_role), \
+         patch.object(MOD, "role_token", return_value="tok"), \
          patch.object(MOD, "sync_one_card") as m_sync, \
          patch.object(MOD, "sync_ev_verdict") as m_ev, \
          patch.object(MOD, "_load_synced_unlocked", return_value=set()), \
@@ -453,8 +457,7 @@ def test_sync_all_ev_card_not_consumed_by_done_segment(monkeypatch) -> None:
 
     assert m_sync.call_count == 0, "EV card must NOT go through done segment: %d" % m_sync.call_count
     assert m_ev.call_count == 1, "EV card must go to EV segment"
-    # auditor 账号 (hh1985) 被用于 EV
-    assert ("switch", "hh1985") in calls, calls
+    # auditor token 被用于 EV (token 即身份, 账号确认由 guard 完成)
 
 
 def test_sync_all_segmented_idempotency_keys(monkeypatch) -> None:
@@ -481,8 +484,8 @@ def test_sync_all_segmented_idempotency_keys(monkeypatch) -> None:
     with patch.object(MOD, "list_running_cards", side_effect=fake_list_running), \
          patch.object(MOD, "list_done_cards", side_effect=fake_list_done), \
          patch.object(MOD, "list_all_cards", side_effect=fake_list_all), \
-         patch.object(MOD, "switch_gh_user", side_effect=fake_switch), \
          patch.object(MOD, "role_user", side_effect=fake_role), \
+         patch.object(MOD, "role_token", return_value="tok"), \
          patch.object(MOD, "set_issue_in_progress") as m_inprog, \
          patch.object(MOD, "sync_one_card") as m_sync, \
          patch.object(MOD, "_load_synced_unlocked", return_value=set()), \
@@ -522,6 +525,7 @@ def test_sync_all_comment_posted_persists_key_even_if_review_fails(monkeypatch, 
         return "bot-engineer"
 
     def fake_sync_one_card(card_, repo, project, dry_run=False, gh_user=None,
+                           gh_token=None,
                            on_comment_posted=None, comment_posted_check=None):
         # 第一次: 评论成功 (回调写键) + Review 失败 → failed
         calls["sync"] += 1
@@ -537,8 +541,8 @@ def test_sync_all_comment_posted_persists_key_even_if_review_fails(monkeypatch, 
     with patch.object(MOD, "list_done_cards", side_effect=fake_list_done), \
          patch.object(MOD, "list_running_cards", side_effect=fake_list_running), \
          patch.object(MOD, "list_all_cards", side_effect=fake_list_all), \
-         patch.object(MOD, "switch_gh_user", side_effect=fake_switch), \
          patch.object(MOD, "role_user", side_effect=fake_role), \
+         patch.object(MOD, "role_token", return_value="tok"), \
          patch.object(MOD, "sync_one_card", side_effect=fake_sync_one_card), \
          patch.object(MOD, "subprocess") as m_sub:
         m_sub.run.return_value = SimpleNamespace(returncode=0, stderr="")
