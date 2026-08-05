@@ -85,7 +85,7 @@ def validate_repo_config(repo_name, cfg):
             raise ValueError("repo '%s' project %s owner is not in session_map" % (repo_name, number))
         project_numbers.add(number)
 
-    for map_name in ("assignee_map", "mention_map"):
+    for map_name in ("assignee_map",):
         role_map = cfg.get(map_name, {})
         if not isinstance(role_map, dict):
             raise ValueError("repo '%s' %s must be a mapping" % (repo_name, map_name))
@@ -93,20 +93,6 @@ def validate_repo_config(repo_name, cfg):
         if unknown_roles:
             raise ValueError("repo '%s' %s references unknown roles: %s" % (
                 repo_name, map_name, ", ".join(unknown_roles)))
-
-    delivery_mode = cfg.get("delivery_mode", "agent-deck")
-    if delivery_mode not in ("agent-deck", "kanban"):
-        raise ValueError(
-            "repo '%s' delivery_mode must be 'agent-deck' or 'kanban' (got %r)"
-            % (repo_name, delivery_mode)
-        )
-    if delivery_mode == "kanban":
-        kanban_bin = cfg.get("kanban_bin", "hermes")
-        if not isinstance(kanban_bin, str) or not kanban_bin:
-            raise ValueError("repo '%s' kanban_bin must be a non-empty string" % repo_name)
-        board = cfg.get("kanban_board")
-        if board is not None and not isinstance(board, str):
-            raise ValueError("repo '%s' kanban_board must be a string or omitted" % repo_name)
 
 
 def load_config(repo_name, config_file=DEFAULT_CONFIG_FILE):
@@ -136,10 +122,6 @@ def build_session_map(cfg):
     return sm, {v: k for k, v in sm.items()}
 
 
-def resolve_workflow_session(cfg, session_map):
-    """Resolve the operational coordinator while keeping PI as the default."""
-    return session_map.get(cfg.get("workflow_role", "pi"))
-
 
 def resolve_owner(proj_num, projects, sm):
     for p in projects:
@@ -148,67 +130,6 @@ def resolve_owner(proj_num, projects, sm):
             return sm.get(role) if role else None
     return None
 
-
-def resolve_assignee_session(assignee_login, assignee_map, sm):
-    role = assignee_map.get(assignee_login)
-    return sm.get(role) if role else None
-
-
-def resolve_author_default_session(author_login, assignee_map, sm, owner_session):
-    """Author-identity fallback routing when a comment cannot be routed by an
-    explicit [TO:] directive or Project ownership:
-    - a message from the PI account (hh1985) defaults to the owner session
-      (the worker who owns the Issue/PR's Project);
-    - a message from a worker account (e.g. everything-bot-engineer) defaults
-      to the PI session.
-    Returns None when the author maps to neither role, so the caller can
-    fail loudly (warning) instead of silently dropping the message."""
-    role = assignee_map.get(author_login)
-    if role == "pi":
-        return owner_session
-    if role and role != "pi":
-        return sm.get("pi")
-    return None
-
-
-def build_mention_map(cfg, sm):
-    mm = {}
-    raw = cfg.get("mention_map", {})
-    for keyword, role in raw.items():
-        session = sm.get(role)
-        if session:
-            mm[keyword] = session
-    return mm
-
-
-def resolve_target_to_session(target, mention_map):
-    tl = target.lower()
-    for kw, s in mention_map.items():
-        if kw.lower() == tl:
-            return s
-    return None
-
-
-def parse_to_directive(body, mention_map):
-    for line in body.split('\n'):
-        s = line.strip()
-        if s.startswith('>') or not s:
-            continue
-        # Recognized shapes on the first content line:
-        #   [TO: PI] | [PI DEPENDENCY CLOSURE][TO: STRATEGY]
-        #   /goal [TO: Worker][...] | [TO: PI / FRESH REVIEW]
-        # /goal and leading [label] groups are optional; the first token
-        # after [TO: is the target. Anchored so inline prose is never read
-        # as a directive.
-        m = re.match(
-            r'(?:/goal\s+)?(?:\[(?!TO:)[^\]]*\]\s*)*'
-            r'\[TO:\s*([A-Za-z0-9_-]+)(?:\s*/[^\]]*)?\]',
-            s, re.IGNORECASE)
-        if m:
-            t = m.group(1)
-            return t, resolve_target_to_session(t, mention_map)
-        break
-    return None, None
 
 
 def format_goal(title, url):
@@ -221,62 +142,23 @@ def format_notice(title, url):
     return "%s\n%s" % (title, url)
 
 
-def queue_goal(output, session, message, issue_num=None):
-    """Retain every distinct event; one session digest is emitted per tick.
+def queue_goal(output, role, message, issue_num=None):
+    """Record a notification for a role (worker/auditor/user/PI).
 
-    Dedupes identical messages within the same tick: two comments on the same
-    PR/issue with the same [TO:] target produce the same goal text, and
-    sending both would duplicate work in the session digest.
-
-    issue_num (optional) anchors a kanban-delivery card to its source issue so
-    the idempotency key stays stable across ticks. The message list stays a
-    plain string list for backward compatibility; a parallel mapping records
-    issue anchors for kanban delivery.
+    v0_3: dispatcher 只产生通知事件 (不投递卡片/不写 GitHub).
+    实际发送由 tick 脚本 / 通知通道 (飞书/邮件短信) 完成.
+    role 取值: worker / auditor / user (PI 不接收通知, 主动轮询).
     """
-    if not session:
+    if not role:
         return
-    pending = output.setdefault("_pending", {}).setdefault(session, [])
-    if message not in pending:
-        pending.append(message)
-        if issue_num is not None:
-            anchors = output.setdefault("_pending_issues", {}).setdefault(session, {})
-            anchors[message] = issue_num
+    notifications = output.setdefault("notifications", [])
+    # dedupe identical messages for the same role within one tick
+    for n in notifications:
+        if n["role"] == role and n["message"] == message:
+            return
+    notifications.append({"role": role, "message": message,
+                          "issue": issue_num})
 
-
-def queue_workflow_issue_transition(
-    cfg,
-    session_map,
-    state_key,
-    issue_num,
-    title,
-    previous_status,
-    current_status,
-    url,
-    primary_session,
-    output,
-):
-    """Give an explicitly configured PM visibility into Issue lifecycle work."""
-    if "workflow_role" not in cfg:
-        return
-    workflow_session = resolve_workflow_session(cfg, session_map)
-    if not workflow_session or workflow_session == primary_session:
-        return
-
-    message = format_goal(
-        "PM coordination: Issue #%d -> %s — %s"
-        % (issue_num, current_status, title),
-        url,
-    )
-    queue_goal(output, workflow_session, message, issue_num=issue_num)
-    output["actions"].append({
-        "node": "workflow:%s" % state_key,
-        "state": current_status,
-        "session": workflow_session,
-        "reason": "issue_status_coordinator",
-        "prev_status": previous_status,
-        "sent": message[:80],
-        "result": "queued",
-    })
 
 
 def load_state(state_file):
@@ -340,50 +222,6 @@ def gql_query(query, retries=4, base_delay=1.0):
     raise ControlPlaneUnavailable("GitHub GraphQL failed: %s" % (last_err or "unknown"))
 
 
-def _issue_relation(repo, issue_num, relation):
-    owner, name = repo.split("/", 1)
-    numbers = set()
-    cursor = None
-    while True:
-        after = "null" if cursor is None else json.dumps(cursor)
-        query = (
-            'query { repository(owner:%s, name:%s) { issue(number:%d) { '
-            '%s(first:%d, after:%s) { nodes { number } '
-            'pageInfo { hasNextPage endCursor } } } } }'
-        ) % (json.dumps(owner), json.dumps(name), issue_num, relation,
-             GRAPH_PAGE_SIZE, after)
-        data = gql_query(query)
-        issue = data.get("data", {}).get("repository", {}).get("issue")
-        if issue is None:
-            raise ControlPlaneUnavailable("Issue #%d unavailable from GitHub Graph" % issue_num)
-        connection = issue.get(relation)
-        if not isinstance(connection, dict):
-            raise ControlPlaneUnavailable("Issue #%d relation %s unavailable" % (issue_num, relation))
-        numbers.update(node["number"] for node in connection.get("nodes", []) if node)
-        page = connection.get("pageInfo") or {}
-        if not page.get("hasNextPage"):
-            return numbers
-        cursor = page.get("endCursor")
-        if not cursor:
-            raise ControlPlaneUnavailable("Issue Graph pagination cursor missing")
-
-
-def get_issue_graph(repo, issue_num):
-    owner, name = repo.split("/", 1)
-    query = (
-        'query { repository(owner:%s, name:%s) { issue(number:%d) '
-        '{ number parent { number } } } }'
-    ) % (json.dumps(owner), json.dumps(name), issue_num)
-    data = gql_query(query)
-    issue = data.get("data", {}).get("repository", {}).get("issue")
-    if issue is None:
-        raise ControlPlaneUnavailable("Issue #%d unavailable from GitHub Graph" % issue_num)
-    return {
-        "parent": issue.get("parent", {}).get("number") if issue.get("parent") else None,
-        "blocked_by": _issue_relation(repo, issue_num, "blockedBy"),
-        "blocking": _issue_relation(repo, issue_num, "blocking"),
-        "sub_issues": _issue_relation(repo, issue_num, "subIssues"),
-    }
 
 
 def build_issue_proj_map(cfg):
@@ -402,222 +240,7 @@ def build_issue_proj_map(cfg):
     return mm, items
 
 
-def find_owner_for_issue(issue_num, proj_map, projects, sm):
-    pn = proj_map.get(issue_num)
-    if pn is None:
-        return None
-    for proj in projects:
-        if proj["number"] == pn:
-            role = proj.get("owner")
-            return sm.get(role) if role else None
-    return None
 
-
-def notify_graph_stakeholders(repo, issue_num, title, cur_s, url, graph,
-                              proj_map, projects, sm, output):
-    related = set()
-    if graph["parent"]:
-        related.add(graph["parent"])
-    related.update(graph["blocked_by"])
-    related.update(graph["blocking"])
-    related.update(graph["sub_issues"])
-
-    for other_num in sorted(related):
-        if other_num == issue_num:
-            continue
-        session = find_owner_for_issue(other_num, proj_map, projects, sm)
-        if not session:
-            continue
-        rels = []
-        if graph["parent"] and other_num == graph["parent"]:
-            rels.append("parent")
-        if other_num in graph["blocked_by"]:
-            rels.append("blocker")
-        if other_num in graph["blocking"]:
-            rels.append("dependent")
-        if other_num in graph["sub_issues"]:
-            rels.append("sub-issue")
-        rel_str = ", ".join(rels) if rels else "related"
-        other_url = "https://github.com/%s/issues/%d" % (repo, other_num)
-        msg = format_goal("Issue #%d → %s — affects #%d (%s)" % (issue_num, cur_s, other_num, rel_str),
-                          other_url)
-        queue_goal(output, session, msg, issue_num=other_num)
-
-
-def get_project_items(cfg):
-    """Fetch all items from configured Projects with cursor pagination."""
-    result = []
-    for proj in cfg.get("projects", []):
-        pn = proj["number"]
-        pid = proj["node"]
-        cursor = None
-        while True:
-            after = "null" if cursor is None else json.dumps(cursor)
-            query = (
-                '{node(id:%s){... on ProjectV2{items(first:%d,after:%s){'
-                'nodes{id content{__typename ... on Issue{number title} '
-                '... on PullRequest{number title}} fieldValues(first:20){nodes{'
-                '__typename ... on ProjectV2ItemFieldSingleSelectValue{name '
-                'field{... on ProjectV2SingleSelectField{name}}}}}} '
-                'pageInfo{hasNextPage endCursor}}}}}'
-            ) % (json.dumps(pid), GRAPH_PAGE_SIZE, after)
-            data = gql_query(query)
-            project = data.get("data", {}).get("node")
-            if not isinstance(project, dict):
-                raise ControlPlaneUnavailable("Project #%d unavailable" % pn)
-            connection = project.get("items")
-            if not isinstance(connection, dict):
-                raise ControlPlaneUnavailable("Project #%d items unavailable" % pn)
-            for node in connection.get("nodes", []):
-                content = node.get("content")
-                if not content or not content.get("number"):
-                    continue
-                status = "Inbox"
-                for value in node.get("fieldValues", {}).get("nodes", []):
-                    if not isinstance(value, dict):
-                        continue
-                    field = value.get("field")
-                    if (value.get("__typename") == "ProjectV2ItemFieldSingleSelectValue"
-                            and isinstance(field, dict) and field.get("name") == "Status"):
-                        status = value.get("name", "Inbox")
-                        break
-                result.append({
-                    "number": content["number"],
-                    "status": status,
-                    "project_num": pn,
-                    "project_name": proj.get("name", str(pn)),
-                    "_item_id": node["id"],
-                    "is_pr": content.get("__typename") == "PullRequest",
-                })
-            page = connection.get("pageInfo") or {}
-            if not page.get("hasNextPage"):
-                break
-            cursor = page.get("endCursor")
-            if not cursor:
-                raise ControlPlaneUnavailable("Project #%d pagination cursor missing" % pn)
-    return result
-
-
-def linked_issue_numbers(body):
-    return {
-        int(value)
-        for value in re.findall(
-            r"(?i)(?:close[sd]?|fix(?:es)?|resolve[sd]?)\s+#(\d+)",
-            body or "",
-        )
-    }
-
-
-def resolve_pr_session(pr, proj_map, projects, sm, assignee_map):
-    """Prefer linked Issue Project ownership over ambiguous shared bot authorship."""
-    linked = pr_linked_issue_numbers(pr)
-    sessions = {
-        find_owner_for_issue(number, proj_map, projects, sm)
-        for number in linked
-    }
-    sessions.discard(None)
-    if len(sessions) == 1:
-        return next(iter(sessions))
-    if linked:
-        return None
-    author = pr.get("author", {})
-    login = author.get("login", "") if isinstance(author, dict) else str(author)
-    return resolve_assignee_session(login, assignee_map, sm)
-
-
-def resolve_worker_session(pr, proj_map, projects, sm):
-    """Resolve the assigned worker for a PR strictly by linked-Issue Project
-    ownership. Unrecognized [TO:] aliases (e.g. \"Worker\") are routed by the
-    Project that owns the linked Issue — never by author/assignee semantics.
-    Returns None unless every linked Issue resolves to the same single
-    Project owner (fail closed on any unmapped or conflicting issue)."""
-    linked = pr_linked_issue_numbers(pr)
-    if not linked:
-        return None
-    sessions = {
-        find_owner_for_issue(number, proj_map, projects, sm)
-        for number in linked
-    }
-    if len(sessions) == 1 and None not in sessions:
-        return next(iter(sessions))
-    return None
-
-
-def resolve_issue_worker_session(issue_num, proj_map, projects, sm):
-    """Resolve the assigned worker for an Issue strictly by its Project
-    ownership. Unrecognized [TO:] aliases on an Issue comment route to the
-    Project that owns the Issue; None if unmapped."""
-    return find_owner_for_issue(issue_num, proj_map, projects, sm)
-
-
-def pr_linked_issue_numbers(pr: dict) -> set[int]:
-    """PR 关联 issue 号 — 优先 GitHub API 结构化字段, 文本解析仅兜底.
-
-    状态表示原则: GitHub API 的 `closingIssuesReferences` 是官方结构化
-    关联 (不依赖解析 PR body 文本); 仅当 API 未返回该字段时 (旧数据/
-    stub) 回退到文本正则 (Closes/Fixes/Resolves #N).
-    """
-    refs = pr.get("closingIssuesReferences")
-    if isinstance(refs, list):
-        nums: set[int] = set()
-        for r in refs:
-            if isinstance(r, dict) and isinstance(r.get("number"), int):
-                nums.add(r["number"])
-        if nums:
-            return nums
-    return linked_issue_numbers(pr.get("body", ""))
-
-
-def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
-    r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "open",
-                        "--json",
-                        "number,title,author,reviewDecision,body,"
-                        "closingIssuesReferences",
-                        "--jq", "."],
-                       capture_output=True, text=True, timeout=10)
-    if r.returncode != 0:
-        raise ControlPlaneUnavailable("Unable to list linked PRs")
-    for pr in json.loads(r.stdout):
-        if issue_num not in pr_linked_issue_numbers(pr):
-            continue
-        if pr.get("reviewDecision") == "CHANGES_REQUESTED":
-            session = resolve_pr_session(pr, proj_map, projects, sm, assignee_map)
-            if session:
-                url = "https://github.com/%s/pull/%d" % (repo, pr["number"])
-                message = format_goal(
-                    "PR #%d needs changes — Issue #%d" % (pr["number"], issue_num),
-                    url,
-                )
-                return session, message, pr["number"]
-    return None
-
-
-# 报告链接结构化约定: worker 按输出模板在 PR 描述写 `**报告**: <url>`.
-# dispatcher 只解析这个模板字段 (机器约定), 不扫任意自由文本.
-REPORT_FIELD_RE = re.compile(
-    r"\*\*报告\*\*\s*:\s*(https?://[^\s\)\]]+)", re.IGNORECASE)
-
-
-def _issue_has_merged_pr(repo: str, issue_num: int) -> bool | None:
-    """校验 issue 是否有已 merge 的关联 PR (Done 不变量, codex #10).
-
-    用 GitHub API closingIssuesReferences 结构化关联; 控制面读不到 →
-    返回 None (调用方 fail-closed).
-    """
-    try:
-        r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "merged",
-                            "--limit", "100",
-                            "--json", "number,closingIssuesReferences",
-                            "--jq", ".[] | select(.closingIssuesReferences != null)"],
-                           capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            return None
-        for pr in json.loads(r.stdout):
-            if issue_num in pr_linked_issue_numbers(pr):
-                return True
-        return False
-    except Exception:
-        return None
 
 
 def extract_report_url(repo, issue_num):
@@ -652,163 +275,28 @@ def extract_report_url(repo, issue_num):
     return None
 
 
-def kanban_idempotency_key(repo, issue_num):
-    """Deterministic idempotency key for a source issue.
 
-    Same issue + repo always maps to the same key, so repeated dispatcher
-    ticks never create a duplicate kanban card.
-    """
-    return "issue-%s-%s" % (repo.replace("/", "-"), issue_num)
-
-
-def build_kanban_command(repo, issue_num, title, session, extra_body=None,
-                         kanban_bin="hermes"):
-    """Build a `hermes kanban create` argv for one source issue.
-
-    Card title carries the issue link; the body carries the full goal digest
-    plus a contract/evidence stub. The idempotency key anchors the card to
-    the source issue across ticks. Board selection happens via a global
-    `hermes kanban boards switch` before create (see flush_goals).
-    """
-    argv = [
-        kanban_bin, "kanban", "create",
-        "--body", (extra_body or title),
-        "--idempotency-key", kanban_idempotency_key(repo, issue_num),
-        "--assignee", session,
-    ]
-    argv.append("[Issue #%d] %s" % (issue_num, title))
-    return argv
-
-
-def submit_session_enter(session):
-    """Submit a goal that agent-deck may have only pasted into the TUI.
-
-    Deliberate fallback: agent-deck `session send --no-wait` normally submits
-    the message itself, but on some sessions it only pastes into the input
-    buffer. The extra Enter guarantees delivery; without it, goals can sit
-    unsubmitted at the prompt.
-    """
-    shown = subprocess.run(
-        ["agent-deck", "session", "show", session, "--json"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if shown.returncode != 0:
-        return False, "session lookup failed: %s" % shown.stderr.strip()[:120]
-    try:
-        tmux_session = json.loads(shown.stdout).get("tmux_session")
-    except (json.JSONDecodeError, AttributeError):
-        return False, "session lookup returned invalid JSON"
-    if not tmux_session:
-        return False, "session lookup returned no tmux_session"
-    submitted = subprocess.run(
-        ["tmux", "send-keys", "-t", tmux_session, "Enter"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if submitted.returncode != 0:
-        return False, "Enter submission failed: %s" % submitted.stderr.strip()[:120]
-    return True, "ok"
 
 
 def flush_goals(output, dry_run=False, baseline=False, cfg=None):
-    """Send one digest per session while retaining every queued event.
+    """Emit queued notifications as structured output.
 
-    baseline=True (first run): the digest is reported but never delivered —
-    a fresh repo joins from the moment of its first tick, historical events
-    are recorded as seen without replay.
-
-    cfg (optional) enables dual delivery:
-      - delivery_mode=kanban (default for new setups): one `hermes kanban
-        create` per queued event, idempotency-keyed by source issue.
-      - delivery_mode=agent-deck: legacy tmux digest delivery.
+    v0_3: 不投递 agent-deck / kanban. 通知事件随 JSON 输出,
+    由外层 tick 脚本 / cron 投递到对应通道 (飞书主 / 邮件短信兜底).
+    baseline=True (first run): 记录但不输出通知 (历史事件不重放).
+    Returns True (通知已就绪, 状态可保存).
     """
-    delivery_mode = "agent-deck"
-    if cfg:
-        delivery_mode = cfg.get("delivery_mode", "agent-deck")
-    kanban_bin = "hermes"
-    board = None
-    if cfg:
-        kanban_bin = cfg.get("kanban_bin", "hermes")
-        board = cfg.get("kanban_board")
-    repo = cfg.get("repo") if cfg else None
-
-    if delivery_mode == "kanban" and board:
-        # Board selection is a global CLI switch, not a per-create flag.
-        r = subprocess.run(
-            [kanban_bin, "kanban", "boards", "switch", board],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode != 0:
-            output["warnings"].append(
-                "kanban boards switch %s failed: %s"
-                % (board, r.stderr.strip()[:120])
-            )
-
-    pending = output.pop("_pending", {})
-    anchors = output.pop("_pending_issues", {})
-    all_success = True
-    for session, messages in pending.items():
-        if isinstance(messages, str):
-            messages = [messages]
-        session_anchors = anchors.get(session, {})
-        digest = "\n\n".join(messages)
-        if baseline:
-            success = True
-            outcome = "baseline-skipped"
-            state = "baseline"
-        elif dry_run:
-            success = True
-            outcome = "dry-run"
-            state = "dry_run"
-        elif delivery_mode == "kanban":
-            success = True
-            outcomes = []
-            for message in messages:
-                issue_num = session_anchors.get(message)
-                first_line = message.splitlines()[0] if message else ""
-                # strip a leading /goal marker for the card title
-                if first_line.startswith("/goal "):
-                    card_title = first_line[len("/goal "):]
-                else:
-                    card_title = first_line
-                argv = build_kanban_command(
-                    repo or "unknown-repo",
-                    issue_num or 0,
-                    card_title,
-                    session,
-                    extra_body=message,
-                    kanban_bin=kanban_bin,
-                )
-                result = subprocess.run(
-                    argv, capture_output=True, text=True, timeout=30
-                )
-                ok = result.returncode == 0
-                success = success and ok
-                outcomes.append(
-                    "ok" if ok else "FAILED: %s" % result.stderr.strip()[:160]
-                )
-            outcome = "; ".join(outcomes)
-            state = "sent" if success else "pending_retry"
-        else:
-            result = subprocess.run(
-                ["agent-deck", "session", "send", session, "--no-wait", digest],
-                capture_output=True, text=True, timeout=30,
-            )
-            success = result.returncode == 0
-            outcome = "ok" if success else "FAILED: %s" % result.stderr.strip()[:160]
-            if success:
-                success, enter_outcome = submit_session_enter(session)
-                outcome = "ok + Enter" if success else "FAILED: %s" % enter_outcome
-            state = "sent" if success else "pending_retry"
-        all_success = all_success and success
-        output["actions"].append({
-            "node": "goal:%s" % session,
-            "state": state,
-            "session": session,
-            "reason": "goal_digest",
-            "event_count": len(messages),
-            "result": outcome,
-        })
-    return all_success
+    notifications = output.get("notifications", [])
+    if baseline:
+        for n in notifications:
+            n["baseline_skipped"] = True
+        output["notifications"] = []
+        return True
+    if dry_run:
+        for n in notifications:
+            n["dry_run"] = True
+        return True
+    return True
 
 
 def main():
@@ -835,10 +323,6 @@ def main():
     repo = cfg["repo"]
     projects = cfg.get("projects", [])
     sm, _ = build_session_map(cfg)
-    coordinator_session = resolve_workflow_session(cfg, sm)
-    pi_session = sm.get("pi")  # Review/Blocked 必须投 PI (评审面定义)
-    assignee_map = cfg.get("assignee_map", {})
-    mention_map = build_mention_map(cfg, sm)
     safe_repo_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", args.repo)
     state_file = args.state_dir.expanduser() / ("dispatcher_%s_state.json" % safe_repo_key)
     prefix = "[%s]" % args.repo
@@ -855,34 +339,12 @@ def main():
     control_plane_ok = False
 
     # ── 1. Project Status changes ──
+    # 契约层八态: 状态变化 → 通知对应角色 (谁裁决谁操作).
+    # 通知对象: worker (Ready), auditor (EV Review), 用户 (Human).
+    # PI 不接收通知 (主动轮询 GitHub); In Progress/PI Review/Blocked/Done
+    # 仅记录状态 (PI 轮询自行感知, 成果汇报走 PM 对话接口).
     try:
         proj_map, items = build_issue_proj_map(cfg)
-        # Fetch issue graphs in parallel (one GraphQL call per issue; large repos
-        # benefit from concurrency instead of serial subprocess latency)
-        changed_issues = [
-            item["number"]
-            for item in items
-            if not item.get("is_pr")
-            and prev_state.get(
-                project_state_key(item["project_num"], item["number"]),
-                "Inbox",
-            ) != item.get("status", "Inbox")
-        ]
-        issue_graphs = {}
-        if changed_issues:
-            try:
-                from concurrent.futures import ThreadPoolExecutor
-
-                def _fetch_graph(num):
-                    return num, get_issue_graph(repo, num)
-
-                with ThreadPoolExecutor(max_workers=min(8, len(changed_issues))) as ex:
-                    for num, graph in ex.map(_fetch_graph, changed_issues):
-                        issue_graphs[num] = graph
-            except Exception:
-                # Fall back to serial if concurrency fails
-                for num in changed_issues:
-                    issue_graphs[num] = get_issue_graph(repo, num)
         for item in items:
             issue_num = item["number"]
             pn = item["project_num"]
@@ -907,191 +369,45 @@ def main():
             if ir.returncode != 0:
                 raise ControlPlaneUnavailable(
                     "Unable to read title for %s #%d" %
-                    ("PR" if item.get("is_pr") else "Issue", issue_num)
-                )
+                    ("PR" if item.get("is_pr") else "Issue", issue_num))
             title = ir.stdout.strip()
             url = ("https://github.com/%s/pull/%d" if item.get("is_pr") else "https://github.com/%s/issues/%d") % (repo, issue_num)
             owner = resolve_owner(pn, projects, sm)
 
-            session = None
+            notify_role = None
             msg = None
             reason = None
 
-            # PRs on project board — only Review status matters
-            if item.get("is_pr"):
-                if cur_s == "Review":
-                    session = pi_session or coordinator_session
-                    if session:
-                        msg = format_goal("PR #%d is in REVIEW — %s" % (issue_num, title),
-                                          url)
-                        reason = "pr_review_ready"
-                        queue_goal(output, session, msg, issue_num=issue_num)
-                        output["actions"].append({"node": sk, "state": cur_s, "session": session, "reason": reason,
-                                                  "prev_status": prev_s, "sent": msg[:80], "result": "queued"})
-                new_state[sk] = cur_s
-                continue
-
             if cur_s == "Ready":
-                session = owner
-                if session:
-                    msg = format_goal("Issue #%d is READY — %s" % (issue_num, title),
-                                      url)
-                    reason = "issue_ready"
+                # 契约: PI 拨 Ready → 通知 worker (owner) 开工
+                notify_role = "worker"
+                msg = format_goal("Issue #%d is READY — %s" % (issue_num, title), url)
+                reason = "issue_ready"
 
-            elif cur_s == "In Progress":
-                # 执行态 (kanban running → sync_job 置位): Ready 时已通知
-                # owner 开始执行, 此处仅记录状态推进, 不重复投递.
-                # (避免 Ready + In Progress 双通知噪音)
-                new_state[sk] = cur_s
-                continue
-
-            elif cur_s == "Blocked":
-                lp = check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects)
-                if lp:
-                    session, msg, _ = lp
-                    reason = "pr_changes_needed"
-                else:
-                    # Worker 手动置 Blocked 表达诉求 (无 PR): 结构化信号 →
-                    # 升级给 PI (不丢消息, 不依赖评论文本). PI 决定解除或处理.
-                    session = sm.get("pi")
-                    if session:
-                        msg = format_goal(
-                            "Issue #%d is BLOCKED — %s "
-                            "(owner: %s, worker 诉求, 需 PI 决策/解除)"
-                            % (issue_num, title, owner),
-                            url)
-                        reason = "issue_blocked_escalate"
-                    else:
-                        output["warnings"].append(
-                            "%s Issue #%d is BLOCKED — no linked PR and no PI "
-                            "session (消息未投递)" % (prefix, issue_num))
-                        new_state[sk] = cur_s
-                        continue
+            elif cur_s == "EV Review":
+                # 契约: worker 完成拨 EV Review → 通知 auditor 独立审计
+                notify_role = "auditor"
+                msg = format_goal(
+                    "Issue #%d in EV Review — %s (worker 已完成, 待独立审计)"
+                    % (issue_num, title), url)
+                reason = "ev_review_ready"
 
             elif cur_s == "Human":
-                # Human = PI 判定需真人干预 (超出 AI 循环):
-                # 流程终局性暂停 — dispatcher 不自动推进, 只显著升级通知.
-                # 真人处理后置 Done (验收) 或回 Ready (解除) 由真人决定.
-                session = pi_session or owner
-                if session:
-                    msg = format_goal(
-                        "⛔ Issue #%d 需【人工干预】— %s (owner: %s) — "
-                        "PI 判定超出 AI 循环, 等待真人决策/处理"
-                        % (issue_num, title, owner),
-                        url)
-                    reason = "issue_human_escalate"
-                    queue_goal(output, session, msg, issue_num=issue_num)
-                    output["actions"].append(
-                        {"node": sk, "state": cur_s, "session": session,
-                         "reason": reason, "prev_status": prev_s,
-                         "sent": msg[:80], "result": "queued"})
-                else:
-                    output["warnings"].append(
-                        "%s Issue #%d 需人工干预但无 PI session (消息未投递)"
-                        % (prefix, issue_num))
-                new_state[sk] = cur_s
-                continue
+                # 契约: PI 判定需真人干预 → 通知用户 (飞书主通道)
+                notify_role = "user"
+                msg = format_goal(
+                    "⛔ Issue #%d 需【人工干预】— %s (owner: %s) — "
+                    "PI 判定超出 AI 循环, 等待真人决策/处理"
+                    % (issue_num, title, owner), url)
+                reason = "issue_human_escalate"
 
-            elif cur_s == "Review":
-                try:
-                    r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "open",
-                                        "--json",
-                                        "number,title,author,reviewDecision,body,"
-                                        "closingIssuesReferences",
-                                        "--jq", "."],
-                                       capture_output=True, text=True, timeout=10)
-                    if r.returncode != 0:
-                        raise ControlPlaneUnavailable(
-                            "Unable to resolve linked PR for Issue #%d" % issue_num
-                        )
-                    linked_pr = None
-                    for pr in json.loads(r.stdout):
-                        if issue_num in pr_linked_issue_numbers(pr):
-                            linked_pr = pr
-                            break
-                    if linked_pr:
-                        pu = "https://github.com/%s/pull/%d" % (repo, linked_pr["number"])
-                        if linked_pr.get("reviewDecision") == "CHANGES_REQUESTED":
-                            linked_session = resolve_pr_session(
-                                linked_pr, proj_map, projects, sm, assignee_map
-                            )
-                            if linked_session:
-                                session = linked_session
-                                msg = format_goal(
-                                    "PR #%d needs changes — Issue #%d in Review"
-                                    % (linked_pr["number"], issue_num),
-                                    pu,
-                                )
-                                reason = "review_pr_changes"
-                        else:
-                            session = pi_session or coordinator_session
-                            msg = format_goal(
-                                "Issue #%d in Review — PR #%d awaiting PI review"
-                                % (issue_num, linked_pr["number"]),
-                                pu,
-                            )
-                            reason = "review_pr_ready"
-                except ControlPlaneUnavailable:
-                    raise
-                except Exception as exc:
-                    raise ControlPlaneUnavailable(
-                        "Invalid linked PR data for Issue #%d" % issue_num
-                    ) from exc
-
-                if not session:
-                    output["warnings"].append("%s Issue #%d in REVIEW — no linked PR" % (prefix, issue_num))
-                    new_state[sk] = cur_s
-                    continue
-
-            elif cur_s == "Done":
-                session = owner
-                # 运行时不变量 (codex #10): Done = accepted and merged.
-                # 校验关联 PR 已 merge; 未 merge 的 Done 视为异常 →
-                # 警告 + 升级 PI (不静默当正常 Done 通知).
-                merged_pr = _issue_has_merged_pr(repo, issue_num)
-                if merged_pr is None:
-                    # 控制面读不到 → fail-closed: 升级 PI 而非猜
-                    output["warnings"].append(
-                        "%s Issue #%d DONE but PR merge state unreadable "
-                        "(fail-closed, escalated)" % (prefix, issue_num))
-                    session = pi_session or session
-                elif not merged_pr:
-                    output["warnings"].append(
-                        "%s Issue #%d DONE but no merged PR — 疑似手工改状态, "
-                        "已升级 PI 核验" % (prefix, issue_num))
-                    session = pi_session or session
-                if session:
-                    msg = format_notice("Issue #%d is DONE — %s" % (issue_num, title),
-                                        url)
-                    report = extract_report_url(repo, issue_num)
-                    if report:
-                        msg = format_notice(
-                            "Issue #%d is DONE — %s (report: %s)" % (issue_num, title, report),
-                            url)
-                    reason = "issue_done"
-
-            if session and msg:
-                queue_goal(output, session, msg, issue_num=issue_num)
-                output["actions"].append({"node": sk, "state": cur_s, "session": session, "reason": reason,
-                                          "prev_status": prev_s, "sent": msg[:80], "result": "queued"})
-
-            queue_workflow_issue_transition(
-                cfg,
-                sm,
-                sk,
-                issue_num,
-                title,
-                prev_s,
-                cur_s,
-                url,
-                session,
-                output,
-            )
-
-            # Notify graph stakeholders
-            notify_graph_stakeholders(
-                repo, issue_num, title, cur_s, url, issue_graphs[issue_num],
-                proj_map, projects, sm, output)
+            # 其余状态 (In Progress / PI Review / Blocked / Done / Inbox):
+            # PI 主动轮询自行感知, dispatcher 仅记录, 不通知.
+            if notify_role and msg:
+                queue_goal(output, notify_role, msg, issue_num=issue_num)
+                output["actions"].append({"node": sk, "state": cur_s, "role": notify_role,
+                                          "reason": reason, "prev_status": prev_s,
+                                          "sent": msg[:80], "result": "queued"})
 
             new_state[sk] = cur_s
 
@@ -1101,416 +417,18 @@ def main():
         new_state = dict(prev_state)
         output["warnings"].append("%s control plane unavailable: %s" % (prefix, str(e)[:160]))
 
-    # ── 2. Issue comments [TO: ...] fallback ──
-    warned_issue_comments = set()  # (issue, author) already warned this tick
+    # ── 2. 滞留监控 (WARN) + 活性检测 + 资源监控 ──
+    # (v0_3: dispatcher 监控职责; 详见 monitor.py / tick 脚本)
     try:
-        r = subprocess.run(["gh", "issue", "list", "--repo", repo, "--state", "open",
-                            "--json", "number,title", "--jq", "."],
-                           capture_output=True, text=True, timeout=15)
-        if r.returncode == 0:
-            for iss in json.loads(r.stdout):
-                num = iss["number"]
-                title = iss["title"]
-                try:
-                    cr = subprocess.run(["gh", "issue", "view", str(num), "--repo", repo,
-                                         "--json", "comments", "--jq", ".comments"],
-                                        capture_output=True, text=True, timeout=15)
-                    if cr.returncode != 0:
-                        continue
-                    for c in json.loads(cr.stdout):
-                        try:
-                            cid = c.get("id", "")
-                            if not cid:
-                                continue
-                            body = c.get("body", "")
-                            author = c.get("author", {}).get("login", "unknown")
-                            # 路由优先级 (状态表示原则: 结构化事实优先,
-                            # [TO:] 文本仅作显式覆盖, 不作为主要路由):
-                            #   1) Project 归属 → owner (工作流依赖基础)
-                            #   2) 作者身份 (API 字段): PI→owner, worker→PI
-                            #   3) [TO:] 显式覆盖 (mention_map 明确配置才生效)
-                            owner = resolve_issue_worker_session(
-                                num, proj_map, projects, sm
-                            )
-                            target, tsession = parse_to_directive(body, mention_map)
-                            # [TO:] 只作用于 mention_map 显式配置的角色;
-                            # 未配置的角色名不参与路由 (不再 fallback 猜 owner)
-                            if target and tsession:
-                                pass  # 显式覆盖: 用 tsession
-                            else:
-                                # 结构化作者路由优先 (PI→owner, worker→PI);
-                                # 未知作者 (非 PI 非 worker) → None → 警告,
-                                # 不静默路由 (与 unknown-author-warns 语义一致)
-                                tsession = resolve_author_default_session(
-                                    author, assignee_map, sm, owner
-                                )
-                                if not tsession and owner and author in (
-                                        assignee_map or {}):
-                                    # 已知角色但无映射时兜底 owner
-                                    tsession = owner
-                            ock = "comment:%s" % cid
-                            ck = "comment:%d:%s:%s" % (num, cid, target.lower()) if target else ock
-                            if prev_state.get(ock) or prev_state.get(ck):
-                                continue
-                            if first_run:
-                                # Baseline mode (first run): remember the comment,
-                                # never replay historical directives.
-                                new_state[ck] = "seen"
-                                continue
-                            if not tsession:
-                                # Unknown author, no [TO:], no owner — cannot
-                                # classify. 不静默丢弃: 路由给 PI 过目 (升级
-                                # 通道) + 记录警告 (unknown-author-warns).
-                                tsession = sm.get("pi")
-                                wkey = (num, author)
-                                if wkey not in warned_issue_comments:
-                                    warned_issue_comments.add(wkey)
-                                    why = ("[TO: %s] unresolvable" % target
-                                           if target else "no [TO:] directive")
-                                    output["warnings"].append(
-                                        "%s Issue #%d comment by @%s unroutable "
-                                        "(%s, no Project owner, author unmapped) "
-                                        "— escalated to PI" % (prefix, num, author, why)
-                                    )
-                                if not tsession:
-                                    # 连 PI 都没有 → 真正无处可去.
-                                    # 不标记 seen (保留 pending, 下轮重试):
-                                    # 配置修复后消息可重新派发 (codex #16).
-                                    # 仅记警告, 不消费事件.
-                                    output["warnings"].append(
-                                        "%s Issue #%d comment by @%s — "
-                                        "no PI session, 保留 pending 下轮重试"
-                                        % (prefix, num, author))
-                                    continue
-                            url = "https://github.com/%s/issues/%d" % (repo, num)
-                            escalated = (author not in (assignee_map or {})
-                                         and not target)
-                            if target:
-                                msg = format_goal("[TO: %s] from @%s on Issue #%d — %s" % (target, author, num, title), url)
-                            elif escalated:
-                                msg = format_notice(
-                                    "⚠️ 未分类评论 by @%s on Issue #%d — %s "
-                                    "(unknown author, escalated to PI)" % (author, num, title), url)
-                            else:
-                                msg = format_notice("Comment by @%s on Issue #%d — %s" % (author, num, title), url)
-                            queue_goal(output, tsession, msg, issue_num=num)
-                            new_state[ck] = "forwarded"
-                            output["actions"].append({"node": ck, "state": "forwarded", "session": tsession,
-                                                      "reason": "escalated_to_pi" if escalated else "to_directive",
-                                                      "target": target, "sent": msg[:80], "result": "queued"})
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+        from dispatcher_monitor import run_monitor
+        mon = run_monitor(repo, project=projects[0] if projects else None,
+                          state_dir=args.state_dir, notify=queue_goal)
+        for w in mon.get("warnings", []):
+            output["warnings"].append("%s %s" % (prefix, w))
+        for n in mon.get("notifications", []):
+            queue_goal(output, n["role"], n["message"])
     except Exception as e:
-        output["warnings"].append("%s comment scan: %s" % (prefix, str(e)[:80]))
-
-    # ── 3. PR monitoring ──
-    prs = []
-    try:
-        pr_r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "open",
-                               "--json", "number,title,headRefName,author,createdAt,mergeStateStatus,body,isDraft",
-                               "--jq", "."],
-                              capture_output=True, text=True, timeout=15)
-        if pr_r.returncode == 0:
-            prs = json.loads(pr_r.stdout)
-            for pr in prs:
-                pn = pr["number"]
-                pk = "pr:%d" % pn
-                pu = "https://github.com/%s/pull/%d" % (repo, pn)
-                author = pr["author"]["login"]
-                is_draft = pr.get("isDraft", False)
-
-                # 0. Draft->Ready transition -> workflow coordinator
-                dk = "prdraft:%d" % pn
-                was_draft = prev_state.get(dk)
-                if was_draft is True and not is_draft:
-                    msg = format_goal("PR #%d is now READY FOR REVIEW — %s" % (pn, pr["title"]),
-                                      pu)
-                    queue_goal(output, coordinator_session, msg, issue_num=pn)
-                    output["actions"].append({"node": dk, "state": "ready", "session": coordinator_session,
-                                              "reason": "pr_draft_ready", "sent": msg[:80], "result": "queued"})
-                new_state[dk] = is_draft
-
-                # 3a. New PR -> workflow coordinator
-                if prev_state.get(pk) != "open":
-                    msg = format_notice("New PR #%d: %s by @%s" % (pn, pr["title"], author),
-                                      pu)
-                    queue_goal(output, coordinator_session, msg, issue_num=pn)
-                    output["actions"].append({"node": pk, "state": "open", "session": coordinator_session, "reason": "new_pr",
-                                              "sent": msg[:80], "result": "queued"})
-                    new_state[pk] = "open"
-
-                # 3b. Review state changes
-                try:
-                    if not control_plane_ok:
-                        raise ControlPlaneUnavailable(
-                            "Project/Graph unavailable for PR owner routing"
-                        )
-                    rv = subprocess.run(["gh", "pr", "view", str(pn), "--repo", repo,
-                                         "--json", "reviewDecision", "--jq", ".reviewDecision"],
-                                        capture_output=True, text=True, timeout=10)
-                    if rv.returncode == 0:
-                        decision = rv.stdout.strip()
-                        rk = "prreview:%d" % pn
-                        pd = prev_state.get(rk)
-                        if decision and (not pd or pd != decision):
-                            asession = resolve_pr_session(pr, proj_map, projects, sm, assignee_map)
-                            if asession:
-                                if decision == "APPROVED":
-                                    reason = "pr_approved"
-                                    t = "PR #%d has been **APPROVED** — %s" % (pn, pr["title"])
-                                elif decision == "CHANGES_REQUESTED":
-                                    reason = "pr_changes_requested"
-                                    t = "PR #%d has **CHANGES REQUESTED** — %s" % (pn, pr["title"])
-                                else:
-                                    reason = "pr_review_changed"
-                                    t = "PR #%d review updated — %s" % (pn, pr["title"])
-                                if decision == "CHANGES_REQUESTED":
-                                    msg = format_goal(t, pu)  # action required
-                                else:
-                                    msg = format_notice(t, pu)  # informational
-                                queue_goal(output, asession, msg, issue_num=pn)
-                                output["actions"].append({"node": rk, "state": decision, "session": asession, "reason": reason,
-                                                          "sent": msg[:80], "result": "queued"})
-                            else:
-                                msg = format_goal("PR #%d review: %s — unresolved owner" % (pn, decision),
-                                                  pu)
-                                queue_goal(output, coordinator_session, msg, issue_num=pn)
-                                output["actions"].append({"node": rk, "state": decision, "session": coordinator_session,
-                                                          "reason": "pr_unclear_owner", "sent": msg[:80], "result": "queued"})
-
-                        if decision:
-                            new_state[rk] = decision
-                except Exception:
-                    pass
-
-            # 3c. Track closed/merged + recent merges
-            if not control_plane_ok:
-                raise ControlPlaneUnavailable(
-                    "Project/Graph unavailable for merged PR owner routing"
-                )
-            open_keys = {"pr:%d" % p["number"] for p in prs}
-            merged_keys = {k for k, v in prev_state.items()
-                           if k.startswith("pr:") and not k.startswith("prreview:")
-                           and v in ("merged", "closed")}
-
-            try:
-                mr = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "merged",
-                                     "--json", "number,title,mergedAt,author,mergedBy,body",
-                                     "--jq", ".[:10]"],
-                                    capture_output=True, text=True, timeout=10)
-                if mr.returncode == 0:
-                    for mp in json.loads(mr.stdout):
-                        pn = mp["number"]
-                        mk = "pr:%d" % pn
-                        if mk not in merged_keys and prev_state.get(mk) != "merged":
-                            new_state[mk] = "merged"
-                            author = mp.get("author", {}).get("login", "unknown")
-                            asession = resolve_pr_session(
-                                mp, proj_map, projects, sm, assignee_map
-                            )
-                            pu = "https://github.com/%s/pull/%d" % (repo, pn)
-                            if asession:
-                                msg = format_notice("PR #%d has been **MERGED**! — %s" % (pn, mp.get("title", "")),
-                                                  pu)
-                                queue_goal(output, asession, msg, issue_num=pn)
-                                output["actions"].append({"node": mk, "state": "merged", "session": asession,
-                                                          "reason": "pr_merged_recent", "sent": msg[:80], "result": "queued"})
-                            else:
-                                msg = format_notice("PR #%d was merged — unclear who to notify" % pn,
-                                                  pu)
-                                queue_goal(output, coordinator_session, msg, issue_num=pn)
-                                output["actions"].append({"node": mk, "state": "merged", "session": coordinator_session,
-                                                          "reason": "pr_merged_unmapped_recent", "sent": msg[:80], "result": "queued"})
-            except Exception:
-                pass
-
-            for key in list(prev_state):
-                if key.startswith("pr:") and not key.startswith("prreview:"):
-                    if key in open_keys:
-                        continue
-                    pn = int(key.split(":")[1])
-                    try:
-                        cl = subprocess.run(["gh", "pr", "view", str(pn), "--repo", repo,
-                                             "--json", "state,mergedAt,author,title,body",
-                                             "--jq", "{state, mergedAt, author: .author.login, title, body}"],
-                                            capture_output=True, text=True, timeout=10)
-                        if cl.returncode == 0:
-                            info = json.loads(cl.stdout)
-                            if info.get("state") == "MERGED":
-                                if new_state.get(key) == "merged":
-                                    continue  # already handled by recent-merges path
-                                new_state[key] = "merged"
-                                author = info.get("author", "")
-                                asession = resolve_pr_session(
-                                    {"author": {"login": author}, "body": info.get("body", "")},
-                                    proj_map, projects, sm, assignee_map,
-                                )
-                                if asession and prev_state.get(key) != "merged":
-                                    pu = "https://github.com/%s/pull/%d" % (repo, pn)
-                                    msg = format_notice("PR #%d has been **MERGED**! — %s" % (pn, info.get("title", "")),
-                                                      pu)
-                                    queue_goal(output, asession, msg, issue_num=pn)
-                                    output["actions"].append({"node": key, "state": "merged", "session": asession,
-                                                              "reason": "pr_merged", "sent": msg[:80], "result": "queued"})
-                                elif not asession and prev_state.get(key) != "merged":
-                                    pu = "https://github.com/%s/pull/%d" % (repo, pn)
-                                    msg = format_notice("PR #%d was merged — unclear who to notify" % pn,
-                                                      pu)
-                                    queue_goal(output, coordinator_session, msg, issue_num=pn)
-                                    output["actions"].append({"node": key, "state": "merged", "session": coordinator_session,
-                                                              "reason": "pr_merged_unmapped", "sent": msg[:80], "result": "queued"})
-                    except Exception:
-                        pass
-    except Exception as e:
-        output["warnings"].append("%s PR scan: %s" % (prefix, str(e)[:80]))
-
-    # ── 3d. PR comments [TO: ...] fallback ──
-    warned_pr_comments = set()  # (pr, author) already warned this tick
-    try:
-        for pr in prs:
-            pn = pr["number"]
-            cr = subprocess.run(["gh", "pr", "view", str(pn), "--repo", repo,
-                                 "--json", "comments",
-                                 "--jq", ".comments"],
-                                capture_output=True, text=True, timeout=15)
-            if cr.returncode != 0:
-                continue
-            for c in json.loads(cr.stdout):
-                cid = c.get("id", "")
-                if not cid:
-                    continue
-                body = c.get("body", "")
-                author = c.get("author", {}).get("login", "unknown")
-                target, tsession = parse_to_directive(body, mention_map)
-                ock = "prcomment:%s" % cid
-                ck = "prcomment:%d:%s:%s" % (pn, cid, target.lower()) if target else ock
-                if prev_state.get(ock) or prev_state.get(ck):
-                    continue
-                if first_run:
-                    # Baseline mode (first run): remember, never replay.
-                    new_state[ck] = "seen"
-                    continue
-                if target and not tsession:
-                    # [TO: <alias>] that no mention_map alias resolves (e.g.
-                    # "Worker") — the assigned worker is decided by Project
-                    # ownership of the linked Issue, never by semantic
-                    # guessing or author/assignee fallback.
-                    tsession = resolve_worker_session(
-                        pr, proj_map, projects, sm
-                    )
-                if not tsession:
-                    # No explicit [TO:] target (or unresolvable) — fall back
-                    # to author identity: PI messages default to the linked
-                    # Issue's Project owner; worker messages default to the
-                    # PI session. Never silently drop a routed author's
-                    # message.
-                    owner = resolve_worker_session(pr, proj_map, projects, sm)
-                    tsession = resolve_author_default_session(
-                        author, assignee_map, sm, owner
-                    )
-                if not tsession:
-                    # Truly unroutable (unknown author, no linked owner) —
-                    # record a warning instead of disappearing it.
-                    new_state[ck] = "seen"
-                    wkey = (pn, author)
-                    if wkey not in warned_pr_comments:
-                        warned_pr_comments.add(wkey)
-                        why = ("[TO: %s] unresolvable" % target
-                               if target else "no [TO:] directive")
-                        output["warnings"].append(
-                            "%s PR #%d comment by @%s unroutable "
-                            "(%s, no linked owner, author unmapped)"
-                            % (prefix, pn, author, why)
-                        )
-                    continue
-                url = "https://github.com/%s/pull/%d" % (repo, pn)
-                if target:
-                    msg = format_goal("[TO: %s] from @%s on PR #%d — %s" % (target, author, pn, pr["title"]), url)
-                else:
-                    msg = format_notice("Comment by @%s on PR #%d — %s" % (author, pn, pr["title"]), url)
-                queue_goal(output, tsession, msg, issue_num=pn)
-                new_state[ck] = "forwarded"
-                output["actions"].append({"node": ck, "state": "forwarded", "session": tsession, "reason": "to_directive_pr",
-                                          "target": target, "sent": msg[:80], "result": "queued"})
-    except Exception as e:
-        output["warnings"].append("%s PR comment scan: %s" % (prefix, str(e)[:80]))
-
-    # ── 4. Milestone monitoring ──
-    try:
-        mr = subprocess.run(["gh", "issue", "list", "--repo", repo, "--state", "open",
-                             "--json", "number,title,milestone,projectItems",
-                             "--jq", ".[] | {n: .number, title: .title[0:50], ms: (.milestone.title // null), ms_due: (.milestone.dueOn // null), status: ([.projectItems[] | .status.name] | first // \"Inbox\"), nproj: ([.projectItems[] | .title] | length)}"],
-                            capture_output=True, text=True, timeout=15)
-        if mr.returncode == 0:
-            # Coverage check: every open Issue must have a Project and a Milestone.
-            # Missing either means PI has not finished routing — flag it.
-            uncovered = []
-            milestones = {}
-            now = time.time()
-            for line in mr.stdout.strip().split('\n'):
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                n = row.get("n")
-                has_ms = bool(row.get("ms"))
-                has_proj = (row.get("nproj") or 0) > 0
-                if n is not None and (not has_ms or not has_proj):
-                    missing = []
-                    if not has_proj:
-                        missing.append("Project")
-                    if not has_ms:
-                        missing.append("Milestone")
-                    uncovered.append("#%d (missing %s)" % (n, " + ".join(missing)))
-                ms = row.get("ms", "")
-                if not ms:
-                    continue
-                if ms not in milestones:
-                    milestones[ms] = {"total": 0, "done": 0, "open": 0, "due": row.get("ms_due", ""), "issues": []}
-                milestones[ms]["total"] += 1
-                status = row.get("status", "Inbox")
-                if status in ("Done", "Cancelled"):
-                    milestones[ms]["done"] += 1
-                else:
-                    milestones[ms]["open"] += 1
-                    milestones[ms]["issues"].append("#%d [%s]" % (row["n"], status))
-
-            for ms_name, ms_data in milestones.items():
-                mk = "milestone:%s" % ms_name
-                prev = prev_state.get(mk, {})
-                if not isinstance(prev, dict):
-                    prev = {}
-                progress = "%d/%d" % (ms_data["done"], ms_data["total"])
-                overdue = ""
-                if ms_data.get("due"):
-                    due_ts = datetime.fromisoformat(ms_data["due"].replace("Z", "+00:00")).timestamp()
-                    days_left = (due_ts - now) / 86400
-                    if days_left < 0:
-                        overdue = "OVERDUE by %d days" % abs(int(days_left))
-                    elif days_left < 7:
-                        overdue = "%d days left" % int(days_left)
-
-                if prev.get("progress") != progress or (overdue and prev.get("overdue") != overdue):
-                    if coordinator_session:
-                        msg = format_notice("Milestone %s — %s%s" % (ms_name, progress, " (%s)" % overdue if overdue else ""),
-                                          "https://github.com/%s/milestones" % repo)
-                        queue_goal(output, coordinator_session, msg)
-                        output["actions"].append({"node": mk, "state": progress, "session": coordinator_session,
-                                                  "reason": "milestone_update", "sent": msg[:80], "result": "queued"})
-                new_state[mk] = {"progress": progress, "overdue": overdue}
-            if uncovered:
-                output["warnings"].append(
-                    "%s un-routed issues (missing Project and/or Milestone): %s" % (
-                        prefix, ", ".join(uncovered[:8])))
-                if len(uncovered) > 8:
-                    output["warnings"].append(
-                        "%s ... and %d more un-routed issues" % (prefix, len(uncovered) - 8))
-    except Exception as e:
-        output["warnings"].append("%s milestone scan: %s" % (prefix, str(e)[:80]))
+        output["warnings"].append("%s monitor: %s" % (prefix, str(e)[:120]))
 
     delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run, cfg=cfg)
     if first_run:
