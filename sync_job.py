@@ -311,6 +311,8 @@ def load_synced(state_file: Path) -> set[str]:
             data = json.loads(state_file.read_text())
             if not isinstance(data, dict) or not isinstance(data.get("synced"), list):
                 raise ValueError("结构非法: 期望 {\"synced\": [..]}")
+            if not all(isinstance(x, str) for x in data["synced"]):
+                raise ValueError("结构非法: synced 元素必须是字符串")
             return set(data["synced"])
         except (json.JSONDecodeError, OSError, ValueError) as exc:
             # 损坏/结构非法 → fail-closed: 退出而非返回空集合重放历史 (codex #18).
@@ -507,12 +509,13 @@ def sync_all(repo: str, project: dict | None, board: str | None,
                                 gh_user=worker_user)
         done_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
+            # 评论/Review 成功即写幂等键 → 防下轮重复评论 (codex 3rd).
+            # 归档失败单独标记, 不阻塞同步幂等 (评论不重发).
+            synced.add("done:%s" % card["id"])
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
                 outcome["archived"] = True
-                # 归档成功才记幂等键 → 归档失败下轮可重试 (codex 2nd)
-                synced.add("done:%s" % card["id"])
             else:
                 outcome["archive_failed"] = r.stderr.strip()[:120]
     segments.append({"segment": "done", "cards": len(done_cards),
@@ -532,12 +535,13 @@ def sync_all(repo: str, project: dict | None, board: str | None,
                                   gh_user=auditor_user)
         ev_results.append(outcome)
         if outcome["status"] == "synced" and not dry_run:
+            # EV 评论成功即写幂等键 → 防下轮重复裁决评论 (codex 3rd).
+            # 归档失败单独标记, 不阻塞同步幂等.
+            synced.add("ev:%s" % card["id"])
             r = subprocess.run(["hermes", "kanban", "archive", card["id"]],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
                 outcome["archived"] = True
-                # 归档成功才记幂等键 → 归档失败下轮可重试 (codex 2nd)
-                synced.add("ev:%s" % card["id"])
             else:
                 outcome["archive_failed"] = r.stderr.strip()[:120]
     segments.append({"segment": "ev", "cards": len(ev_cards),
@@ -606,9 +610,11 @@ def main() -> None:
 
     cards = list_done_cards(args.board)
 
-    # 执行态同步: 读 running 卡 → 置 GitHub In Progress (worker 账号)
+    # 执行态同步: 读 running 卡 → 置 GitHub In Progress (worker 账号;
+    # 排除 EV 卡, EV 归 auditor 段)
     if args.sync_inprogress:
-        run_cards = list_running_cards(args.board)
+        run_cards = [c for c in list_running_cards(args.board)
+                     if not is_ev_card(c)]
         gh_user = role_user("worker")  # 环境变量预传递, 无默认账号 (fail-closed)
         for card in run_cards:
             if card["id"] in synced:
