@@ -391,15 +391,21 @@ def _state_lock(lock_path: Path):
             fh.close()
 
 
-def resolve_item_id(repo: str, issue_num: int, project_node: str) -> str:
-    """gh api graphql: find the ProjectV2 item id for a linked issue."""
+def resolve_item_id(repo: str, issue_num: int, project_node: str,
+                    gh_token: str | None = None) -> str:
+    """gh api graphql: find the ProjectV2 item id for a linked issue.
+
+    gh_token 注入: 查询也走角色身份 (codex: 默认账号查询=权限错位).
+    """
     query = (
         'query($p: ID!) { node(id: $p) { ... on ProjectV2 { items(first: 100) {'
         ' nodes { id content { ... on Issue { number } } } } } } }'
     )
+    env = gh_env(gh_token) if gh_token else None
     r = subprocess.run(
         ["gh", "api", "graphql", "-f", "query=%s" % query, "-F", "p=%s" % project_node],
         capture_output=True, text=True, timeout=30,
+        env=env,
     )
     if r.returncode != 0:
         raise RuntimeError("item lookup failed: %s" % r.stderr.strip()[:200])
@@ -431,6 +437,10 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
     issue_num = extract_issue_number(card)
     if issue_num is None:
         return {"card": card["id"], "status": "skipped", "reason": "no issue ref"}
+    # 账号确认提前到函数级 (codex): 无论评论是否跳过 (重试 Review),
+    # 全部 GitHub 写操作都必须是 worker 身份.
+    if not dry_run:
+        guard_gh_user(gh_user, gh_token)
     actions = []
 
     # 1. Evidence comment (幂等: 已发过则跳过 — codex 5th 评论/Review 分离)
@@ -442,7 +452,6 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
         if dry_run:
             actions.append({"action": "comment", "dry_run": True, "body": comment[:80]})
         else:
-            guard_gh_user(gh_user, gh_token)  # 账号确认: GH_TOKEN == worker
             r = subprocess.run(
                 ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", comment],
                 capture_output=True, text=True, timeout=30,
@@ -458,7 +467,8 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
     # 2. Move to Review on the project board
     if project and issue_num:
         try:
-            item_id = resolve_item_id(repo, issue_num, project["node"])
+            item_id = resolve_item_id(repo, issue_num, project["node"],
+                                      gh_token=gh_token)
             if not item_id:
                 # 评论已发但状态未推进 → failed (不 synced, 避免下轮重复评论
                 # 的幂等保护失效: 控制面/执行面分叉 = 静默丢状态)
@@ -518,7 +528,8 @@ def set_issue_in_progress(card: dict, repo: str, project: dict | None,
                 "actions": [{"action": "inprogress", "dry_run": True}]}
     guard_gh_user(gh_user, gh_token)
     try:
-        item_id = resolve_item_id(repo, issue_num, project["node"])
+        item_id = resolve_item_id(repo, issue_num, project["node"],
+                                  gh_token=gh_token)
         if not item_id:
             return {"card": card["id"], "status": "skipped",
                     "reason": "issue not in project"}
