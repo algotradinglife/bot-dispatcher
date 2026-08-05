@@ -199,16 +199,24 @@ def role_user(role: str) -> str:
 
 
 def switch_gh_user(gh_user: str) -> None:
-    """切换到指定账号, 并验证切换成功 (fail-closed: 失败即抛错, 不静默)."""
-    r = subprocess.run(["gh", "auth", "switch", "--user", gh_user],
-                       capture_output=True, text=True, timeout=30)
-    if r.returncode != 0:
-        raise RuntimeError(
-            "gh auth switch 到 %s 失败: %s" % (gh_user, r.stderr.strip()[:160]))
-    actual = current_gh_user()
-    if actual != gh_user:
-        raise RuntimeError(
-            "账号守卫: 期望 %s, 实际 %s — 拒绝继续 (防角色错位)" % (gh_user, actual))
+    """切换到指定账号, 并验证切换成功 (fail-closed: 失败即抛错, 不静默).
+
+    全局锁保护 gh auth switch (全局账号状态): 不同 repo 并发切换
+    会互相踩 — codex 7th. 锁文件固定路径, 跨 repo 互斥.
+    """
+    global_lock = Path(os.path.expanduser(
+        "~/.hermes/bot-dispatcher-gh-switch.lock"))
+    global_lock.parent.mkdir(parents=True, exist_ok=True)
+    with _state_lock(global_lock):
+        r = subprocess.run(["gh", "auth", "switch", "--user", gh_user],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise RuntimeError(
+                "gh auth switch 到 %s 失败: %s" % (gh_user, r.stderr.strip()[:160]))
+        actual = current_gh_user()
+        if actual != gh_user:
+            raise RuntimeError(
+                "账号守卫: 期望 %s, 实际 %s — 拒绝继续 (防角色错位)" % (gh_user, actual))
 
 
 def guard_gh_user(expected: str) -> None:
@@ -674,17 +682,21 @@ def main() -> None:
                     break
 
     state_file = args.state_dir / ("synced_%s.json" % args.repo.replace("/", "_"))
-    synced = load_synced(state_file)
-    results = []
 
-    # 统一同步入口 (推荐): 一次调用同步全部状态
+    # 统一同步入口 (推荐): 一次调用同步全部状态 (内部持锁)
     if args.sync_all or not (args.sync_ev or args.sync_inprogress):
         out = sync_all(args.repo, project, args.board, state_file,
                        dry_run=args.dry_run)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return
 
-    cards = list_done_cards(args.board)
+    # 旧入口 (兼容): 同样持锁 — 检查-行动原子, 防并发重复评论
+    # (codex 7th: 旧入口锁外检查-行动可并发双发)
+    lock_path = state_file.with_suffix(".lock")
+    with _state_lock(lock_path):
+        synced = _load_synced_unlocked(state_file)
+        results = []
+        cards = list_done_cards(args.board)
 
     # 执行态同步: 读 running 卡 → 置 GitHub In Progress (worker 账号;
     # 排除 EV 卡, EV 归 auditor 段)
@@ -704,7 +716,7 @@ def main() -> None:
             if outcome["status"] == "synced" and not args.dry_run:
                 synced.add(card["id"])
         if not args.dry_run:
-            save_synced(state_file, synced)
+            _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
         print(json.dumps({"cards": len(run_cards), "new": len(results),
                           "results": results}, ensure_ascii=False, indent=2))
         return
@@ -734,7 +746,7 @@ def main() -> None:
                     else:
                         outcome["archive_failed"] = r.stderr.strip()[:120]
         if not args.dry_run:
-            save_synced(state_file, synced)
+            _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
         print(json.dumps({"cards": len(ev_cards), "new": len(results),
                           "results": results}, ensure_ascii=False, indent=2))
         return
@@ -760,7 +772,7 @@ def main() -> None:
                 else:
                     outcome["archive_failed"] = r.stderr.strip()[:120]
     if not args.dry_run:
-        save_synced(state_file, synced)
+        _save_synced_unlocked(state_file, synced)  # 已持锁, 无锁写
     print(json.dumps({"cards": len(cards), "new": len(results),
                       "results": results}, ensure_ascii=False, indent=2))
 
