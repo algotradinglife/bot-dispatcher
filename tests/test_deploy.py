@@ -18,7 +18,8 @@ deploy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(deploy)
 
 
-FAKE_OPTS = {"Inbox": "i1", "Ready": "r1", "Review": "v1", "Done": "d1"}
+FAKE_OPTS = {"Inbox": "i1", "Ready": "r1", "In Progress": "ip1",
+             "Review": "v1", "Blocked": "b1", "Human": "h1", "Done": "d1"}
 
 
 def test_gen_workflow_fills_real_ids(tmp_path):
@@ -101,4 +102,5 @@ def test_templates_exist():
 
 def test_states_definition_complete():
     names = [s[0] for s in deploy.STATES]
-    assert names == ["Inbox", "Ready", "Review", "Done"]
+    assert names == ["Inbox", "Ready", "In Progress", "Review",
+                     "Blocked", "Human", "Done"]

@@ -40,11 +40,17 @@ REPO_ROOT = Path(__file__).resolve().parent
 TEMPLATES = REPO_ROOT / "templates"
 WORKFLOW_SRC = REPO_ROOT / "workflows" / "pr-status-sync.yaml"
 
-# 四态 (GitHub Project V2 single-select)
+# 七态 (GitHub Project V2 single-select)
+#   In Progress = 执行态: kanban 卡 running (执行开始) → 同步置位
+#   Blocked     = worker 诉求通道: worker 置 Blocked → dispatcher 升级 PI
+#   Human       = PI 判定需真人干预 (超出 AI 循环): 终局性暂停, 等真人处理
 STATES = [
     ("Inbox", "GRAY", "planning, not yet dispatched"),
     ("Ready", "GREEN", "contract approved, ready to dispatch"),
+    ("In Progress", "BLUE", "executing: kanban card running (synced)"),
     ("Review", "YELLOW", "evidence submitted, awaiting PI review"),
+    ("Blocked", "RED", "worker request: needs PI decision or unblock"),
+    ("Human", "ORANGE", "PI judged: needs human intervention (beyond AI loop)"),
     ("Done", "PURPLE", "accepted and merged"),
 ]
 
@@ -142,13 +148,21 @@ def set_states(project_id: str, field_id: str, dry: bool) -> dict:
     _, opts = get_status_field(project_id, dry)
     missing = [s for s, *_ in STATES if s not in opts]
     if missing and not dry:
-        q = ('mutation($p: ID!, $f: ID!, $o: [ProjectV2SingleSelectFieldOptionInput!]!) '
+        q = ('mutation($f: ID!, $o: [ProjectV2SingleSelectFieldOptionInput!]!) '
              '{ updateProjectV2Field(input: {fieldId: $f, singleSelectOptions: $o}) '
              '{ projectV2Field { ... on ProjectV2SingleSelectField { id options { id name } } } } }')
         opts_in = [{"name": n, "color": c, "description": d}
                    for n, c, d in STATES]
-        gh("graphql", "-f", f"query={q}", "-F", f"p={project_id}",
-           "-F", f"f={field_id}", "-f", f"o={json.dumps(opts_in)}")
+        # gh -f/-F 无法正确传 [Input!]! list → 用 --input 传完整 JSON body
+        body = json.dumps({"query": q,
+                           "variables": {"f": field_id, "o": opts_in}})
+        env = dict(os.environ)
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        r = subprocess.run(["gh", "api", "graphql", "--input", "-"],
+                           input=body, capture_output=True, text=True,
+                           timeout=60, env=env)
+        if r.returncode != 0:
+            raise DeployError("set_states failed: %s" % r.stderr.strip()[:300])
         _, opts = get_status_field(project_id, dry=False)
     return {s: opts[s] for s, *_ in STATES if s in opts}
 
@@ -213,6 +227,7 @@ repos:
         owner: researcher
         review_field: "{field_id}"
         review_option: "{opts['Review']}"   # Review
+        inprogress_option: "{opts['In Progress']}"   # In Progress (执行态同步)
     # worker 角色 → (board, assignee_profile)
     # researcher=Dr. Strange(文献/策略/模型/报告), engineer=Adam(全栈),
     # auditor=Alan(独立 EV, Engineering validation)
@@ -295,18 +310,14 @@ $GH auth switch --user hh1985 >/dev/null 2>&1
 OUT=$(cd $BASE && python3 bot-dispatcher/dispatcher.py \\
   --repo {key} --config $CFG --state-dir $STATE 2>&1)
 
-SYNC_OUT=$(cd $BASE && python3 bot-dispatcher/sync_job.py \\
-  --repo $REPO --config $CFG --board $BOARD --state-dir $STATE --archive 2>&1)
+SYNC_OUT=$(cd $BASE && GH_USER_WORKER="$GH_USER_WORKER" GH_USER_AUDITOR="$GH_USER_AUDITOR" python3 bot-dispatcher/sync_job.py \
+  --repo $REPO --config $CFG --board $BOARD --state-dir $STATE --sync-all 2>&1)
 
-EV_OUT=$(cd $BASE && GH_USER_AUDITOR="$GH_USER_AUDITOR" python3 bot-dispatcher/sync_job.py \\
-  --repo $REPO --config $CFG --board $BOARD --state-dir $STATE \\
-  --sync-ev --archive 2>&1)
-
-python3 - "$OUT" "$SYNC_OUT" "$EV_OUT" <<'PY'
+python3 - "$OUT" "$SYNC_OUT" <<'PY'
 import json, sys
 
 lines = []
-disp_raw, sync_raw, ev_raw = sys.argv[1], sys.argv[2], sys.argv[3]
+disp_raw, sync_raw = sys.argv[1], sys.argv[2]
 
 try:
     d = json.loads(disp_raw)
@@ -325,25 +336,26 @@ except Exception:
 
 try:
     s = json.loads(sync_raw)
-    if s.get('new'):
-        lines.append('🔄 %d 张完成卡已同步 + 归档'.format(len(s['results'])))
-        for r in s['results']:
-            if r.get('status') == 'synced':
-                lines.append('  - issue #%s → %s %s' % (
-                    r.get('issue'), [a.get('action') for a in r.get('actions', [])],
+    for seg in s.get('segments', []):
+        new = [r for r in seg.get('results', [])
+               if r.get('status') == 'synced']
+        if not new:
+            continue
+        if seg.get('segment') == 'inprogress':
+            lines.append('▶️ %d 张执行卡已同步 (In Progress)'.format(len(new)))
+            for r in new:
+                lines.append('  - issue #%s → In Progress' % r.get('issue'))
+        elif seg.get('segment') == 'done':
+            lines.append('🔄 %d 张完成卡已同步 + 归档'.format(len(new)))
+            for r in new:
+                lines.append('  - issue #%s → Review %s' % (
+                    r.get('issue'),
                     '🗂' if r.get('archived') else ''))
-except Exception:
-    pass
-
-try:
-    e = json.loads(ev_raw)
-    if e.get('new'):
-        lines.append('🔍 %d 条 EV 裁决已同步 (hh1985)'.format(len(e['results'])))
-        for r in e['results']:
-            if r.get('status') == 'synced':
-                lines.append('  - issue #%s: %s %s' % (
-                    r.get('issue'), r.get('verdict', ''),
-                    '🗂' if r.get('archived') else ''))
+        elif seg.get('segment') == 'ev':
+            lines.append('🔍 %d 条 EV 裁决已同步 (auditor)'.format(len(new)))
+            for r in new:
+                lines.append('  - issue #%s %s' % (
+                    r.get('issue'), r.get('verdict', '')))
 except Exception:
     pass
 

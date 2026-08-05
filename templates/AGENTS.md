@@ -85,6 +85,10 @@ kanban 是执行态（工作卡），单向映射、不双写。
 - **worker 诉求 = Blocked 状态**（结构化信号）：worker 要 PI 决策/解除 →
   置 issue Blocked，dispatcher 检测 → 升级 PI（issue_blocked_escalate）。
   不通过评论文本传达诉求。
+- **Human 状态 = 需真人干预**：PI 判定问题超出 AI 循环 → 置 Human →
+  dispatcher 显著升级通知（issue_human_escalate）且不自动推进；真人
+  处理后置 Done（验收）或回 Ready（解除）。Blocked 与 Human 语义分离：
+  Blocked 是 AI 循环内诉求（PI 可决策），Human 是终局性暂停（需真人）。
 - **账号即物证 + 环境变量预传递**: 每个角色绑定唯一账号（GH_USER_PI /
   GH_USER_WORKER / GH_USER_AUDITOR），调用方注入、无默认值、缺省 fail-closed；
   切换后验证当前账号，不符即拒绝写入。

@@ -112,8 +112,8 @@ def build_review_comment(card: dict) -> str:
 
 # ── sync orchestration ────────────────────────────────────────────────
 
-def list_done_cards(board: str | None = None) -> list[dict]:
-    argv = ["hermes", "kanban", "list", "--status", "done", "--json"]
+def list_cards_by_status(status: str, board: str | None = None) -> list[dict]:
+    argv = ["hermes", "kanban", "list", "--status", status, "--json"]
     if board:
         # Board selection is a global CLI switch (not a --tenant filter).
         r = subprocess.run(
@@ -126,6 +126,16 @@ def list_done_cards(board: str | None = None) -> list[dict]:
     if r.returncode != 0:
         raise RuntimeError("kanban list failed: %s" % r.stderr.strip()[:200])
     return json.loads(r.stdout or "[]")
+
+
+def list_done_cards(board: str | None = None) -> list[dict]:
+    """done 卡 (证据同步主通道)."""
+    return list_cards_by_status("done", board)
+
+
+def list_running_cards(board: str | None = None) -> list[dict]:
+    """running 卡 (执行态: 卡 running → GitHub In Progress)."""
+    return list_cards_by_status("running", board)
 
 
 def list_all_cards(board: str | None = None) -> list[dict]:
@@ -212,19 +222,24 @@ def guard_gh_user(expected: str) -> None:
 def parse_verdict(result: str) -> str | None:
     """从 result 解析结构化裁决标记.
 
-    约定: result 首行必须是机器可读标记 `VERDICT: PASS` 或 `VERDICT: REJECT`
+    约定: result **首行**必须是机器可读标记 `VERDICT: PASS|REJECT`
     (Alan 按 auditor-ev-templates 写入), 后续行为人类可读详情.
+    严格匹配: 仅首个非空行; 自由文本夹带标记 (非首行) 不识别.
     无法解析 → 返回 None (调用方 fail-closed, 绝不宽松猜文本).
     """
     for line in result.splitlines():
         line = line.strip()
-        if line.upper().startswith("VERDICT:"):
-            v = line.split(":", 1)[1].strip().upper()
-            if v == "PASS":
-                return "PASS"
-            if v == "REJECT":
-                return "REJECT"
-            return None  # VERDICT: 存在但值不合法 → 不猜
+        if not line:
+            continue
+        # 只检查首个非空行 — 之后的任何内容都视为详情, 不参与裁决
+        if not line.upper().startswith("VERDICT:"):
+            return None
+        v = line.split(":", 1)[1].strip().upper()
+        if v == "PASS":
+            return "PASS"
+        if v == "REJECT":
+            return "REJECT"
+        return None  # VERDICT: 存在但值不合法 → 不猜
     return None  # 无结构化标记 → 不猜
 
 
@@ -294,14 +309,21 @@ def load_synced(state_file: Path) -> set[str]:
     if state_file.exists():
         try:
             return set(json.loads(state_file.read_text()).get("synced", []))
-        except (json.JSONDecodeError, OSError):
-            return set()
+        except (json.JSONDecodeError, OSError) as exc:
+            # 损坏 → fail-closed: 退出而非返回空集合重放历史 (codex #18).
+            # 原子写保证主文件损坏极罕见; 真损坏需人工检查.
+            raise RuntimeError(
+                "state 文件损坏 (%s): %s — 已停止, 需人工检查 %s "
+                "(避免批量重放)" % (state_file.name, exc, state_file))
     return set()
 
 
 def save_synced(state_file: Path, synced: set[str]) -> None:
+    """原子写: tmp + rename, 防进程中断产生半文件 (损坏→重放的根因)."""
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps({"synced": sorted(synced)}, indent=2))
+    tmp = state_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"synced": sorted(synced)}, indent=2))
+    tmp.replace(state_file)  # POSIX 原子 rename
 
 
 def resolve_item_id(repo: str, issue_num: int, project_node: str) -> str:
@@ -324,8 +346,14 @@ def resolve_item_id(repo: str, issue_num: int, project_node: str) -> str:
 
 
 def sync_one_card(card: dict, repo: str, project: dict | None,
-                  dry_run: bool = False) -> dict:
-    """Post the evidence comment and (optionally) move the issue to Review."""
+                  dry_run: bool = False, gh_user: str | None = None) -> dict:
+    """Post the evidence comment and (optionally) move the issue to Review.
+
+    账号守卫 (P0-3): 证据评论是 worker 产出的汇报 → 必须以 worker 账号
+    发布 (gh_user 必传, 环境变量预传递); 缺省 fail-closed.
+    """
+    if not gh_user:
+        raise RuntimeError("sync_one_card 必须指定 gh_user (worker 账号)")
     issue_num = extract_issue_number(card)
     if issue_num is None:
         return {"card": card["id"], "status": "skipped", "reason": "no issue ref"}
@@ -336,6 +364,7 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
     if dry_run:
         actions.append({"action": "comment", "dry_run": True, "body": comment[:80]})
     else:
+        guard_gh_user(gh_user)  # 账号守卫: 当前账号 == worker 账号
         r = subprocess.run(
             ["gh", "issue", "comment", str(issue_num), "--repo", repo, "--body", comment],
             capture_output=True, text=True, timeout=30,
@@ -350,8 +379,11 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
         try:
             item_id = resolve_item_id(repo, issue_num, project["node"])
             if not item_id:
-                actions.append({"action": "review", "status": "skipped",
-                                "reason": "issue not in project"})
+                # 评论已发但状态未推进 → failed (不 synced, 避免下轮重复评论
+                # 的幂等保护失效: 控制面/执行面分叉 = 静默丢状态)
+                return {"card": card["id"], "status": "failed",
+                        "reason": "review: issue not in project",
+                        "actions": [{"action": "comment", "ok": True}]}
             elif dry_run:
                 actions.append({"action": "review", "dry_run": True})
             else:
@@ -371,12 +403,138 @@ def sync_one_card(card: dict, repo: str, project: dict | None,
                     return {"card": card["id"], "status": "failed",
                             "reason": "review: %s" % r.stderr.strip()[:160]}
                 actions.append({"action": "review", "ok": True})
-        except Exception as exc:  # review move is best-effort
-            actions.append({"action": "review", "status": "skipped",
-                            "reason": str(exc)[:120]})
+        except Exception as exc:  # review move failed → 不 synced (防重复评论)
+            return {"card": card["id"], "status": "failed",
+                    "reason": "review: %s" % str(exc)[:120],
+                    "actions": [{"action": "comment", "ok": True}]}
 
     return {"card": card["id"], "status": "synced", "issue": issue_num,
             "actions": actions}
+
+
+def set_issue_in_progress(card: dict, repo: str, project: dict | None,
+                          dry_run: bool = False, gh_user: str | None = None) -> dict:
+    """执行态同步: kanban 卡 running → 置 GitHub issue In Progress.
+
+    账号守卫: 执行态同步是 worker 产出的状态反映 → worker 账号.
+    In Progress 与 Ready 是互斥推进: 卡开始执行 (running) 即契约已批准,
+    同步置 In Progress 反映执行中. 缺省 fail-closed.
+    """
+    if not gh_user:
+        raise RuntimeError("set_issue_in_progress 必须指定 gh_user (worker 账号)")
+    issue_num = extract_issue_number(card)
+    if issue_num is None:
+        return {"card": card["id"], "status": "skipped", "reason": "no issue ref"}
+    if not project or not project.get("inprogress_option"):
+        return {"card": card["id"], "status": "skipped",
+                "reason": "no inprogress_option in config"}
+    if dry_run:
+        return {"card": card["id"], "status": "synced", "issue": issue_num,
+                "actions": [{"action": "inprogress", "dry_run": True}]}
+    guard_gh_user(gh_user)
+    try:
+        item_id = resolve_item_id(repo, issue_num, project["node"])
+        if not item_id:
+            return {"card": card["id"], "status": "skipped",
+                    "reason": "issue not in project"}
+        r = subprocess.run(
+            ["gh", "api", "graphql",
+             "-f", "query=mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {"
+                   " updateProjectV2ItemFieldValue(input: {"
+                   " projectId: $p, itemId: $i, fieldId: $f,"
+                   " value: {singleSelectOptionId: $o}}) { projectV2Item { id } } }",
+             "-F", "p=%s" % project["node"],
+             "-F", "i=%s" % item_id,
+             "-F", "f=%s" % project["review_field"],
+             "-F", "o=%s" % project["inprogress_option"]],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return {"card": card["id"], "status": "failed",
+                    "reason": "inprogress: %s" % r.stderr.strip()[:160]}
+        return {"card": card["id"], "status": "synced", "issue": issue_num,
+                "actions": [{"action": "inprogress", "ok": True}]}
+    except Exception as exc:
+        return {"card": card["id"], "status": "failed",
+                "reason": "inprogress: %s" % str(exc)[:120]}
+
+
+def sync_all(repo: str, project: dict | None, board: str | None,
+             state_file: Path, dry_run: bool = False) -> dict:
+    """统一状态同步入口: 一次调用同步全部 kanban↔GitHub 状态.
+
+    按执行顺序 (账号切换最少化):
+      1) running 卡 → GitHub In Progress (worker 账号)
+      2) done 卡 → 证据评论 + Review (worker 账号)
+      3) [EV] done 卡 → EV 裁决评论 (auditor 账号, 账号即物证)
+
+    各段独立计数; 某段失败不影响其他段 (各自 fail-closed).
+    幂等: synced 集合跨段共享, 已同步不重复.
+    """
+    synced = load_synced(state_file)
+    segments = []
+
+    # 1. 执行态: running → In Progress
+    run_cards = list_running_cards(board)
+    run_results = []
+    worker_user = role_user("worker")
+    for card in run_cards:
+        if card["id"] in synced:
+            continue
+        if not dry_run:
+            switch_gh_user(worker_user)
+        outcome = set_issue_in_progress(card, repo, project,
+                                        dry_run=dry_run, gh_user=worker_user)
+        run_results.append(outcome)
+        if outcome["status"] == "synced" and not dry_run:
+            synced.add(card["id"])
+    segments.append({"segment": "inprogress", "cards": len(run_cards),
+                     "results": run_results})
+
+    # 2. 完成态: done → 证据评论 + Review
+    done_cards = list_done_cards(board)
+    done_results = []
+    for card in done_cards:
+        if card["id"] in synced:
+            continue
+        if not dry_run:
+            switch_gh_user(worker_user)
+        outcome = sync_one_card(card, repo, project, dry_run=dry_run,
+                                gh_user=worker_user)
+        done_results.append(outcome)
+        if outcome["status"] == "synced" and not dry_run:
+            synced.add(card["id"])
+            if not dry_run:
+                subprocess.run(["hermes", "kanban", "archive", card["id"]],
+                               capture_output=True, text=True, timeout=15)
+                outcome["archived"] = True
+    segments.append({"segment": "done", "cards": len(done_cards),
+                     "results": done_results})
+
+    # 3. EV 裁决: [EV] done → 裁决评论 (auditor 账号)
+    ev_cards = [c for c in list_all_cards(board)
+                if is_ev_card(c) and c.get("status") == "done"]
+    ev_results = []
+    auditor_user = role_user("auditor")
+    for card in ev_cards:
+        if card["id"] in synced:
+            continue
+        if not dry_run:
+            switch_gh_user(auditor_user)
+        outcome = sync_ev_verdict(card, repo, dry_run=dry_run,
+                                  gh_user=auditor_user)
+        ev_results.append(outcome)
+        if outcome["status"] == "synced" and not dry_run:
+            synced.add(card["id"])
+            subprocess.run(["hermes", "kanban", "archive", card["id"]],
+                           capture_output=True, text=True, timeout=15)
+            outcome["archived"] = True
+    segments.append({"segment": "ev", "cards": len(ev_cards),
+                     "results": ev_results})
+
+    if not dry_run:
+        save_synced(state_file, synced)
+    return {"segments": segments, "synced_count": len(synced)}
 
 
 def main() -> None:
@@ -391,10 +549,16 @@ def main() -> None:
                         help="archive done cards after successful sync "
                              "(keeps the board clean; default off for "
                              "backward compatibility)")
+    parser.add_argument("--sync-all", action="store_true",
+                        help="统一同步全部状态 (running→In Progress, done→"
+                             "Review, EV 裁决) — 推荐入口, 一次调用完成")
     parser.add_argument("--sync-ev", action="store_true",
                         help="sync EV verdicts ([EV] cards with a result) to "
                              "GitHub issue comments instead of the done-card "
                              "evidence sync")
+    parser.add_argument("--sync-inprogress", action="store_true",
+                        help="sync execution state: running kanban cards -> "
+                             "GitHub issue In Progress")
     parser.add_argument("--gh-user", default=None,
                         help="(deprecated) 账号由环境变量 GH_USER_<ROLE> "
                              "预传递, 此参数仅作向后兼容")
@@ -418,10 +582,39 @@ def main() -> None:
                     project = p
                     break
 
-    cards = list_done_cards(args.board)
     state_file = args.state_dir / ("synced_%s.json" % args.repo.replace("/", "_"))
     synced = load_synced(state_file)
     results = []
+
+    # 统一同步入口 (推荐): 一次调用同步全部状态
+    if args.sync_all or not (args.sync_ev or args.sync_inprogress):
+        out = sync_all(args.repo, project, args.board, state_file,
+                       dry_run=args.dry_run)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return
+
+    cards = list_done_cards(args.board)
+
+    # 执行态同步: 读 running 卡 → 置 GitHub In Progress (worker 账号)
+    if args.sync_inprogress:
+        run_cards = list_running_cards(args.board)
+        gh_user = role_user("worker")  # 环境变量预传递, 无默认账号 (fail-closed)
+        for card in run_cards:
+            if card["id"] in synced:
+                continue
+            if not args.dry_run:
+                switch_gh_user(gh_user)  # 切换 + 验证 (fail-closed)
+            outcome = set_issue_in_progress(card, args.repo, project,
+                                            dry_run=args.dry_run,
+                                            gh_user=gh_user)
+            results.append(outcome)
+            if outcome["status"] == "synced" and not args.dry_run:
+                synced.add(card["id"])
+        if not args.dry_run:
+            save_synced(state_file, synced)
+        print(json.dumps({"cards": len(run_cards), "new": len(results),
+                          "results": results}, ensure_ascii=False, indent=2))
+        return
 
     # EV 同步模式: 读 [EV] 卡 (含 result 裁决), 以 auditor 账号
     # (GH_USER_AUDITOR 环境变量预传递) 把裁决发到 GitHub issue comment
@@ -453,7 +646,13 @@ def main() -> None:
     for card in cards:
         if card["id"] in synced:
             continue
-        outcome = sync_one_card(card, args.repo, project, dry_run=args.dry_run)
+        # 账号守卫 (P0-3): 证据评论是 worker 产出的汇报 → worker 账号.
+        # 环境变量预传递, 无默认账号 (fail-closed); 与 EV 分支同一模型.
+        worker_user = role_user("worker")
+        if not args.dry_run:
+            switch_gh_user(worker_user)  # 切换 + 验证 (fail-closed)
+        outcome = sync_one_card(card, args.repo, project, dry_run=args.dry_run,
+                                gh_user=worker_user)
         results.append(outcome)
         if outcome["status"] == "synced" and not args.dry_run:
             synced.add(card["id"])

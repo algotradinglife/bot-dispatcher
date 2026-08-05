@@ -1191,3 +1191,167 @@ def test_issue_blocked_escalates_to_pi() -> None:
     assert escalate, "Blocked issue should escalate to PI: %s" % payload.get("actions")
     assert escalate[0]["session"] == "sample-PI", escalate[0]
     assert "BLOCKED" in escalate[0]["sent"], escalate[0]
+
+
+# ── Human 状态 = PI 判定需真人干预 → 升级通知, 不自动推进 ────────────
+
+def test_issue_human_escalates_and_does_not_advance() -> None:
+    """PI 把 issue 置 Human (需真人干预) → dispatcher 升级通知 PI,
+    且状态不自动推进 (终局性暂停, 等真人处理)."""
+    import sys
+    import io
+    import contextlib
+    import yaml
+    from pathlib import Path
+
+    repo_cfg = {
+        "repo": "example-org/sample-research",
+        "projects": [
+            {"number": 2, "node": "PVT_EXAMPLE2", "name": "Prediction", "owner": "strategist"},
+        ],
+        "session_map": {"pi": "sample-PI", "strategist": "sample-Strategy", "engineer": "sample-Engineer"},
+        "assignee_map": {"hh1985": "pi", "everything-bot-engineer": "engineer"},
+        "mention_map": {"pi": "pi", "strategist": "strategist"},
+    }
+
+    def fake_run(cmd, **kwargs):
+        ok = SimpleNamespace(returncode=0, stderr="", stdout="")
+        if cmd[:2] == ["gh", "api"]:
+            q = " ".join(cmd)
+            if "repository(" in q:
+                ok.stdout = json.dumps({"data": {"repository": {"issue": {
+                    "number": 400, "parent": None,
+                    "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+                    "blocking": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+                    "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+                }}}})
+            else:
+                ok.stdout = json.dumps({"data": {"node": {"items": {
+                    "nodes": [{
+                        "id": "ITEM_400",
+                        "content": {"__typename": "Issue", "number": 400, "title": "human task"},
+                        "fieldValues": {"nodes": [{
+                            "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                            "name": "Human",
+                            "field": {"name": "Status"},
+                        }]},
+                    }],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }}}})
+            return ok
+        if cmd[:3] == ["gh", "issue", "view"]:
+            ok.stdout = "human task"
+            return ok
+        if cmd[:3] == ["gh", "pr", "list"]:
+            ok.stdout = "[]"
+            return ok
+        if cmd[:3] == ["gh", "pr", "view"]:
+            ok.stdout = "{}"
+            return ok
+        ok.stdout = "{}"
+        return ok
+
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        cfg_file = Path(td) / "dispatcher.yaml"
+        cfg_file.write_text(yaml.safe_dump({"repos": {"sample": repo_cfg}}))
+        state_file = Path(td) / "state.json"
+        state_file.write_text(json.dumps({}))
+        with contextlib.redirect_stdout(buf):
+            with patch.object(MOD.subprocess, "run", side_effect=fake_run):
+                with patch.object(sys, "argv", [
+                    "dispatcher.py", "--repo", "sample",
+                    "--config", str(cfg_file), "--state-dir", td,
+                ]):
+                    MOD.main()
+    payload = json.loads(buf.getvalue())
+    escalate = [a for a in payload.get("actions", [])
+                if a.get("reason") == "issue_human_escalate"]
+    assert escalate, "Human issue should escalate: %s" % payload.get("actions")
+    assert escalate[0]["session"] == "sample-PI", escalate[0]
+    assert "人工干预" in escalate[0]["sent"], escalate[0]
+    # 状态不自动推进: 没有其他 forward 动作
+    forwards = [a for a in payload.get("actions", [])
+                if a.get("state") == "forwarded"]
+    assert not forwards, "Human should not auto-advance: %s" % forwards
+
+
+# ── Done 运行时不变量 (codex #10): Done = accepted and merged ─────────
+
+def test_done_without_merged_pr_escalates() -> None:
+    """Done 但无 merged PR → 警告 + 升级 PI (疑似手工改状态)."""
+    import sys
+    import io
+    import contextlib
+    import yaml
+    from pathlib import Path
+
+    repo_cfg = {
+        "repo": "example-org/sample-research",
+        "projects": [
+            {"number": 2, "node": "PVT_EXAMPLE2", "name": "Prediction", "owner": "strategist"},
+        ],
+        "session_map": {"pi": "sample-PI", "strategist": "sample-Strategy"},
+        "assignee_map": {"hh1985": "pi"},
+        "mention_map": {"pi": "pi"},
+    }
+
+    def fake_run(cmd, **kwargs):
+        ok = SimpleNamespace(returncode=0, stderr="", stdout="")
+        if cmd[:2] == ["gh", "api"]:
+            q = " ".join(cmd)
+            if "repository(" in q:
+                ok.stdout = json.dumps({"data": {"repository": {"issue": {
+                    "number": 500, "parent": None,
+                    "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+                    "blocking": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+                    "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+                }}}})
+            else:
+                ok.stdout = json.dumps({"data": {"node": {"items": {
+                    "nodes": [{
+                        "id": "ITEM_500",
+                        "content": {"__typename": "Issue", "number": 500, "title": "done task"},
+                        "fieldValues": {"nodes": [{
+                            "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                            "name": "Done",
+                            "field": {"name": "Status"},
+                        }]},
+                    }],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }}}})
+            return ok
+        if cmd[:3] == ["gh", "pr", "list"]:
+            # merged PR 列表为空 → 无 merged PR
+            ok.stdout = "[]"
+            return ok
+        if cmd[:3] == ["gh", "issue", "view"]:
+            ok.stdout = "done task"
+            return ok
+        if cmd[:3] == ["gh", "pr", "view"]:
+            ok.stdout = "{}"
+            return ok
+        ok.stdout = "{}"
+        return ok
+
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        cfg_file = Path(td) / "dispatcher.yaml"
+        cfg_file.write_text(yaml.safe_dump({"repos": {"sample": repo_cfg}}))
+        state_file = Path(td) / "state.json"
+        state_file.write_text(json.dumps({}))
+        with contextlib.redirect_stdout(buf):
+            with patch.object(MOD.subprocess, "run", side_effect=fake_run):
+                with patch.object(sys, "argv", [
+                    "dispatcher.py", "--repo", "sample",
+                    "--config", str(cfg_file), "--state-dir", td,
+                ]):
+                    MOD.main()
+    payload = json.loads(buf.getvalue())
+    warns = payload.get("warnings", [])
+    assert any("no merged PR" in w for w in warns), warns
+    # Done 仍通知 (升级到 PI 而非 owner)
+    done_actions = [a for a in payload.get("actions", [])
+                    if a.get("state") == "Done"]
+    assert done_actions, payload.get("actions")
+    assert done_actions[0]["session"] == "sample-PI", done_actions[0]

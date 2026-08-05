@@ -106,8 +106,10 @@ def test_sync_one_card_posts_comment_and_review() -> None:
             return ok
         return ok
 
-    with patch.object(MOD.subprocess, "run", side_effect=fake_run) as run:
-        out = MOD.sync_one_card(done_card(), "org/repo", project)
+    with patch.object(MOD.subprocess, "run", side_effect=fake_run) as run, \
+         patch.object(MOD, "current_gh_user", return_value="bot-engineer"):
+        out = MOD.sync_one_card(done_card(), "org/repo", project,
+                                gh_user="bot-engineer")
 
     assert out["status"] == "synced"
     assert out["issue"] == 42
@@ -123,20 +125,23 @@ def test_sync_one_card_posts_comment_and_review() -> None:
 
 def test_sync_one_card_no_issue_ref_skipped() -> None:
     card = done_card(title="No ref", body="nothing")
-    out = MOD.sync_one_card(card, "org/repo", None)
+    out = MOD.sync_one_card(card, "org/repo", None, gh_user="bot-engineer")
     assert out["status"] == "skipped"
 
 
 def test_sync_one_card_comment_failure_reported() -> None:
     bad = SimpleNamespace(returncode=1, stderr="api error", stdout="")
-    with patch.object(MOD.subprocess, "run", return_value=bad):
-        out = MOD.sync_one_card(done_card(), "org/repo", None)
+    with patch.object(MOD.subprocess, "run", return_value=bad), \
+         patch.object(MOD, "current_gh_user", return_value="bot-engineer"):
+        out = MOD.sync_one_card(done_card(), "org/repo", None,
+                                gh_user="bot-engineer")
     assert out["status"] == "failed"
     assert "api error" in out["reason"]
 
 
 def test_sync_one_card_review_move_best_effort() -> None:
-    """If project lookup fails, comment still succeeds; review is skipped."""
+    """If project lookup fails, comment posted but review failed → 不 synced
+    (原子性: 状态未推进不归档, 防下轮重复评论)."""
     project = {"node": "PVT_X", "review_field": "F", "review_option": "o"}
 
     def fake_run(argv, **kw):
@@ -146,11 +151,12 @@ def test_sync_one_card_review_move_best_effort() -> None:
             return SimpleNamespace(returncode=1, stderr="boom", stdout="")
         return SimpleNamespace(returncode=0, stderr="", stdout="")
 
-    with patch.object(MOD.subprocess, "run", side_effect=fake_run):
-        out = MOD.sync_one_card(done_card(), "org/repo", project)
-    assert out["status"] == "synced"
-    assert any(a["action"] == "review" and a.get("status") == "skipped"
-               for a in out["actions"])
+    with patch.object(MOD.subprocess, "run", side_effect=fake_run), \
+         patch.object(MOD, "current_gh_user", return_value="bot-engineer"):
+        out = MOD.sync_one_card(done_card(), "org/repo", project,
+                                gh_user="bot-engineer")
+    assert out["status"] == "failed", out
+    assert "review" in out["reason"], out
 
 
 # ── L1-05: idempotency + state persistence ────────────────────────────
@@ -184,9 +190,14 @@ def test_load_synced_missing_file_empty(tmp_path: Path) -> None:
 
 
 def test_load_synced_corrupt_file_empty(tmp_path: Path) -> None:
+    """损坏 → fail-closed: 抛错退出 (防批量重放), 而非返回空集合."""
     sf = tmp_path / "state.json"
     sf.write_text("not json{{{")
-    assert MOD.load_synced(sf) == set()
+    try:
+        MOD.load_synced(sf)
+        assert False, "should raise on corrupt state"
+    except RuntimeError as e:
+        assert "损坏" in str(e)
 
 
 # ── L1-06: EV trigger (pure logic of the EV card pattern) ─────────────
@@ -216,8 +227,8 @@ def test_parse_verdict_structured_marker() -> None:
     assert MOD.parse_verdict("VERDICT: REJECT\n缺 §7") == "REJECT"
     # 大小写不敏感
     assert MOD.parse_verdict("verdict: pass") == "PASS"
-    # 标记可在任意行 (约定首行, 但容忍后续行)
-    assert MOD.parse_verdict("详情...\nVERDICT: REJECT") == "REJECT"
+    # 严格首行: 自由文本在前 (非首行标记) → None (不猜)
+    assert MOD.parse_verdict("详情...\nVERDICT: REJECT") is None
 
 
 def test_parse_verdict_fails_closed_on_free_text() -> None:
@@ -338,3 +349,57 @@ def test_role_user_missing_env_fails_closed(monkeypatch) -> None:
 def test_role_user_unknown_role() -> None:
     with pytest.raises(RuntimeError, match="未知角色"):
         MOD.role_user("nobody")
+
+
+# ── In Progress 执行态同步 (running 卡 → GitHub In Progress) ──────────
+
+def test_set_issue_in_progress_syncs() -> None:
+    """running 卡 → 置 GitHub issue In Progress (worker 账号)."""
+    card = done_card()  # reuse: has issue 42 anchor in body
+    project = {"node": "PVT_X", "review_field": "F",
+               "inprogress_option": "inprog-opt"}
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        if argv[:2] == ["gh", "api"] and "node(id: $p)" in " ".join(argv):
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
+                "data": {"node": {"items": {"nodes": [
+                    {"id": "ITEM_42", "content": {"number": 42}},
+                ]}}}}))
+        if "updateProjectV2ItemFieldValue" in " ".join(argv):
+            return SimpleNamespace(returncode=0, stderr="", stdout="{}")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    with patch.object(MOD.subprocess, "run", side_effect=fake_run), \
+         patch.object(MOD, "current_gh_user", return_value="bot-engineer"):
+        out = MOD.set_issue_in_progress(card, "org/repo", project,
+                                        gh_user="bot-engineer")
+    assert out["status"] == "synced", out
+    assert out["issue"] == 42
+    mutation = [c for c in calls if "updateProjectV2ItemFieldValue" in " ".join(c)]
+    assert mutation, "should issue a status mutation"
+    # find the option: the -F pair whose value carries inprogress_option
+    argv = mutation[0]
+    opt = None
+    for i, a in enumerate(argv):
+        if a == "-F" and i + 1 < len(argv) and "o=inprog-opt" in argv[i + 1]:
+            opt = argv[i + 1]
+    assert opt == "o=inprog-opt", argv
+
+
+def test_set_issue_in_progress_fails_closed_without_gh_user() -> None:
+    """缺 gh_user → fail-closed (不写 GitHub)."""
+    try:
+        MOD.set_issue_in_progress(done_card(), "org/repo", None)
+        assert False, "should raise"
+    except RuntimeError as e:
+        assert "gh_user" in str(e)
+
+
+def test_set_issue_in_progress_skips_without_config() -> None:
+    """配置缺 inprogress_option → skipped (不猜)."""
+    out = MOD.set_issue_in_progress(done_card(), "org/repo", None,
+                                    gh_user="bot-engineer")
+    assert out["status"] == "skipped"
+    assert "inprogress_option" in out["reason"]

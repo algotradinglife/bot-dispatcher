@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Config-driven GitHub dispatcher for no-agent polling jobs.
 Reads repository routing from a local YAML file.
@@ -296,8 +297,11 @@ def load_state(state_file):
 
 
 def save_state(state_file, state):
+    """原子写: tmp + rename, 防进程中断产生半文件 (损坏→重放的根因)."""
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(state))
+    tmp = state_file.with_name(state_file.name + ".tmp")
+    tmp.write_text(json.dumps(state))
+    tmp.replace(state_file)
 
 
 def gql_query(query, retries=4, base_delay=1.0):
@@ -595,6 +599,28 @@ REPORT_FIELD_RE = re.compile(
     r"\*\*报告\*\*\s*:\s*(https?://[^\s\)\]]+)", re.IGNORECASE)
 
 
+def _issue_has_merged_pr(repo: str, issue_num: int) -> bool | None:
+    """校验 issue 是否有已 merge 的关联 PR (Done 不变量, codex #10).
+
+    用 GitHub API closingIssuesReferences 结构化关联; 控制面读不到 →
+    返回 None (调用方 fail-closed).
+    """
+    try:
+        r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "merged",
+                            "--limit", "100",
+                            "--json", "number,closingIssuesReferences",
+                            "--jq", ".[] | select(.closingIssuesReferences != null)"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return None
+        for pr in json.loads(r.stdout):
+            if issue_num in pr_linked_issue_numbers(pr):
+                return True
+        return False
+    except Exception:
+        return None
+
+
 def extract_report_url(repo, issue_num):
     """Find the analysis-report link for a completed Issue.
 
@@ -811,6 +837,7 @@ def main():
     projects = cfg.get("projects", [])
     sm, _ = build_session_map(cfg)
     coordinator_session = resolve_workflow_session(cfg, sm)
+    pi_session = sm.get("pi")  # Review/Blocked 必须投 PI (评审面定义)
     assignee_map = cfg.get("assignee_map", {})
     mention_map = build_mention_map(cfg, sm)
     safe_repo_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", args.repo)
@@ -894,7 +921,7 @@ def main():
             # PRs on project board — only Review status matters
             if item.get("is_pr"):
                 if cur_s == "Review":
-                    session = coordinator_session
+                    session = pi_session or coordinator_session
                     if session:
                         msg = format_goal("PR #%d is in REVIEW — %s" % (issue_num, title),
                                           url)
@@ -911,6 +938,13 @@ def main():
                     msg = format_goal("Issue #%d is READY — %s" % (issue_num, title),
                                       url)
                     reason = "issue_ready"
+
+            elif cur_s == "In Progress":
+                # 执行态 (kanban running → sync_job 置位): Ready 时已通知
+                # owner 开始执行, 此处仅记录状态推进, 不重复投递.
+                # (避免 Ready + In Progress 双通知噪音)
+                new_state[sk] = cur_s
+                continue
 
             elif cur_s == "Blocked":
                 lp = check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects)
@@ -934,6 +968,30 @@ def main():
                             "session (消息未投递)" % (prefix, issue_num))
                         new_state[sk] = cur_s
                         continue
+
+            elif cur_s == "Human":
+                # Human = PI 判定需真人干预 (超出 AI 循环):
+                # 流程终局性暂停 — dispatcher 不自动推进, 只显著升级通知.
+                # 真人处理后置 Done (验收) 或回 Ready (解除) 由真人决定.
+                session = pi_session or owner
+                if session:
+                    msg = format_goal(
+                        "⛔ Issue #%d 需【人工干预】— %s (owner: %s) — "
+                        "PI 判定超出 AI 循环, 等待真人决策/处理"
+                        % (issue_num, title, owner),
+                        url)
+                    reason = "issue_human_escalate"
+                    queue_goal(output, session, msg, issue_num=issue_num)
+                    output["actions"].append(
+                        {"node": sk, "state": cur_s, "session": session,
+                         "reason": reason, "prev_status": prev_s,
+                         "sent": msg[:80], "result": "queued"})
+                else:
+                    output["warnings"].append(
+                        "%s Issue #%d 需人工干预但无 PI session (消息未投递)"
+                        % (prefix, issue_num))
+                new_state[sk] = cur_s
+                continue
 
             elif cur_s == "Review":
                 try:
@@ -967,9 +1025,9 @@ def main():
                                 )
                                 reason = "review_pr_changes"
                         else:
-                            session = coordinator_session
+                            session = pi_session or coordinator_session
                             msg = format_goal(
-                                "Issue #%d in Review — PR #%d awaiting coordination"
+                                "Issue #%d in Review — PR #%d awaiting PI review"
                                 % (issue_num, linked_pr["number"]),
                                 pu,
                             )
@@ -988,6 +1046,21 @@ def main():
 
             elif cur_s == "Done":
                 session = owner
+                # 运行时不变量 (codex #10): Done = accepted and merged.
+                # 校验关联 PR 已 merge; 未 merge 的 Done 视为异常 →
+                # 警告 + 升级 PI (不静默当正常 Done 通知).
+                merged_pr = _issue_has_merged_pr(repo, issue_num)
+                if merged_pr is None:
+                    # 控制面读不到 → fail-closed: 升级 PI 而非猜
+                    output["warnings"].append(
+                        "%s Issue #%d DONE but PR merge state unreadable "
+                        "(fail-closed, escalated)" % (prefix, issue_num))
+                    session = pi_session or session
+                elif not merged_pr:
+                    output["warnings"].append(
+                        "%s Issue #%d DONE but no merged PR — 疑似手工改状态, "
+                        "已升级 PI 核验" % (prefix, issue_num))
+                    session = pi_session or session
                 if session:
                     msg = format_notice("Issue #%d is DONE — %s" % (issue_num, title),
                                         url)
@@ -1101,8 +1174,14 @@ def main():
                                         "— escalated to PI" % (prefix, num, author, why)
                                     )
                                 if not tsession:
-                                    # 连 PI 都没有 → 真正无处可去, 记警告不丢
-                                    new_state[ck] = "seen"
+                                    # 连 PI 都没有 → 真正无处可去.
+                                    # 不标记 seen (保留 pending, 下轮重试):
+                                    # 配置修复后消息可重新派发 (codex #16).
+                                    # 仅记警告, 不消费事件.
+                                    output["warnings"].append(
+                                        "%s Issue #%d comment by @%s — "
+                                        "no PI session, 保留 pending 下轮重试"
+                                        % (prefix, num, author))
                                     continue
                             url = "https://github.com/%s/issues/%d" % (repo, num)
                             escalated = (author not in (assignee_map or {})
