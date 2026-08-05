@@ -507,7 +507,7 @@ def linked_issue_numbers(body):
 
 def resolve_pr_session(pr, proj_map, projects, sm, assignee_map):
     """Prefer linked Issue Project ownership over ambiguous shared bot authorship."""
-    linked = linked_issue_numbers(pr.get("body", ""))
+    linked = pr_linked_issue_numbers(pr)
     sessions = {
         find_owner_for_issue(number, proj_map, projects, sm)
         for number in linked
@@ -528,7 +528,7 @@ def resolve_worker_session(pr, proj_map, projects, sm):
     Project that owns the linked Issue — never by author/assignee semantics.
     Returns None unless every linked Issue resolves to the same single
     Project owner (fail closed on any unmapped or conflicting issue)."""
-    linked = linked_issue_numbers(pr.get("body", ""))
+    linked = pr_linked_issue_numbers(pr)
     if not linked:
         return None
     sessions = {
@@ -547,15 +547,35 @@ def resolve_issue_worker_session(issue_num, proj_map, projects, sm):
     return find_owner_for_issue(issue_num, proj_map, projects, sm)
 
 
+def pr_linked_issue_numbers(pr: dict) -> set[int]:
+    """PR 关联 issue 号 — 优先 GitHub API 结构化字段, 文本解析仅兜底.
+
+    状态表示原则: GitHub API 的 `closingIssuesReferences` 是官方结构化
+    关联 (不依赖解析 PR body 文本); 仅当 API 未返回该字段时 (旧数据/
+    stub) 回退到文本正则 (Closes/Fixes/Resolves #N).
+    """
+    refs = pr.get("closingIssuesReferences")
+    if isinstance(refs, list):
+        nums: set[int] = set()
+        for r in refs:
+            if isinstance(r, dict) and isinstance(r.get("number"), int):
+                nums.add(r["number"])
+        if nums:
+            return nums
+    return linked_issue_numbers(pr.get("body", ""))
+
+
 def check_linked_pr(repo, issue_num, assignee_map, sm, proj_map, projects):
     r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "open",
-                        "--json", "number,title,author,reviewDecision,body",
+                        "--json",
+                        "number,title,author,reviewDecision,body,"
+                        "closingIssuesReferences",
                         "--jq", "."],
                        capture_output=True, text=True, timeout=10)
     if r.returncode != 0:
         raise ControlPlaneUnavailable("Unable to list linked PRs")
     for pr in json.loads(r.stdout):
-        if issue_num not in linked_issue_numbers(pr.get("body", "")):
+        if issue_num not in pr_linked_issue_numbers(pr):
             continue
         if pr.get("reviewDecision") == "CHANGES_REQUESTED":
             session = resolve_pr_session(pr, proj_map, projects, sm, assignee_map)
@@ -581,14 +601,16 @@ def extract_report_url(repo, issue_num):
     try:
         r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "all",
                             "--limit", "100",
-                            "--json", "number,title,state,body,mergedAt,updatedAt",
+                            "--json",
+                            "number,title,state,body,mergedAt,updatedAt,"
+                            "closingIssuesReferences",
                             "--jq", ".[] | select(.body != null)"],
                            capture_output=True, text=True, timeout=15)
         if r.returncode != 0:
             return None
         candidates = []
         for pr in json.loads(r.stdout):
-            if issue_num not in linked_issue_numbers(pr.get("body", "")):
+            if issue_num not in pr_linked_issue_numbers(pr):
                 continue
             candidates.append(pr)
         # Most recently updated/merged first.
@@ -908,14 +930,29 @@ def main():
                     session, msg, _ = lp
                     reason = "pr_changes_needed"
                 else:
-                    output["warnings"].append("%s Issue #%d is BLOCKED — no linked PR" % (prefix, issue_num))
-                    new_state[sk] = cur_s
-                    continue
+                    # Worker 手动置 Blocked 表达诉求 (无 PR): 结构化信号 →
+                    # 升级给 PI (不丢消息, 不依赖评论文本). PI 决定解除或处理.
+                    session = sm.get("pi")
+                    if session:
+                        msg = format_goal(
+                            "Issue #%d is BLOCKED — %s "
+                            "(owner: %s, worker 诉求, 需 PI 决策/解除)"
+                            % (issue_num, title, owner),
+                            url)
+                        reason = "issue_blocked_escalate"
+                    else:
+                        output["warnings"].append(
+                            "%s Issue #%d is BLOCKED — no linked PR and no PI "
+                            "session (消息未投递)" % (prefix, issue_num))
+                        new_state[sk] = cur_s
+                        continue
 
             elif cur_s == "Review":
                 try:
                     r = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "open",
-                                        "--json", "number,title,author,reviewDecision,body",
+                                        "--json",
+                                        "number,title,author,reviewDecision,body,"
+                                        "closingIssuesReferences",
                                         "--jq", "."],
                                        capture_output=True, text=True, timeout=10)
                     if r.returncode != 0:
@@ -924,7 +961,7 @@ def main():
                         )
                     linked_pr = None
                     for pr in json.loads(r.stdout):
-                        if issue_num in linked_issue_numbers(pr.get("body", "")):
+                        if issue_num in pr_linked_issue_numbers(pr):
                             linked_pr = pr
                             break
                     if linked_pr:
@@ -1027,7 +1064,30 @@ def main():
                                 continue
                             body = c.get("body", "")
                             author = c.get("author", {}).get("login", "unknown")
+                            # 路由优先级 (状态表示原则: 结构化事实优先,
+                            # [TO:] 文本仅作显式覆盖, 不作为主要路由):
+                            #   1) Project 归属 → owner (工作流依赖基础)
+                            #   2) 作者身份 (API 字段): PI→owner, worker→PI
+                            #   3) [TO:] 显式覆盖 (mention_map 明确配置才生效)
+                            owner = resolve_issue_worker_session(
+                                num, proj_map, projects, sm
+                            )
                             target, tsession = parse_to_directive(body, mention_map)
+                            # [TO:] 只作用于 mention_map 显式配置的角色;
+                            # 未配置的角色名不参与路由 (不再 fallback 猜 owner)
+                            if target and tsession:
+                                pass  # 显式覆盖: 用 tsession
+                            else:
+                                # 结构化作者路由优先 (PI→owner, worker→PI);
+                                # 未知作者 (非 PI 非 worker) → None → 警告,
+                                # 不静默路由 (与 unknown-author-warns 语义一致)
+                                tsession = resolve_author_default_session(
+                                    author, assignee_map, sm, owner
+                                )
+                                if not tsession and owner and author in (
+                                        assignee_map or {}):
+                                    # 已知角色但无映射时兜底 owner
+                                    tsession = owner
                             ock = "comment:%s" % cid
                             ck = "comment:%d:%s:%s" % (num, cid, target.lower()) if target else ock
                             if prev_state.get(ock) or prev_state.get(ck):
@@ -1037,29 +1097,11 @@ def main():
                                 # never replay historical directives.
                                 new_state[ck] = "seen"
                                 continue
-                            if target and not tsession:
-                                # [TO: <alias>] not in mention_map (e.g. "Worker")
-                                # — the assigned worker is the Project that owns
-                                # this Issue.
-                                tsession = resolve_issue_worker_session(
-                                    num, proj_map, projects, sm
-                                )
                             if not tsession:
-                                # No explicit [TO:] target (or unresolvable) —
-                                # fall back to author identity: PI messages
-                                # default to the Issue's Project owner; worker
-                                # messages default to the PI session. Never
-                                # silently drop a routed author's message.
-                                owner = resolve_issue_worker_session(
-                                    num, proj_map, projects, sm
-                                )
-                                tsession = resolve_author_default_session(
-                                    author, assignee_map, sm, owner
-                                )
-                            if not tsession:
-                                # Truly unroutable (unknown author, no owner) —
-                                # record a warning instead of disappearing it.
-                                new_state[ck] = "seen"
+                                # Unknown author, no [TO:], no owner — cannot
+                                # classify. 不静默丢弃: 路由给 PI 过目 (升级
+                                # 通道) + 记录警告 (unknown-author-warns).
+                                tsession = sm.get("pi")
                                 wkey = (num, author)
                                 if wkey not in warned_issue_comments:
                                     warned_issue_comments.add(wkey)
@@ -1067,18 +1109,28 @@ def main():
                                            if target else "no [TO:] directive")
                                     output["warnings"].append(
                                         "%s Issue #%d comment by @%s unroutable "
-                                        "(%s, no Project owner, author unmapped)"
-                                        % (prefix, num, author, why)
+                                        "(%s, no Project owner, author unmapped) "
+                                        "— escalated to PI" % (prefix, num, author, why)
                                     )
-                                continue
+                                if not tsession:
+                                    # 连 PI 都没有 → 真正无处可去, 记警告不丢
+                                    new_state[ck] = "seen"
+                                    continue
                             url = "https://github.com/%s/issues/%d" % (repo, num)
+                            escalated = (author not in (assignee_map or {})
+                                         and not target)
                             if target:
                                 msg = format_goal("[TO: %s] from @%s on Issue #%d — %s" % (target, author, num, title), url)
+                            elif escalated:
+                                msg = format_notice(
+                                    "⚠️ 未分类评论 by @%s on Issue #%d — %s "
+                                    "(unknown author, escalated to PI)" % (author, num, title), url)
                             else:
                                 msg = format_notice("Comment by @%s on Issue #%d — %s" % (author, num, title), url)
                             queue_goal(output, tsession, msg, issue_num=num)
                             new_state[ck] = "forwarded"
-                            output["actions"].append({"node": ck, "state": "forwarded", "session": tsession, "reason": "to_directive",
+                            output["actions"].append({"node": ck, "state": "forwarded", "session": tsession,
+                                                      "reason": "escalated_to_pi" if escalated else "to_directive",
                                                       "target": target, "sent": msg[:80], "result": "queued"})
                         except Exception:
                             pass

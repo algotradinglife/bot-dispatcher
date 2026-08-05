@@ -200,7 +200,7 @@ def test_extract_issue_number_prefers_explicit_issue_field() -> None:
 
 # ── EV verdict sync (auditor → GitHub, 账号即物证) ─────────────────────
 
-def ev_card(verdict: str = "REJECT: 缺 §7 附录", title: str = "[EV] issue #1 审计",
+def ev_card(verdict: str = "VERDICT: REJECT\n缺 §7 附录", title: str = "[EV] issue #1 审计",
             status: str = "done") -> dict:
     return {
         "id": "t_ev1",
@@ -211,17 +211,35 @@ def ev_card(verdict: str = "REJECT: 缺 §7 附录", title: str = "[EV] issue #1
     }
 
 
+def test_parse_verdict_structured_marker() -> None:
+    assert MOD.parse_verdict("VERDICT: PASS\n证据链完整") == "PASS"
+    assert MOD.parse_verdict("VERDICT: REJECT\n缺 §7") == "REJECT"
+    # 大小写不敏感
+    assert MOD.parse_verdict("verdict: pass") == "PASS"
+    # 标记可在任意行 (约定首行, 但容忍后续行)
+    assert MOD.parse_verdict("详情...\nVERDICT: REJECT") == "REJECT"
+
+
+def test_parse_verdict_fails_closed_on_free_text() -> None:
+    """自由文本不含结构化标记 → None (绝不宽松猜文本)."""
+    assert MOD.parse_verdict("REJECT: 缺 §7 附录") is None
+    assert MOD.parse_verdict("the PASS criteria...") is None
+    assert MOD.parse_verdict("VERDICT: MAYBE") is None  # 非法值
+    assert MOD.parse_verdict("") is None
+
+
 def test_is_ev_card_detects_prefix() -> None:
     assert MOD.is_ev_card(ev_card()) is True
     assert MOD.is_ev_card(done_card()) is False
 
 
 def test_sync_ev_verdict_reject_posts_comment() -> None:
-    card = ev_card(verdict="REJECT: 缺 §7 附录, 请补齐")
-    with patch.object(MOD.subprocess, "run",
+    card = ev_card(verdict="VERDICT: REJECT\n缺 §7 附录, 请补齐")
+    with patch.object(MOD, "current_gh_user", return_value="hh1985"), \
+         patch.object(MOD.subprocess, "run",
                       return_value=SimpleNamespace(returncode=0,
                                                    stdout="ok", stderr="")) as m:
-        out = MOD.sync_ev_verdict(card, "org/repo")
+        out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
     assert out["status"] == "synced"
     assert "REJECT" in out["verdict"]
     argv = m.call_args.args[0]
@@ -231,12 +249,38 @@ def test_sync_ev_verdict_reject_posts_comment() -> None:
     assert "EV 裁决" in body
 
 
+def test_sync_ev_verdict_rejects_free_text_result() -> None:
+    """自由文本 result (无结构化标记) → fail-closed, 不发评论."""
+    card = ev_card(verdict="REJECT: 缺 §7 附录")  # 无 VERDICT: 标记
+    with patch.object(MOD, "current_gh_user", return_value="hh1985"), \
+         patch.object(MOD.subprocess, "run") as m:
+        out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
+    assert out["status"] == "failed"
+    assert "VERDICT" in out["reason"]
+    m.assert_not_called()  # 不猜文本 → 不写任何评论
+
+
+def test_sync_ev_verdict_requires_gh_user() -> None:
+    card = ev_card(verdict="PASS")
+    with pytest.raises(RuntimeError, match="gh_user"):
+        MOD.sync_ev_verdict(card, "org/repo")  # 不传 gh_user → fail-closed
+
+
+def test_sync_ev_verdict_guard_rejects_wrong_account() -> None:
+    """账号守卫: 当前账号 ≠ 期望账号 → 拒绝写入 (防角色错位)."""
+    card = ev_card(verdict="VERDICT: PASS\n证据链完整")
+    with patch.object(MOD, "current_gh_user", return_value="bot-account"):
+        with pytest.raises(RuntimeError, match="账号守卫"):
+            MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
+
+
 def test_sync_ev_verdict_pass_label() -> None:
-    card = ev_card(verdict="PASS: 证据链完整")
-    with patch.object(MOD.subprocess, "run",
+    card = ev_card(verdict="VERDICT: PASS\n证据链完整")
+    with patch.object(MOD, "current_gh_user", return_value="hh1985"), \
+         patch.object(MOD.subprocess, "run",
                       return_value=SimpleNamespace(returncode=0,
                                                    stdout="ok", stderr="")):
-        out = MOD.sync_ev_verdict(card, "org/repo")
+        out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
     assert "PASS" in out["verdict"]
     assert "REJECT" not in out["verdict"]
 
@@ -244,20 +288,20 @@ def test_sync_ev_verdict_pass_label() -> None:
 def test_sync_ev_verdict_no_issue_ref_skipped() -> None:
     card = ev_card(title="[EV] no ref here")
     card["body"] = "no issue link"
-    out = MOD.sync_ev_verdict(card, "org/repo")
+    out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
     assert out["status"] == "skipped"
 
 
 def test_sync_ev_verdict_no_result_skipped() -> None:
     card = ev_card(verdict="")
-    out = MOD.sync_ev_verdict(card, "org/repo")
+    out = MOD.sync_ev_verdict(card, "org/repo", gh_user="hh1985")
     assert out["status"] == "skipped"
     assert "no verdict" in out["reason"]
 
 
-def test_main_ev_mode_switches_to_pi_account(tmp_path: Path) -> None:
-    """--sync-ev 模式: EV 卡裁决以 hh1985 账号发 (账号即物证)."""
-    state_file = tmp_path / "synced_org_repo.json"
+def test_main_ev_mode_uses_auditor_account_from_env(monkeypatch) -> None:
+    """EV 同步: 账号从 GH_USER_AUDITOR 环境变量预传递 (无默认, fail-closed)."""
+    monkeypatch.setenv("GH_USER_AUDITOR", "auditor-account")
     calls: list[list[str]] = []
 
     def fake_run(argv, capture_output=False, text=False, timeout=30,
@@ -267,18 +311,30 @@ def test_main_ev_mode_switches_to_pi_account(tmp_path: Path) -> None:
 
     with patch.object(MOD, "list_all_cards", return_value=[ev_card()]), \
          patch.object(MOD, "list_done_cards", return_value=[]), \
-         patch.object(MOD.subprocess, "run", side_effect=fake_run), \
-         patch.object(MOD, "save_synced"):
+         patch.object(MOD, "current_gh_user", return_value="auditor-account"), \
+         patch.object(MOD.subprocess, "run", side_effect=fake_run):
         # simulate the --sync-ev branch (as main does)
         ev_cards = [c for c in MOD.list_all_cards()
                     if MOD.is_ev_card(c) and c.get("status") == "done"]
-        gh_user = "hh1985"
+        gh_user = MOD.role_user("auditor")
+        assert gh_user == "auditor-account"
         for card in ev_cards:
-            MOD.subprocess.run(["gh", "auth", "switch", "--user", gh_user],
-                               capture_output=True, text=True, timeout=30)
-            MOD.sync_ev_verdict(card, "org/repo")
+            MOD.switch_gh_user(gh_user)
+            MOD.sync_ev_verdict(card, "org/repo", gh_user=gh_user)
     auth_switch = [a for a in calls if a[:2] == ["gh", "auth"]]
     comment_call = [a for a in calls if a[:3] == ["gh", "issue", "comment"]]
     assert auth_switch, "必须切换账号"
-    assert "hh1985" in auth_switch[0]
+    assert "auditor-account" in auth_switch[0]
     assert comment_call, "必须发评论"
+
+
+def test_role_user_missing_env_fails_closed(monkeypatch) -> None:
+    """角色账号未预传递 → 拒绝运行 (禁止默认账号)."""
+    monkeypatch.delenv("GH_USER_AUDITOR", raising=False)
+    with pytest.raises(RuntimeError, match="GH_USER_AUDITOR"):
+        MOD.role_user("auditor")
+
+
+def test_role_user_unknown_role() -> None:
+    with pytest.raises(RuntimeError, match="未知角色"):
+        MOD.role_user("nobody")

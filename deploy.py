@@ -246,10 +246,13 @@ repos:
 
 # ── 5. tick 脚本生成 ───────────────────────────────────────────────────
 def gen_tick(key: str, repo: str, board: str, deploy_dir: Path, dry: bool) -> Path:
+    repo_name = repo.split("/")[-1]  # e.g. helixatlas (用于目录归属校验)
     script = f"""#!/bin/bash
 # {key} dispatcher + sync loop — no_agent observer.
 # 1) dispatcher: GitHub read -> kanban cards (never writes GitHub)
 # 2) sync_job --archive: done cards -> evidence comment + Review -> archive
+# 3) sync_job --sync-ev: EV 裁决以独立账号 (hh1985) 发到 GitHub (账号即物证)
+set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 GH=/opt/homebrew/bin/gh
@@ -258,6 +261,34 @@ CFG=$BASE/{deploy_dir.name}/dispatcher.yaml
 STATE=$BASE/{deploy_dir.name}/dispatcher-state
 REPO={repo}
 BOARD={board}
+EXPECTED_REPO="{repo}"
+
+# ── 角色账号 (环境变量预传递, 调用方注入, 无默认值) ──
+GH_USER_PI="${{GH_USER_PI:-}}"
+GH_USER_AUDITOR="${{GH_USER_AUDITOR:-}}"
+if [ -z "$GH_USER_PI" ] || [ -z "$GH_USER_AUDITOR" ]; then
+  echo "⚠️ 账号缺失: 必须预传递 GH_USER_PI 和 GH_USER_AUDITOR 环境变量"
+  exit 1
+fi
+
+# ── 守卫 1: 当前账号必须是 PI 账号 — dispatcher/sync 是观察+汇报通道 ──
+ACTUAL_USER=$($GH api user --jq .login 2>/dev/null || echo "unknown")
+if [ "$ACTUAL_USER" != "$GH_USER_PI" ]; then
+  echo "⚠️ 账号守卫失败: 期望 $GH_USER_PI, 实际 $ACTUAL_USER — 拒绝运行"
+  exit 1
+fi
+
+# ── 守卫 2: 工作目录归属校验 — 防止在错误 repo 执行 git 操作 ──
+if [ -d "$BASE" ] && [ -d "$BASE/.git" ]; then
+  ACTUAL_REPO=$(git -C "$BASE" remote get-url origin 2>/dev/null || echo "no-remote")
+  case "$ACTUAL_REPO" in
+    *"{repo}"*|*"{repo_name}"*) : ;;
+    *)
+      echo "⚠️ 目录守卫失败: $BASE remote ($ACTUAL_REPO) ≠ $EXPECTED_REPO — 拒绝运行"
+      exit 1
+      ;;
+  esac
+fi
 
 $GH auth switch --user hh1985 >/dev/null 2>&1
 
@@ -267,9 +298,9 @@ OUT=$(cd $BASE && python3 bot-dispatcher/dispatcher.py \\
 SYNC_OUT=$(cd $BASE && python3 bot-dispatcher/sync_job.py \\
   --repo $REPO --config $CFG --board $BOARD --state-dir $STATE --archive 2>&1)
 
-EV_OUT=$(cd $BASE && python3 bot-dispatcher/sync_job.py \\
+EV_OUT=$(cd $BASE && GH_USER_AUDITOR="$GH_USER_AUDITOR" python3 bot-dispatcher/sync_job.py \\
   --repo $REPO --config $CFG --board $BOARD --state-dir $STATE \\
-  --sync-ev --gh-user hh1985 --archive 2>&1)
+  --sync-ev --archive 2>&1)
 
 python3 - "$OUT" "$SYNC_OUT" "$EV_OUT" <<'PY'
 import json, sys

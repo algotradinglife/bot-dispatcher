@@ -886,6 +886,10 @@ def test_plain_pi_comment_routes_to_owner_and_unknown_warns() -> None:
     assert forwards[0]["session"] == "sample-Strategy", forwards[0]
     warns = payload.get("warnings", [])
     assert any("unroutable" in w for w in warns), "unknown author should warn: %s" % warns
+    # unknown author 不静默丢弃 → 升级给 PI (escalated_to_pi)
+    escalated = [a for a in payload.get("actions", []) if a.get("reason") == "escalated_to_pi"]
+    assert len(escalated) == 1, "unknown author comment should escalate to PI: %s" % escalated
+    assert escalated[0]["session"] == "sample-PI", escalated[0]
 
 
 def test_plain_worker_comment_on_pr_routes_to_pi() -> None:
@@ -1078,3 +1082,114 @@ def test_extract_report_url_wiki_link() -> None:
         ]
         url = MOD.extract_report_url("example-org/sample", 145)
     assert url == "https://github.com/example-org/sample/wiki/BJ145"
+
+
+# ── pr_linked_issue_numbers: API 结构化优先, 文本兜底 ──────────────────
+
+def test_pr_linked_issue_numbers_prefers_api_field() -> None:
+    """GitHub API 的 closingIssuesReferences 优先于 body 文本."""
+    pr = {
+        "number": 5,
+        "body": "Closes #999 (文本可能是错的/漂移)",
+        "closingIssuesReferences": [{"number": 42}],
+    }
+    assert MOD.pr_linked_issue_numbers(pr) == {42}
+
+
+def test_pr_linked_issue_numbers_falls_back_to_body_text() -> None:
+    """API 未返回字段时 (旧数据/stub) 回退文本解析."""
+    pr = {"number": 5, "body": "Closes #42", "closingIssuesReferences": None}
+    assert MOD.pr_linked_issue_numbers(pr) == {42}
+
+
+def test_pr_linked_issue_numbers_empty_api_field_uses_text() -> None:
+    """API 返回空列表 → 文本兜底 (避免漏检)."""
+    pr = {"number": 5, "body": "Fixes #7", "closingIssuesReferences": []}
+    assert MOD.pr_linked_issue_numbers(pr) == {7}
+
+
+def test_pr_linked_issue_numbers_no_refs() -> None:
+    assert MOD.pr_linked_issue_numbers({"number": 5, "body": "no refs"}) == set()
+
+# ── Blocked 状态 = worker 诉求的结构化通道 → 升级 PI ───────────────────
+
+def test_issue_blocked_escalates_to_pi() -> None:
+    """worker 把 issue 移到 Blocked (结构化状态) → dispatcher 升级给 PI.
+
+    worker 有诉求不再依赖评论文本: Blocked 状态是 API 可读的结构化信号,
+    dispatcher 检测到 → 扔给 PI (issue_blocked_escalate).
+    """
+    import sys
+    import io
+    import contextlib
+    import yaml
+    from pathlib import Path
+
+    repo_cfg = {
+        "repo": "example-org/sample-research",
+        "projects": [
+            {"number": 2, "node": "PVT_EXAMPLE2", "name": "Prediction", "owner": "strategist"},
+        ],
+        "session_map": {"pi": "sample-PI", "strategist": "sample-Strategy", "engineer": "sample-Engineer"},
+        "assignee_map": {"hh1985": "pi", "everything-bot-engineer": "engineer"},
+        "mention_map": {"pi": "pi", "strategist": "strategist"},
+    }
+
+    def fake_run(cmd, **kwargs):
+        ok = SimpleNamespace(returncode=0, stderr="", stdout="")
+        if cmd[:2] == ["gh", "api"]:
+            q = " ".join(cmd)
+            if "repository(" in q:
+                # Issue Graph 查询: 返回 repository 结构 (带 parent 等)
+                ok.stdout = json.dumps({"data": {"repository": {"issue": {
+                    "number": 300, "parent": None,
+                    "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+                    "blocking": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+                    "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+                }}}})
+            else:
+                # Project 查询: 返回 node.items 项目结构
+                ok.stdout = json.dumps({"data": {"node": {"items": {
+                    "nodes": [{
+                        "id": "ITEM_300",
+                        "content": {"__typename": "Issue", "number": 300, "title": "blocked task"},
+                        "fieldValues": {"nodes": [{
+                            "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                            "name": "Blocked",
+                            "field": {"name": "Status"},
+                        }]},
+                    }],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }}}})
+            return ok
+        if cmd[:3] == ["gh", "issue", "view"]:
+            ok.stdout = "blocked task"  # --jq .title → bare string
+            return ok
+        if cmd[:3] == ["gh", "pr", "list"]:
+            ok.stdout = "[]"
+            return ok
+        if cmd[:3] == ["gh", "pr", "view"]:
+            ok.stdout = "{}"
+            return ok
+        ok.stdout = "{}"
+        return ok
+
+    buf = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        cfg_file = Path(td) / "dispatcher.yaml"
+        cfg_file.write_text(yaml.safe_dump({"repos": {"sample": repo_cfg}}))
+        state_file = Path(td) / "state.json"
+        state_file.write_text(json.dumps({}))
+        with contextlib.redirect_stdout(buf):
+            with patch.object(MOD.subprocess, "run", side_effect=fake_run):
+                with patch.object(sys, "argv", [
+                    "dispatcher.py", "--repo", "sample",
+                    "--config", str(cfg_file), "--state-dir", td,
+                ]):
+                    MOD.main()
+    payload = json.loads(buf.getvalue())
+    escalate = [a for a in payload.get("actions", [])
+                if a.get("reason") == "issue_blocked_escalate"]
+    assert escalate, "Blocked issue should escalate to PI: %s" % payload.get("actions")
+    assert escalate[0]["session"] == "sample-PI", escalate[0]
+    assert "BLOCKED" in escalate[0]["sent"], escalate[0]

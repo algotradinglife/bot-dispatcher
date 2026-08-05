@@ -75,11 +75,25 @@ kanban 是执行态（工作卡），单向映射、不双写。
 
 ## Ground rules
 
+- **消息派发主通道 = 工作流 + 状态 + dispatcher 规则**（结构化）：状态机
+  （Project Status）、工作流依赖（Issue Graph: parent/blockedBy/subIssues）、
+  API 字段（closingIssuesReferences、author）是路由依据。
+- **文本只兜底，且兜底是下一个角色的职责**：dispatcher 不做 AI 文本解析
+  优化（不猜、不优化正则）。AI 撰写的评论/PR 描述由接手它的角色
+  （PI 评审、auditor EV）在检查时理解。dispatcher 判不了 → fail-closed
+  或升级 PI，绝不猜文本。
+- **worker 诉求 = Blocked 状态**（结构化信号）：worker 要 PI 决策/解除 →
+  置 issue Blocked，dispatcher 检测 → 升级 PI（issue_blocked_escalate）。
+  不通过评论文本传达诉求。
+- **账号即物证 + 环境变量预传递**: 每个角色绑定唯一账号（GH_USER_PI /
+  GH_USER_WORKER / GH_USER_AUDITOR），调用方注入、无默认值、缺省 fail-closed；
+  切换后验证当前账号，不符即拒绝写入。
 - 观察者永不写状态: dispatcher 只读 + 投递，绝不改 Project/Graph/不 merge/不关 Issue。
 - GitHub 是唯一真相: 状态只从 GitHub 读，单向映射到 kanban，不双写。
 - fail-closed: 控制面读不到就拒绝投递，绝不猜。
 - at-least-once: 投递失败保留旧状态重试，不丢事件。
-- 确定性路由降级链: Project 归属 → owner → [TO:] → 作者兜底 → 响铃警告。
+- 确定性路由降级链: Project 归属 → 作者身份 → [TO:] 显式覆盖（mention_map
+  明确配置才生效）→ 升级 PI / 响铃警告。
 - 损坏状态自动恢复: 备份 `.corrupt` + fresh baseline，人工检查备份。
 - Dry-run must not send messages or write state.
 - 调度 cron 是 `no_agent` 观察者，不启动 reasoning agent。

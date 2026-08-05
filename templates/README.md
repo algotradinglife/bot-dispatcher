@@ -15,12 +15,21 @@
 | 观察 cron | 每 5 分钟（`{{KEY}}_tick.sh` → profile scripts/） |
 | 治理模板 | `AGENTS.md` / `docs/ROADMAP.md`（入库） |
 
-## 账号角色（硬纪律）
+## 账号角色（硬纪律 — 环境变量预传递）
 
-- **PI = hh1985**: 开契约 Issue、评审、merge、最终验收、**维护路线图**
-- **worker = everything-bot-engineer**: 提交证据 PR、完成卡（执行者）
-- **约束**: bot 绝不 merge；PI 决策动作必须由 hh1985 执行
-- 切换: `gh auth switch --user hh1985|everything-bot-engineer`
+**每个角色绑定唯一账号，通过环境变量预传递（调用方注入，无默认值）**：
+
+| 环境变量 | 角色 | 职责 |
+|---|---|---|
+| `GH_USER_PI` | PI | 开契约 Issue、评审、merge、最终验收、维护路线图 |
+| `GH_USER_WORKER` | worker | 提交证据 PR、完成卡（执行者） |
+| `GH_USER_AUDITOR` | auditor | EV 裁决评论（**账号即物证**：审计独立于 worker） |
+
+- **状态表示**：有 API/CLI 用结构化状态；无 API/CLI 时用**结构化标记**（`VERDICT: PASS|REJECT` 首行），且**必须基于模板生成**（`auditor-ev-templates` 模板文件逐字段填充，不自由排版）
+- 脚本只读环境变量，**不自行选择账号**（杜绝硬编码错位）
+- 未预传递 → fail-closed 拒绝运行（禁止默认账号）
+- 切换后验证当前账号 == 期望账号，不符即拒绝写入
+- 约束: worker 绝不 merge；PI 决策动作必须由 PI 账号执行
 
 ## 日常派工流程（闭环）
 
