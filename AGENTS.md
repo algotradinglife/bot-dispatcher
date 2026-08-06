@@ -58,3 +58,24 @@ the scheduler owns cadence and `no_agent` execution.
   notification transport only.
 - Keep the deployed runtime unchanged unless deployment is explicitly
   authorized.
+
+## Engineering principles (owner-mandated)
+
+1. **No backward-compat tax.** Delete obsolete code outright. No compat layers,
+   no migrations, no fallbacks for old behavior — if it's outdated, remove it.
+2. **Simplest implementation that satisfies the current need.** No speculative
+   abstraction, no gratuitous config layers.
+3. **Layered system — build thin first.** Get a minimal end-to-end version
+   running, then add on top. Never rip out working code for unimplemented
+   complexity.
+4. **Modular components, separation of concerns.** Keep pieces decoupled and
+   single-purpose.
+5. **Prefer mature, maintained libraries.** No reinventing the wheel without a
+   clear reason.
+6. **Check existing dependencies first.** Before adding a package or writing
+   your own, see what the project already has and what it can do. Don't assume
+   the library is missing.
+7. **Architecture decisions are made long-term.** No "ship it now, fix later"
+   stopgaps — an accepted design is expected to persist.
+8. **Learn from mature products.** See how established products solve the same
+   problem and use proven patterns; don't invent from scratch.
