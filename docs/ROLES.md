@@ -69,8 +69,10 @@ PI 必须假设 worker 可能错了，主动进攻而非被动验收。每个产
       值得复杂度/成本代价？基线是否公平（调参水平、算力一致）？
 - [ ] **消融/敏感性**：结论对关键成分的依赖是否被验证（消融实验、去掉某
       成分还成立吗）？对参数/阈值扰动是否稳健？
-- [ ] **没有参照系 = 没有结论**：分析类产出缺金标准/对照/基线三者任一，
-      却宣称"有效/准确/提升"→ 直接打回，要求补对比
+- [ ] **没有参照系 = 没有结论**：分析类产出若宣称"有效/准确/提升"，
+      须有适用参照（金标准/对照/基线之一或组合）；**缺适用参照且无合理
+      说明**（如探索性分析、描述性统计本无对照可设）→ 直接打回要求补对比
+      或声明为何不适用
 
 **立场层**：
 - [ ] **换位质疑**：如果我是反对者，我会怎么攻击这份产出？攻击点是否被
@@ -120,19 +122,19 @@ Worker 角色**方向不同、流程相同**。所有执行者遵循同一条职
 6. 汇报   — 结果通过 [TO: PI] 评论汇报，附证据
 ```
 
-### 2.1a Engineering Validation（EV）由 worker 负责
+### 2.1a Engineering Validation（EV）由 auditor 独立执行（v0_3 八态）
 
-**EV 不是独立角色，而是 worker 的职责之一。** 每个 worker session 完成
-产出型任务后，必须执行独立的 Engineering Validation：
+**EV 是独立审计环节，不是 worker 的自检。** 八态契约：worker 完成 →
+置 `EV Review` → **auditor（Alan）**独立审计（fresh checkout + 证据链 +
+代码质量/数据工程检查）→ EV 裁决（PASS → 进入 `PI Review`；REJECT →
+打回 worker 修复）。见 §1.2.1 与 auditor SOUL（六步 EV）。
 
-- **执行者**：由产出方 **自己所在角色的 session** 派出独立验证（可 fork
-  一个独立 agent 实例做 fresh review），或由另一 worker session 交叉验证
-- **不需要独立的 reviewer/EV 角色**（不设专用 EV session）
-- **EV 内容**：在干净副本上重跑证据链（SHA 校验、receipt、fresh read-only
-  验证），确认产出可复现、无越权、scope 无膨胀
-- **EV 结果**：随产出一起通过 `[TO: PI]` 汇报，作为 PI 验收 gate 的输入
-- **交叉验证**：涉及资金/数据的敏感变更，建议另一 worker session 交叉
-  验证（如 Strategist 产出 → Engineer 验证数据，反之亦然）
+- **执行者**：auditor profile（独立于产出方，assignee ≠ 产出方）
+- **EV 内容**：独立 fresh checkout 重跑 + 四件套证据链 + 边界审计 +
+  代码质量与数据工程检查（第 5 步）
+- **EV 结果**：EV 裁决报告（VERDICT: PASS/REJECT），作为 PI Review 的输入
+- **worker 的自验职责**（不替代 EV）：worker 提交前自跑测试、自查证据
+  链，但这是自验不是 EV——EV 的独立性不能被自验替代
 
 ### 2.2 角色方向差异
 

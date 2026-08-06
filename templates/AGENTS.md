@@ -13,7 +13,7 @@ kanban 是执行态（工作卡），单向映射、不双写。
 2. dispatcher（cron）检测 → kanban 建卡（幂等于 issue 号）
 3. 唯一 owner worker（researcher/engineer 二选一）执行 → 完成卡 →
    提交证据 PR（body 含 `Closes #N`）
-4. draft→ready → pr-status-sync workflow 置 issue `Review`
+4. draft→ready → pr-status-sync workflow 置 issue `EV Review`
 5. EV（auditor=Alan）：独立 fresh checkout 验证 → **含代码质量与数据工程
    检查**（数据 IO 用 pandas/numpy 非原生 csv、写前 dry-run 预检、读入
    fail-fast 校验、原子写）→ EV 裁决（PASS/REJECT）
@@ -34,8 +34,9 @@ kanban 是执行态（工作卡），单向映射、不双写。
   分析/研究/模型类产出另查**对比有效性**：金标准（相对什么标准？病理/确诊/
   基准数据集）、对照（相对谁有效？安慰剂/SOC/前身方案；单臂谨慎表述）、
   基线（优于简单基线？majority/常数/随机/启发式；增量值不值得代价）、
-  消融/敏感性。**没有参照系 = 没有结论**——缺金标准/对照/基线任一却宣称
-  "有效/准确/提升" → 直接打回补对比。
+  消融/敏感性。**没有参照系 = 没有结论**——缺适用参照（金标准/对照/基线
+  之一或组合）且无合理说明（如探索性分析本无对照）却宣称"有效/准确/提升"
+  → 直接打回补对比或声明为何不适用。
 - **PI 维护路线图**（`docs/ROADMAP.md`）：路线图是 PI 的职责，worker 不做
   方案设计。每次 worker 产出评审 merge 后，PI 必须更新路线图（将已验证的
   产出纳入 §2 当前路线 / §3 已验证资产，追加 §5 更新记录）。版本 v0_N
