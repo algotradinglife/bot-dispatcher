@@ -15,8 +15,8 @@ kanban 是执行态（工作卡），单向映射、不双写。
    提交证据 PR（body 含 `Closes #N`）
 4. draft→ready → pr-status-sync workflow 置 issue `EV Review`
 5. EV（auditor=Alan）：独立 fresh checkout 验证 → **含代码质量与数据工程
-   检查**（数据 IO 用 pandas/numpy 非原生 csv、写前 dry-run 预检、读入
-   fail-fast 校验、原子写）→ EV 裁决（PASS/REJECT）
+   检查**（写操作原子写、读入 fail-fast 校验、异常显式、编码显式）→
+   EV 裁决（PASS/REJECT）
 6. PI 评审 → merge → 自动 `Done` + 关闭 issue
 7. PI 更新路线图（`docs/ROADMAP.md`，v0_N 递增，追加更新记录）
 
