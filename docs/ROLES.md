@@ -116,7 +116,8 @@ Worker 角色**方向不同、流程相同**。所有执行者遵循同一条职
 ```
 1. 认领   — 从 Project 看板取 Ready/In Progress 的 Issue
 2. 执行   — 在自己的 worktree 完成 Issue 契约
-3. 自验   — 跑测试 + 独立验证（EV / 证据收据）
+3. 自验   — 跑测试 + 自查证据链（自验非 EV；EV 由 auditor 独立执行，
+   见 §2.1a）
 4. 提交   — 开 PR 引用 Issue，标 Ready for Review（Draft→Ready）
 5. 响应   — 处理 PI review 意见（CHANGES_REQUESTED → 修改重推）
 6. 汇报   — 结果通过 [TO: PI] 评论汇报，附证据

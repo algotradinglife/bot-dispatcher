@@ -13,11 +13,13 @@ kanban 是执行态（工作卡），单向映射、不双写。
 2. dispatcher（cron）检测 → kanban 建卡（幂等于 issue 号）
 3. 唯一 owner worker（researcher/engineer 二选一）执行 → 完成卡 →
    提交证据 PR（body 含 `Closes #N`）
-4. draft→ready → pr-status-sync workflow 置 issue `EV Review`
+4. worker 提交证据 PR（draft→ready，body 含 `Closes #N`）→ 置 `EV Review`
+   （worker 请求审计；pr-status-sync workflow 响应 draft→ready 自动落盘）
 5. EV（auditor=Alan）：独立 fresh checkout 验证 → **含代码质量与数据工程
    检查**（写操作原子写、读入 fail-fast 校验、异常显式、编码显式）→
    EV 裁决（PASS/REJECT）
-6. PI 评审 → merge → 自动 `Done` + 关闭 issue
+6. PI 评审（对抗性）→ 裁决 merge → 置 `Done` + 关闭 issue（PI 操作；
+   pr-status-sync workflow 响应 merge 自动落盘）
 7. PI 更新路线图（`docs/ROADMAP.md`，v0_N 递增，追加更新记录）
 
 ## Roles
