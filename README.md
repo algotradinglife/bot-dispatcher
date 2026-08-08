@@ -9,6 +9,30 @@ The tracked tree contains no live repository IDs, session names, GitHub
 accounts, tokens, or machine-specific paths. Runtime configuration stays
 outside Git.
 
+## One-shot deployment (`deploy.py`)
+
+三层管理体系一键部署：给定项目参数，自动初始化 GitHub 控制面 + kanban 执行面
++ 治理模板资产（含闭环治理约束：一 issue 一 worker、owner 不可变更、
+EV 流程、路线图维护）。
+
+```bash
+python3 deploy.py --repo owner/name --key project-key --board kanban-board \
+    --out /path/to/deploy-dir [--project-title "Title"] [--dry-run]
+```
+
+生成资产：
+- `.github/workflows/pr-status-sync.yaml` — PR 生命周期 → Project 状态（参数化 ID）
+- `dispatcher.yaml` — session_map（researcher/engineer/auditor + pm/pi）
+- `<key>_tick.sh` — no_agent 观察 cron（dispatcher + sync_job --archive）
+- `AGENTS.md` / `ROADMAP.md` / `README.md` — 治理模板（templates/）
+
+`--dry-run` 纯预览无副作用。真实部署后仍需手动：
+`gh secret set PROJECT_SYNC_TOKEN`、`hermes kanban boards create`、注册 cron。
+
+治理约束详见 `templates/AGENTS.md`：闭环 PI→worker→EV→PI review+merge→
+roadmap update；一 issue 一 worker；owner 与 Project 归属严格绑定不可变更；
+跨 worker 协作拆 issue；改变=重开 issue 落对应 Project。
+
 ## Boundary
 
 The dispatcher observes GitHub and delivers notifications. It does not decide
