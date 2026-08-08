@@ -1,3 +1,10 @@
+# Runtime configuration and state are local. Only the sanitized example is tracked.
+dispatcher.yaml
+*.state.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
 # 测试例暂不纳入版本库（2026-08-08 用户定案：本地保留、不提交）
 # 将来需要纳入时删除下面这行并 git add tests/
 tests/
