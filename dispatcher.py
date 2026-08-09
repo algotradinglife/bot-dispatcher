@@ -392,8 +392,8 @@ def main():
             reason = None
 
             if cur_s == "Ready":
-                # 契约: PI 拨 Ready → 通知 worker (owner) 开工
-                notify_role = "worker"
+                # 契约: PI 拨 Ready → 通知 owner worker (project owner 角色) 开工
+                notify_role = owner
                 msg = format_goal("Issue #%d is READY — %s" % (issue_num, title), url)
                 reason = "issue_ready"
 
