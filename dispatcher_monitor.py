@@ -28,7 +28,7 @@ from pathlib import Path
 # 默认阈值 (秒): 滞留 WARN
 STALE_THRESHOLDS = {
     "Ready": 3 * 86400,        # 3 天没人接
-    "In Progress": 5 * 86400,  # 5 天 (配合活性检测, 活性正常则不报)
+    "In Progress": 3600,       # 1 小时 (试点收紧: worker 卡死快速发现)
     "EV Review": 2 * 86400,    # 2 天 EV 积压
     "PI Review": 2 * 86400,    # 2 天 PI 积压
     "Blocked": 2 * 86400,      # 2 天诉求未处理
