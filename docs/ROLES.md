@@ -133,10 +133,15 @@ v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitH
 代码质量/数据工程检查）→ EV 裁决（PASS → 进入 `PI Review`；REJECT →
 打回 worker 修复）。见 §1.2.1 与 auditor SOUL（六步 EV）。
 
-- **执行者**：auditor profile（独立于产出方，assignee ≠ 产出方）
+- **执行者**：auditor profile（审计过程独立于产出方：独立 fresh
+  checkout、独立复算、不共享产出方 worktree/环境/进程）
 - **EV 内容**：独立 fresh checkout 重跑 + 四件套证据链 + 边界审计 +
   代码质量与数据工程检查（第 5 步）
 - **EV 结果**：EV 裁决报告（VERDICT: PASS/REJECT），作为 PI Review 的输入
+- **裁决发布（已定方案）**：本机无独立 auditor GitHub 账号时，由
+  hh1985（PI）或 everything-bot-engineer 代发，报告注明"auditor profile
+  独立执行，代发"。代发不破坏独立性：审计过程独立完成，且 PI Review
+  阶段 PI 对抗性审查独立检查 EV 证据（PI 不盲信 EV）
 - **worker 的自验职责**（不替代 EV）：worker 提交前自跑测试、自查证据
   链，但这是自验不是 EV——EV 的独立性不能被自验替代
 
