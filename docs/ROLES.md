@@ -107,20 +107,22 @@ PI 必须假设 worker 可能错了，主动进攻而非被动验收。每个产
 - ❌ **不建无依据的 graph 边**（无真实依赖关系的 Issue 不硬连）
 - ❌ **不代替执行者做实验设计**（方向可以定，方案执行者出）
 
-## 2. 执行者角色（Engineer / Strategist / Data）
+## 2. 执行者角色（Analyst / Engineer / Auditor — Hermes profiles）
 
-Worker 角色**方向不同、流程相同**。所有执行者遵循同一条职责流程：
+Worker 角色**方向不同、流程相同**。所有执行者遵循同一条职责流程。
+v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitHub）。
 
 ### 2.1 通用职责流程（所有 worker 一致）
 
 ```
-1. 认领   — 从 Project 看板取 Ready/In Progress 的 Issue
+1. 认领   — 收到 Ready 唤醒 → 打开 Issue → 置 In Progress
 2. 执行   — 在自己的 worktree 完成 Issue 契约
 3. 自验   — 跑测试 + 自查证据链（自验非 EV；EV 由 auditor 独立执行，
    见 §2.1a）
-4. 提交   — 开 PR 引用 Issue，标 Ready for Review（Draft→Ready）
-5. 响应   — 处理 PI review 意见（CHANGES_REQUESTED → 修改重推）
-6. 汇报   — 结果通过 [TO: PI] 评论汇报，附证据
+4. 交付   — 开 PR（body 含 Closes #N）附证据三层（notebook + 代码 + 工件）
+5. 交审   — PR ready → 置 EV Review（请求独立审计）
+6. 返工   — EV REJECT / PI 驳回 → 回 In Progress 按反馈修正
+7. 诉求   — 需要 PI 决策 → 置 Blocked（结构化信号，不靠评论喊话）
 ```
 
 ### 2.1a Engineering Validation（EV）由 auditor 独立执行（v0_3 八态）
@@ -139,11 +141,15 @@ Worker 角色**方向不同、流程相同**。所有执行者遵循同一条职
 
 ### 2.2 角色方向差异
 
-| 角色 | 方向 | 典型 Project |
-|------|------|-------------|
-| **Engineer** | 工程实现：代码、管线、修复、产品能力 | Data Platform / Product & Ops / Contracts & Reproducibility |
-| **Strategist** | 策略研究：模型、实验、回测、决策链 | Prediction & Betting / Strategy Research |
-| **Data** | 数据：采集、存储、freshness、交付 | Data & Market State |
+| 角色 | 类别 | 方向 | 典型 Project |
+|------|------|------|-------------|
+| **Analyst** | worker | 策略研究：模型、实验、回测、决策链 | Prediction & Betting / Strategy Research |
+| **Engineer** | worker | 工程实现：代码、管线、修复、产品能力、数据 | Data Platform / Product & Ops / Contracts & Reproducibility / Data & Market State |
+| **Auditor** | 独立审计 | EV：fresh checkout 验证、证据链审计、代码质量与数据工程检查（assignee ≠ 产出方） | 全部（EV Review 阶段） |
+
+> **worker 是泛称**：Analyst 和 Engineer 都是 worker 的具体实例，遵循
+> 完全相同的状态机职责流程，仅任务方向不同。Auditor 独立于 worker
+> （EV 审计 assignee ≠ 产出方）。除 PI 外，其余全部是 worker。
 
 ### 2.3 Worker 红线（所有执行者）
 
@@ -155,9 +161,10 @@ Worker 角色**方向不同、流程相同**。所有执行者遵循同一条职
 
 ## 3. 角色到路由
 
-dispatcher 的 `session_map` 把角色 key 映射到 agent-deck session；
-`projects[].owner` 决定 Issue 的默认路由；`mention_map` 决定 `[TO: role]` 的路由。
-角色语义（本文件）跨项目不变，只有 session 名称和项目配置变化。
+dispatcher 的 `session_map` 把角色 key 映射到 **Hermes profile**（命令行
+唤醒：`hermes -p <role> chat -q "<任务>"`）；`projects[].owner` 决定
+Issue 的默认路由。角色语义（本文件）跨项目不变，只有 profile 名称和
+项目配置变化。PI 仍是 codex session（agent-deck），人工通知 + 主动轮询。
 
 ## 4. 变更流程
 
