@@ -113,7 +113,7 @@ Worker 角色**方向不同、流程不同**。Analyst / Engineer 遵循 §2.1
 （producing 流程），Auditor 遵循 §2.1a（独立 EV 审计流程）。
 v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitHub）。
 
-### 2.1 通用职责流程（所有 worker 一致）
+### 2.1 Producing worker 职责流程（Analyst / Engineer）
 
 ```
 1. 认领   — 收到 Ready 唤醒 → 打开 Issue → 置 In Progress
