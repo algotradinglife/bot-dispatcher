@@ -397,6 +397,10 @@ def main():
                 msg = format_goal("Issue #%d is READY — %s" % (issue_num, title), url)
                 reason = "issue_ready"
 
+            elif cur_s == "In Progress":
+                # 通知 owner worker 知晓已认领; 状态切换对用户可见
+                reason = "issue_in_progress"
+
             elif cur_s == "EV Review":
                 # 契约: worker 完成拨 EV Review → 通知 auditor 独立审计
                 notify_role = "auditor"
@@ -404,6 +408,18 @@ def main():
                     "Issue #%d in EV Review — %s (worker 已完成, 待独立审计)"
                     % (issue_num, title), url)
                 reason = "ev_review_ready"
+
+            elif cur_s == "PI Review":
+                # 待 PI 终审: 状态切换对用户可见 (PI 人工通知, 不自动)
+                reason = "issue_pi_review"
+
+            elif cur_s == "Blocked":
+                # worker 诉求: 状态切换对用户可见 (Blocked = 需 PI 决策)
+                reason = "issue_blocked"
+
+            elif cur_s == "Done":
+                # 完成: 已有 issue_done 语义 (含报告链接)
+                reason = "issue_done"
 
             elif cur_s == "Human":
                 # 契约: PI 判定需真人干预 → 通知用户 (飞书主通道)
@@ -414,13 +430,17 @@ def main():
                     % (issue_num, title, owner), url)
                 reason = "issue_human_escalate"
 
-            # 其余状态 (In Progress / PI Review / Blocked / Done / Inbox):
-            # PI 主动轮询自行感知, dispatcher 仅记录, 不通知.
-            if notify_role and msg:
-                queue_goal(output, notify_role, msg, issue_num=issue_num)
+            # 其余状态 (Inbox / Cancelled): 仅记录
+            # 状态切换事件对用户 digest 可见 (reason 非 None 即记录 action)
+            if reason:
+                action_msg = msg or format_notice(
+                    "Issue #%d 状态: %s — %s" % (issue_num, cur_s, title), url)
                 output["actions"].append({"node": sk, "state": cur_s, "role": notify_role,
                                           "reason": reason, "prev_status": prev_s,
-                                          "sent": msg[:80], "result": "queued"})
+                                          "sent": action_msg[:80], "result": "queued"})
+
+            if notify_role and msg:
+                queue_goal(output, notify_role, msg, issue_num=issue_num)
 
             new_state[sk] = cur_s
 
