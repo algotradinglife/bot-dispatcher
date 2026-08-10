@@ -467,6 +467,40 @@ def main():
     except Exception as e:
         output["warnings"].append("%s monitor: %s" % (prefix, str(e)[:120]))
 
+    # ── 3. PR merged 检测 ──
+    # v0_3 重构误删了 PR 监控; 恢复 merged 通知 (用户 digest 白名单 🎉).
+    # 检测: gh pr list --state merged 近期合并 → 通知用户 (author receipt).
+    # 路径 A: 最近合并的 PR 扫描 (catch-up, 不依赖 project membership).
+    try:
+        mrun = subprocess.run(
+            ["gh", "pr", "list", "--repo", repo, "--state", "merged",
+             "--limit", "10", "--json", "number,title,mergedAt,author"],
+            capture_output=True, text=True, timeout=20)
+        if mrun.returncode == 0:
+            merged_prs = json.loads(mrun.stdout)
+            for pr in merged_prs:
+                pn = pr["number"]
+                key = "pr:%d" % pn
+                prev_m = prev_state.get(key)
+                if prev_m == "merged":
+                    continue
+                if new_state.get(key) == "merged":
+                    continue  # 同 tick 已处理
+                merged_at = pr.get("mergedAt") or ""
+                title = pr.get("title") or ""
+                url = "https://github.com/%s/pull/%d" % (repo, pn)
+                msg = format_notice(
+                    "PR #%d has been MERGED! — %s" % (pn, title), url)
+                reason = "pr_merged_recent" if not prev_m else "pr_merged"
+                output["actions"].append({"node": key, "state": "merged",
+                                          "role": None, "reason": reason,
+                                          "prev_status": prev_m,
+                                          "sent": msg[:80], "result": "queued"})
+                queue_goal(output, "user", msg, issue_num=pn)
+                new_state[key] = "merged"
+    except Exception as e:
+        output["warnings"].append("%s PR merged scan: %s" % (prefix, str(e)[:120]))
+
     delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run, cfg=cfg)
     # Human 兜底: dispatcher 侧仅尽力而为的飞书提醒 (monitor 锁内计数限频);
     # 真正的 8h×3 邮件/短信兜底由 PI 第二通道负责 (独立轮询 GitHub,
