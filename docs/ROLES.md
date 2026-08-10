@@ -109,7 +109,8 @@ PI 必须假设 worker 可能错了，主动进攻而非被动验收。每个产
 
 ## 2. 执行者角色（Analyst / Engineer / Auditor — Hermes profiles）
 
-Worker 角色**方向不同、流程相同**。所有执行者遵循同一条职责流程。
+Worker 角色**方向不同、流程不同**。Analyst / Engineer 遵循 §2.1
+（producing 流程），Auditor 遵循 §2.1a（独立 EV 审计流程）。
 v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitHub）。
 
 ### 2.1 通用职责流程（所有 worker 一致）
@@ -148,8 +149,9 @@ v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitH
 | **Auditor** | 独立审计 | EV：fresh checkout 验证、证据链审计、代码质量与数据工程检查（assignee ≠ 产出方） | 全部（EV Review 阶段） |
 
 > **worker 是泛称**：worker profiles 是 Analyst、Engineer、Auditor 三类。
-> Analyst / Engineer 是 **producing worker**（产出方）；Auditor 是
-> **non-producing、独立审计 worker**（不产出，只验证，assignee ≠ 产出方）。
+> Analyst / Engineer 是 **producing worker**（产出业务交付）；Auditor 是
+> **non-producing、独立审计 worker**（不产出业务交付，仅产出独立 EV 裁决报告，
+> assignee ≠ 产出方）。
 > 三者都遵循状态机职责流程，区别仅在是否产出与审计独立性。
 
 ### 2.3 Worker 红线（所有执行者）
@@ -171,7 +173,8 @@ v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitH
 - **PI Review → Done / Ready 由 PI 操作**：PI 验收通过 → Done 并关闭
   issue；驳回 → Ready 返工。worker/auditor 不碰这两个转换
 - **PI 更新 ROADMAP**：worker 产出评审 merge 后，PI 必须更新
-  ROADMAP.md（版本 v0_N 递增，追加更新记录，可追溯到产出证据）
+  `docs/research/roadmap.md`（canonical 路径，版本 v0_N 递增，追加更新
+  记录，可追溯到产出证据）
 
 ## 3. 角色到路由
 
