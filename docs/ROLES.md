@@ -138,10 +138,12 @@ v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitH
 - **EV 内容**：独立 fresh checkout 重跑 + 四件套证据链 + 边界审计 +
   代码质量与数据工程检查（第 5 步）
 - **EV 结果**：EV 裁决报告（VERDICT: PASS/REJECT），作为 PI Review 的输入
-- **裁决发布（已定方案）**：本机无独立 auditor GitHub 账号时，由
-  hh1985（PI）或 everything-bot-engineer 代发，报告注明"auditor profile
-  独立执行，代发"。代发不破坏独立性：审计过程独立完成，且 PI Review
-  阶段 PI 对抗性审查独立检查 EV 证据（PI 不盲信 EV）
+- **裁决发布（已定方案）**：auditor 统一使用 bot 账号
+  （everything-bot-engineer），包括发布 EV 裁决报告和拨 GitHub 状态
+  （REJECT → issue Ready 返工；PASS → issue PI Review）。报告注明
+  "auditor profile 独立执行，bot 账号发布"。审计独立性由审计过程保证
+  （独立 checkout/复算），非发布账号；PI Review 阶段 PI 对抗性审查
+  独立复核 EV 证据（PI 不盲信 EV）
 - **worker 的自验职责**（不替代 EV）：worker 提交前自跑测试、自查证据
   链，但这是自验不是 EV——EV 的独立性不能被自验替代
 
