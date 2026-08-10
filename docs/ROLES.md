@@ -17,7 +17,7 @@ PI 是每个项目的最终决策者和质量守门人。dispatcher 的所有路
 | **Issue Graph** | 建立/修改 `blockedBy` / `blocking` / `parent` / `subIssues` 关系 |
 | **Project 路由** | 决定 Issue 进哪个 Project、Owner Role 归谁 |
 | **Project + Milestone 分配（强制）** | **每个 Issue 必须挂载到明确的 Project 和 Milestone**。Project 决定 owner 路由；Milestone 决定交付目标和 deadline。两者缺失的 Issue 视为未就绪，dispatcher 不路由，直到 PI 补齐 |
-| **最终 Review** | 执行验收 gate（fresh EV、证据完整性、契约符合性） |
+| **最终 Review** | 执行验收 gate（审阅独立 auditor 提交的 fresh EV 证据、证据完整性、契约符合性） |
 | **PR 合并权** | 唯一有权 merge PR 的角色 |
 | **Issue 关闭** | 唯一有权关闭 Issue 的角色 |
 | **需求接收** | 用户意图的唯一入口；用户经 PI 传达方向 |
@@ -128,7 +128,7 @@ v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitH
 ### 2.1a Engineering Validation（EV）由 auditor 独立执行（v0_3 八态）
 
 **EV 是独立审计环节，不是 worker 的自检。** 八态契约：worker 完成 →
-置 `EV Review` → **auditor（Alan）**独立审计（fresh checkout + 证据链 +
+置 `EV Review` → **auditor profile**独立审计（fresh checkout + 证据链 +
 代码质量/数据工程检查）→ EV 裁决（PASS → 进入 `PI Review`；REJECT →
 打回 worker 修复）。见 §1.2.1 与 auditor SOUL（六步 EV）。
 
@@ -147,9 +147,10 @@ v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitH
 | **Engineer** | worker | 工程实现：代码、管线、修复、产品能力、数据 | Data Platform / Product & Ops / Contracts & Reproducibility / Data & Market State |
 | **Auditor** | 独立审计 | EV：fresh checkout 验证、证据链审计、代码质量与数据工程检查（assignee ≠ 产出方） | 全部（EV Review 阶段） |
 
-> **worker 是泛称**：Analyst 和 Engineer 都是 worker 的具体实例，遵循
-> 完全相同的状态机职责流程，仅任务方向不同。Auditor 独立于 worker
-> （EV 审计 assignee ≠ 产出方）。除 PI 外，其余全部是 worker。
+> **worker 是泛称**：worker profiles 是 Analyst、Engineer、Auditor 三类。
+> Analyst / Engineer 是 **producing worker**（产出方）；Auditor 是
+> **non-producing、独立审计 worker**（不产出，只验证，assignee ≠ 产出方）。
+> 三者都遵循状态机职责流程，区别仅在是否产出与审计独立性。
 
 ### 2.3 Worker 红线（所有执行者）
 
@@ -159,12 +160,25 @@ v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitH
 - ❌ 不读取/修改其他角色的工作区
 - ❌ 不用 PI 的 GitHub 身份操作（hh1985 只归 PI）
 
+### 2.4 v0_3 硬规则（共同契约）
+
+- **one-issue-one-project**：Issue 只能属于一个 configured Project，
+  不能多挂
+- **owner 严格绑定**：owner 与 Project 归属严格绑定，创建后不可中途
+  修改；确需变更 → 关原 issue，新开 issue 挂对应 Project 并引用谱系
+- **Human 只能 PI 置**：worker/auditor 不得置 Human 状态（Human =
+  需真人干预，由 PI 判定并置）
+- **PI Review → Done / Ready 由 PI 操作**：PI 验收通过 → Done 并关闭
+  issue；驳回 → Ready 返工。worker/auditor 不碰这两个转换
+- **PI 更新 ROADMAP**：worker 产出评审 merge 后，PI 必须更新
+  ROADMAP.md（版本 v0_N 递增，追加更新记录，可追溯到产出证据）
+
 ## 3. 角色到路由
 
 dispatcher 的 `session_map` 把角色 key 映射到 **Hermes profile**（命令行
 唤醒：`hermes -p <role> chat -q "<任务>"`）；`projects[].owner` 决定
 Issue 的默认路由。角色语义（本文件）跨项目不变，只有 profile 名称和
-项目配置变化。PI 仍是 codex session（agent-deck），人工通知 + 主动轮询。
+项目配置变化。PI 仍是 **Codex session**，人工通知 + 主动轮询。
 
 ## 4. 变更流程
 
