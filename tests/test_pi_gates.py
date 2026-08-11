@@ -65,6 +65,13 @@ def _graph_blocked_closed():
     return json.dumps(d)
 
 
+def _graph_blocked_nodes():
+    """gh 真实结构: blockedBy: {nodes: [{number, state}]}."""
+    d = json.loads(_graph_ok())
+    d["blockedBy"] = {"nodes": [{"number": 999, "state": "OPEN"}]}
+    return json.dumps(d)
+
+
 def _pr_ok():
     return json.dumps({"headRefOid": "5622a4091378abc", "state": "OPEN"})
 
@@ -101,6 +108,15 @@ def test_g01_pass_closed_blocker():
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
     assert res["G01"][0] == "PASS"
+
+
+def test_g01_fail_nodes_blocker():
+    """gh {nodes:[...]} 结构: OPEN blocker 正确检出."""
+    fake = FakeGh([_graph_blocked_nodes()])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1)
+    assert res["G01"][0] == "FAIL"
+    assert "999" in res["G01"][1]
 
 
 def test_g01_fail_graph_unavailable():
