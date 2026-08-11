@@ -19,3 +19,16 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements-dev.txt
       - run: pytest -q
+
+  # PI-GATE check: 跑 gate 逻辑的单测 (不查真实 GitHub —
+  # 真实 gate 在 dispatcher 运行; 这里保证 gate 代码本身正确).
+  pi-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: pytest tests/test_pi_gates.py -q
