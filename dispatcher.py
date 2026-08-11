@@ -542,6 +542,23 @@ def main():
         output["warnings"].append(
             "%s PI-GATE G05 reconcile: %s" % (prefix, str(e)[:100]))
 
+    # ── PI-GATE live CheckRun 发布 (round-4 收口) ──
+    # 受保护的 dispatcher 读取实时状态 → 向 open PRs 的 HEAD 发布
+    # required CheckRun (pi-gates-live). 替代 PR 内 workflow 自证.
+    # 限频: 每 tick 最多发布 5 个 (API 配额保护).
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from gate_check import scan_and_publish
+        published = scan_and_publish(repo, limit=5)
+        for p in published:
+            if p.get("conclusion") == "failure":
+                output["warnings"].append(
+                    "%s ⛔ PI-GATE live: PR #%d 被 gate 阻断 (%s)"
+                    % (prefix, p["pr"], p.get("check_id", "?")))
+    except Exception as e:
+        output["warnings"].append(
+            "%s PI-GATE live check-run: %s" % (prefix, str(e)[:100]))
+
     delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run, cfg=cfg)
     # Human 兜底: dispatcher 侧仅尽力而为的飞书提醒 (monitor 锁内计数限频);
     # 真正的 8h×3 邮件/短信兜底由 PI 第二通道负责 (独立轮询 GitHub,
