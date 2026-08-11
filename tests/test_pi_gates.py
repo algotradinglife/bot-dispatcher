@@ -73,7 +73,8 @@ def _graph_blocked_nodes():
 
 
 def _pr_ok():
-    return json.dumps({"headRefOid": "5622a4091378abc", "state": "OPEN"})
+    return json.dumps({"headRefOid": "5622a4091378abc" + "0" * 25,
+                       "state": "OPEN"})
 
 
 # ── AUDITED_SHA parser ──
@@ -156,9 +157,9 @@ def test_g02_no_req_remind():
 
 # ── G03 ──
 # 调用序: G01 graph, G02 body, G02 comments, G03 pr(head_before),
-#         G03 issue comments, G03 pr comments
+#         G03 issue comments meta, G03 pr comments meta, G03 pr(head_after)
 
-def _ev_block(sha="5622a4091378abc" + "0" * 27,
+def _ev_block(sha="5622a4091378abc" + "0" * 25,
               auditor="everything-bot-engineer",
               verdict="PASS",
               ts="2026-08-11T03:47:12Z"):
@@ -167,10 +168,21 @@ def _ev_block(sha="5622a4091378abc" + "0" * 27,
             % (auditor, sha, verdict, ts))
 
 
+def _comments_json(blocks, authors=None, ts=None):
+    """_fetch_comments_meta 的 gh 输出: [{a, t, b}] JSON."""
+    items = []
+    for i, b in enumerate(blocks):
+        items.append({"a": (authors[i] if authors else "everything-bot-engineer"),
+                      "t": (ts[i] if ts else "2026-08-11T03:47:12Z"),
+                      "b": b})
+    return json.dumps(items)
+
+
 def test_g03_pass_structured():
     """结构化 EV-VERDICT: 完整 SHA + 可信 auditor + 匹配 HEAD → PASS."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   _pr_ok(), _ev_block(), ""])
+                   _pr_ok(), _comments_json([_ev_block()]), "",
+                   _pr_ok()])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
     assert res["G03"][0] == "PASS"
@@ -179,17 +191,52 @@ def test_g03_pass_structured():
 def test_g03_fail_short_sha():
     """SHA 不足 40 位 → FAIL (不完整 SHA)."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   _pr_ok(), _ev_block(sha="5622a4091378"), ""])
+                   _pr_ok(), _comments_json([_ev_block(sha="5622a4091378")]), "",
+                   _pr_ok()])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
     assert res["G03"][0] == "FAIL"
 
 
-def test_g03_fail_untrusted_auditor():
-    """auditor 不在可信列表 → FAIL."""
+def test_g03_fail_41char_sha():
+    """41 位 SHA → FAIL (严格 40 位)."""
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   _pr_ok(), _comments_json([_ev_block(sha="a" * 41)]), "",
+                   _pr_ok()])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
+    assert res["G03"][0] == "FAIL"
+
+
+def test_g03_fail_forged_auditor():
+    """伪造 auditor: 评论作者不是可信 auditor → FAIL (P0-2)."""
+    # 正文写 auditor=everything-bot-engineer 但真实作者是 attacker
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
                    _pr_ok(),
-                   _ev_block(auditor="unknown-account"), ""])
+                   _comments_json([_ev_block()], authors=["attacker-account"]),
+                   "", _pr_ok()])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
+    assert res["G03"][0] == "FAIL"
+
+
+def test_g03_fail_later_reject():
+    """later REJECT (P0-1): 最新 verdict 是 REJECT → FAIL."""
+    blocks = [_ev_block(verdict="PASS", ts="2026-08-11T00:11:42Z"),
+              _ev_block(verdict="REJECT", ts="2026-08-11T03:47:12Z")]
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   _pr_ok(), _comments_json(blocks), "", _pr_ok()])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
+    assert res["G03"][0] == "FAIL"
+
+
+def test_g03_fail_head_changed():
+    """HEAD 二次变化 (P0-3): head_before != head_after → FAIL."""
+    head1 = json.dumps({"headRefOid": "5622a4091378abc", "state": "OPEN"})
+    head2 = json.dumps({"headRefOid": "deadbeef" + "0" * 33, "state": "OPEN"})
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   head1, _comments_json([_ev_block()]), "", head2])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
     assert res["G03"][0] == "FAIL"
@@ -199,41 +246,17 @@ def test_g03_fail_stale_sha():
     """结构化 SHA 与 HEAD 不一致 → FAIL (stale)."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
                    _pr_ok(),
-                   _ev_block(sha="deadbeef" * 5), ""])
+                   _comments_json([_ev_block(sha="deadbeef" * 5)]), "",
+                   _pr_ok()])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
     assert res["G03"][0] == "FAIL"
 
 
-def test_g03_time_order():
-    """全局时间序: 两个 PASS, 取 timestamp 最新的 — 旧 PASS 不覆盖新 PASS."""
-    old = _ev_block(ts="2026-08-11T00:11:42Z",
-                    sha="deadbeef" * 5)  # 旧 PASS: sha 不匹配 HEAD
-    new = _ev_block(ts="2026-08-11T03:47:12Z")  # 新 PASS: sha 匹配 HEAD
-    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   _pr_ok(), old + "\n" + new, ""])
-    with mock.patch.object(pi_gates, "_gh", fake):
-        res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
-    # 最新 PASS 的 sha 匹配 HEAD → PASS (不被旧 PASS 干扰)
-    assert res["G03"][0] == "PASS"
-
-
-def test_g03_time_order_reverse():
-    """反序: 新 PASS 在前文本位置, 旧 PASS 在后 — 仍取 timestamp 最新."""
-    old = _ev_block(ts="2026-08-11T00:11:42Z",
-                    sha="deadbeef" * 5)  # 旧 PASS: 不匹配 HEAD
-    new = _ev_block(ts="2026-08-11T03:47:12Z")  # 新 PASS: 匹配 HEAD
-    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   _pr_ok(), new + "\n" + old, ""])
-    with mock.patch.object(pi_gates, "_gh", fake):
-        res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
-    assert res["G03"][0] == "PASS"
-
-
 def test_g03_fail_no_sha():
     """无 EV-VERDICT 也无 legacy AUDITED_SHA → FAIL."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   _pr_ok(), "no verdict", ""])
+                   _pr_ok(), _comments_json(["no verdict"]), "", _pr_ok()])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
     assert res["G03"][0] == "FAIL"
@@ -251,7 +274,7 @@ def test_parse_ev_verdicts():
 # ── G04 ──
 
 def test_g04_structured_marker():
-    """[ADVERSARIAL] 结构化标记 → PASS."""
+    """[ADVERSARIAL] 结构化标记 (含键值对) → PASS."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
                    "[ADVERSARIAL] baseline=pass leak=pass"])
     with mock.patch.object(pi_gates, "_gh", fake):
@@ -259,13 +282,22 @@ def test_g04_structured_marker():
     assert res["G04"][0] == "PASS"
 
 
-def test_g04_keywords_fallback():
-    """无结构化标记但有关键词 → PASS (unstructured fallback)."""
+def test_g04_invalid_marker_remind():
+    """[ADVERSARIAL] hello (无键值对) → REMIND (P1-7 严格化)."""
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   "[ADVERSARIAL] hello"])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1)
+    assert res["G04"][0] == "REMIND"
+
+
+def test_g04_keywords_no_longer_pass():
+    """普通评论含 baseline 不再 PASS (P1-7)."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
                    "baseline comparison done"])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
-    assert res["G04"][0] == "PASS"
+    assert res["G04"][0] == "REMIND"
 
 
 # ── G05 ──
@@ -296,16 +328,34 @@ def test_g05_remind_open():
 
 
 # ── G06 ──
+# 调用序: G01 graph, G02 body, G02 comments, G04 comments, G05 state,
+#         G06 child issue {st, c}
 
 def test_g06_premature_activation():
+    """下游 Ready 且无 [ACTIVATE] receipt → FAIL."""
     d = json.loads(_graph_ok())
     d["blocking"] = [{"number": 300, "state": "OPEN"}]
     graph = json.dumps(d)
+    child = json.dumps({"st": "Ready", "c": ["no activation"]})
     fake = FakeGh([graph, "REQ-E01", "| REQ-E01 | x | PASS |",
-                   "adv", "{}", '"Ready"'])
+                   "adv", "{}", child])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
     assert res["G06"][0] == "FAIL"
+
+
+def test_g06_authorized_activation_pass():
+    """下游 Ready 但有 PI [ACTIVATE] receipt → PASS (P1-8)."""
+    d = json.loads(_graph_ok())
+    d["blocking"] = [{"number": 300, "state": "OPEN"}]
+    graph = json.dumps(d)
+    child = json.dumps({"st": "Ready",
+                        "c": ["[ACTIVATE] issue=300 by PI"]})
+    fake = FakeGh([graph, "REQ-E01", "| REQ-E01 | x | PASS |",
+                   "adv", "{}", child])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1)
+    assert res["G06"][0] == "PASS"
 
 
 def test_g06_skip_no_children():
