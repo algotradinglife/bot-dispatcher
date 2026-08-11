@@ -61,6 +61,34 @@ def find_cards(issue_num, tag=None):
     return out
 
 
+SESSION_RE = re.compile(r"\[SESSION\]\s*([A-Za-z0-9_\-]+)", re.IGNORECASE)
+
+
+def get_session_id(issue_num):
+    """Read the worker's last [SESSION] marker from issue comments."""
+    r = run(["gh", "issue", "view", str(issue_num),
+             "--repo", "algotradinglife/beijing-lot",
+             "--json", "comments", "--jq", ".comments[].body"])
+    if r.returncode != 0:
+        return None
+    for body in r.stdout.splitlines():
+        m = SESSION_RE.search(body)
+        if m:
+            return m.group(1)
+    return None
+
+
+def exec_card_prompt(issue_num, title, url, owner):
+    """Build the exec-card task prompt, injecting RESUME_SESSION if known."""
+    sid = get_session_id(issue_num)
+    prompt = ("/goal Issue #%d is READY — %s\n%s\n"
+              "GitHub workflow: 认领置 In Progress → 执行 → 交付 PR → 置 EV Review. "
+              "交付时评论附 [SESSION] <session_id> + HANDOFF 摘要." % (issue_num, title, url))
+    if sid:
+        prompt = ("RESUME_SESSION=%s\n" % sid) + prompt
+    return prompt
+
+
 def generation_of(card):
     body = (card.get("body") or "") + " " + (card.get("title") or "")
     m = GEN_RE.search(body)
@@ -82,10 +110,17 @@ def get_or_create_card(issue_num, title, url, kind, owner):
     workspace = "worktree" if kind == "exec" else "scratch"
     branch = ("%s/bj%d-issue" % (owner, issue_num)) if kind == "exec" else None
 
+    if kind == "exec":
+        # 卡 body = worker 的任务 prompt; 注入 RESUME_SESSION 恢复上下文
+        card_body = exec_card_prompt(issue_num, title, url, owner)
+        card_body += "\n%s GENERATION=1" % tag
+    else:
+        card_body = ("EV audit for GitHub issue #%d (%s) — %s\n%s GENERATION=1"
+                     % (issue_num, title, url, tag))
+
     cmd = ["hermes", "kanban", "create",
            "Issue #%d: %s [%s GENERATION=1]" % (issue_num, title, tag),
-           "--body", "GitHub issue #%d (%s) — %s\n%s GENERATION=1"
-                      % (issue_num, title, url, tag),
+           "--body", card_body,
            "--assignee", assignee,
            "--workspace", workspace,
            "--idempotency-key", "gh-issue-%d-%s" % (issue_num, tag.lower())]
