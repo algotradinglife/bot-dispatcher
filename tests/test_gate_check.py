@@ -35,14 +35,15 @@ class FakeGh:
 
 
 def test_gate_for_pr_no_closing():
-    """无 closing issue → success (docs/CI-only, 不阻断)."""
+    """无 closing issue → failure (治理契约, 不显示绿)."""
     pr = json.dumps({"headRefOid": "a" * 40, "title": "docs: x",
                      "closingIssuesReferences": [], "state": "OPEN"})
     fake = FakeGh([pr])
     with mock.patch.object(gate_check, "_gh", fake):
-        c, t, s = gate_check.gate_for_pr("r", 5)
-    assert c == "success"
-    assert "no linked issue" in t
+        c, t, s, head = gate_check.gate_for_pr("r", 5)
+    assert c == "failure"
+    assert "no closing issue" in t
+    assert head == "a" * 40
 
 
 def test_gate_for_pr_closing_fail():
@@ -56,7 +57,7 @@ def test_gate_for_pr_closing_fail():
         # 同时 mock pi_gates._gh (check_pi_gates 内部用)
         import pi_gates
         with mock.patch.object(pi_gates, "_gh", FakeGh([None] * 20)):
-            c, t, s = gate_check.gate_for_pr("r", 5)
+            c, t, s, head = gate_check.gate_for_pr("r", 5)
     assert c == "failure"
 
 
@@ -75,12 +76,31 @@ def test_publish_checkrun():
 
 
 def test_scan_publish():
-    prs = json.dumps([{"number": 5, "headRefOid": "a" * 40}])
+    prs = json.dumps([{"number": 5, "headRefOid": "a" * 40,
+                       "updatedAt": "2026-08-11T00:00:00Z"}])
     pr_detail = json.dumps({"headRefOid": "a" * 40, "title": "t",
                             "closingIssuesReferences": [], "state": "OPEN"})
     fake = FakeGh([prs, pr_detail, json.dumps({"id": 1})])
     with mock.patch.object(gate_check, "_gh", fake):
-        # 无 closing issue → gate_for_pr 直接返回, 不调 check_pi_gates
-        out = gate_check.scan_and_publish("r")
+        out = gate_check.scan_and_publish("r", limit=5)
     assert out[0]["pr"] == 5
-    assert out[0]["conclusion"] == "success"
+    assert out[0]["conclusion"] == "failure"  # 无 closing issue
+    assert out[0]["head"] == "a" * 12
+
+
+def test_fetch_comments_meta_array():
+    """P0: jq 输出为数组 [ {a,t,b} ] — 多评论正确解析."""
+    import pi_gates
+    meta_json = json.dumps([
+        {"a": "everything-bot-engineer", "t": "2026-08-11T03:47:12Z",
+         "b": "[EV-VERDICT]\nauditor=x\nsha=abc\nverdict=PASS\n[/EV-VERDICT]"},
+        {"a": "hh1985", "t": "2026-08-11T04:00:00Z",
+         "b": "[ADVERSARIAL] baseline=pass"},
+    ])
+    fake = FakeGh([meta_json])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        out = pi_gates._fetch_comments_meta("r", 1, None)
+    assert len(out) == 2
+    assert out[0]["author"] == "everything-bot-engineer"
+    assert out[1]["author"] == "hh1985"
+    assert "EV-VERDICT" in out[0]["body"]

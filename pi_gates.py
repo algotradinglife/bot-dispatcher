@@ -70,15 +70,18 @@ def _fetch_comments_meta(repo, issue_num, pr_num):
     if pr_num:
         views.append(["pr", "view", str(pr_num)])
     for view in views:
+        # P0: jq 输出必须包成数组 [ ... ] — 否则多行对象 json.loads 失败
         r = _gh(view + ["--repo", repo, "--json", "comments",
-                        "--jq", ".comments[] | {a: .author.login, t: .createdAt, b: .body}"])
+                        "--jq", "[.comments[] | {a: .author.login, t: .createdAt, b: .body}]"])
         if r.returncode != 0:
             continue
         try:
             items = json.loads(r.stdout)
         except Exception:
             items = []
-        for it in items if isinstance(items, list) else [items]:
+        if not isinstance(items, list):
+            items = [items]
+        for it in items:
             out.append({
                 "author": (it.get("a") or "").lower(),
                 "created_at": it.get("t") or "",
