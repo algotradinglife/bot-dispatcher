@@ -139,30 +139,97 @@ def test_g02_no_req_remind():
 
 
 # ── G03 ──
-# 调用序: G01 graph, G02 body, G02 comments, G03 pr, G03 comments
+# 调用序: G01 graph, G02 body, G02 comments, G03 pr(head_before),
+#         G03 issue comments, G03 pr comments
 
-def test_g03_pass_sha_matches_head():
+def _ev_block(sha="5622a4091378abc" + "0" * 27,
+              auditor="everything-bot-engineer",
+              verdict="PASS",
+              ts="2026-08-11T03:47:12Z"):
+    return ("[EV-VERDICT]\n"
+            "auditor=%s\nsha=%s\nverdict=%s\ntimestamp=%s\n[/EV-VERDICT]"
+            % (auditor, sha, verdict, ts))
+
+
+def test_g03_pass_structured():
+    """结构化 EV-VERDICT: 完整 SHA + 可信 auditor + 匹配 HEAD → PASS."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   _pr_ok(), "AUDITED_SHA=5622a4091378"])
+                   _pr_ok(), _ev_block(), ""])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
     assert res["G03"][0] == "PASS"
 
 
-def test_g03_fail_stale_sha():
+def test_g03_fail_short_sha():
+    """SHA 不足 40 位 → FAIL (不完整 SHA)."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   _pr_ok(), "AUDITED_SHA=deadbeef0000"])
+                   _pr_ok(), _ev_block(sha="5622a4091378"), ""])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
     assert res["G03"][0] == "FAIL"
+
+
+def test_g03_fail_untrusted_auditor():
+    """auditor 不在可信列表 → FAIL."""
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   _pr_ok(),
+                   _ev_block(auditor="unknown-account"), ""])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
+    assert res["G03"][0] == "FAIL"
+
+
+def test_g03_fail_stale_sha():
+    """结构化 SHA 与 HEAD 不一致 → FAIL (stale)."""
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   _pr_ok(),
+                   _ev_block(sha="deadbeef" * 5), ""])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
+    assert res["G03"][0] == "FAIL"
+
+
+def test_g03_time_order():
+    """全局时间序: 两个 PASS, 取 timestamp 最新的 — 旧 PASS 不覆盖新 PASS."""
+    old = _ev_block(ts="2026-08-11T00:11:42Z",
+                    sha="deadbeef" * 5)  # 旧 PASS: sha 不匹配 HEAD
+    new = _ev_block(ts="2026-08-11T03:47:12Z")  # 新 PASS: sha 匹配 HEAD
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   _pr_ok(), old + "\n" + new, ""])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
+    # 最新 PASS 的 sha 匹配 HEAD → PASS (不被旧 PASS 干扰)
+    assert res["G03"][0] == "PASS"
+
+
+def test_g03_time_order_reverse():
+    """反序: 新 PASS 在前文本位置, 旧 PASS 在后 — 仍取 timestamp 最新."""
+    old = _ev_block(ts="2026-08-11T00:11:42Z",
+                    sha="deadbeef" * 5)  # 旧 PASS: 不匹配 HEAD
+    new = _ev_block(ts="2026-08-11T03:47:12Z")  # 新 PASS: 匹配 HEAD
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   _pr_ok(), new + "\n" + old, ""])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
+    assert res["G03"][0] == "PASS"
 
 
 def test_g03_fail_no_sha():
+    """无 EV-VERDICT 也无 legacy AUDITED_SHA → FAIL."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   _pr_ok(), "no audited sha"])
+                   _pr_ok(), "no verdict", ""])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
     assert res["G03"][0] == "FAIL"
+
+
+def test_parse_ev_verdicts():
+    text = ("[EV-VERDICT]\nauditor=a\nsha=111\nverdict=PASS\ntimestamp=T1\n"
+            "[/EV-VERDICT]\n[EV-VERDICT]\nauditor=b\nsha=222\nverdict=REJECT"
+            "\ntimestamp=T2\n[/EV-VERDICT]")
+    vs = pi_gates.parse_ev_verdicts(text)
+    assert len(vs) == 2
+    assert vs[0]["sha"] == "111" and vs[1]["verdict"] == "REJECT"
 
 
 # ── G04 ──

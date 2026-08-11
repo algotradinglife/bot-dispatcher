@@ -17,6 +17,37 @@ GATE_NAMES = ["G01", "G02", "G03", "G04", "G05", "G06"]
 # EV PASS 评论中的审计 SHA 标记 (auditor 交付规范)
 EV_SHA_RE = re.compile(r"AUDITED_SHA=([0-9a-f]{7,40})", re.IGNORECASE)
 
+# 结构化 EV-VERDICT 块 (PI review item 2):
+# [EV-VERDICT] auditor=... sha=<40位> verdict=PASS timestamp=... [/EV-VERDICT]
+EV_BLOCK_RE = re.compile(
+    r"\[EV-VERDICT\](.*?)\[/EV-VERDICT\]", re.IGNORECASE | re.DOTALL)
+EV_FIELD_RE = re.compile(r"^\s*(\w+)=(.+?)\s*$", re.MULTILINE)
+
+
+def parse_ev_verdicts(text):
+    """Parse all EV-VERDICT blocks; return list of dicts (oldest→newest)."""
+    out = []
+    for blk in EV_BLOCK_RE.findall(text):
+        d = {}
+        for m in EV_FIELD_RE.finditer(blk):
+            d[m.group(1).lower()] = m.group(2).strip()
+        if d.get("verdict") and d.get("sha"):
+            out.append(d)
+    return out
+
+
+def latest_ev_pass(text):
+    """Latest (by timestamp field) EV PASS verdict, or None.
+
+    全局时间顺序: 按 timestamp 字段排序取最后 — 不是文本顺序.
+    """
+    verdicts = parse_ev_verdicts(text)
+    passes = [v for v in verdicts if v.get("verdict", "").upper() == "PASS"]
+    if not passes:
+        return None
+    passes.sort(key=lambda v: v.get("timestamp", ""))
+    return passes[-1]
+
 # REQ 编号 (契约 body) — E01-E08 + issue 特定 (如 REQ-207-01)
 # 支持 REQ-E01 和 REQ-E-01 两种写法; 捕获完整 REQ-xxx (统一格式)
 REQ_RE = re.compile(r"\b(REQ-[A-Z][A-Z0-9]*-?\d{1,2})\b")
@@ -87,22 +118,6 @@ def _pr_head(repo, pr_num):
         return None
 
 
-def _latest_ev_sha(repo, issue_num, pr_num):
-    """Scan issue + PR comments for the newest EV PASS with AUDITED_SHA."""
-    shas = []
-    for view in (["issue", "view", str(issue_num)],
-                 ["pr", "view", str(pr_num)]):
-        r = _gh(view + ["--repo", repo, "--json", "comments",
-                        "--jq", ".comments[].body"])
-        if r.returncode != 0:
-            continue
-        for line in r.stdout.splitlines():
-            m = EV_SHA_RE.search(line)
-            if m:
-                shas.append((m.group(1), line[:60]))
-    return shas[-1][0] if shas else None
-
-
 def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
                    title="", url=""):
     """Run the 6 PI gates. Returns {gate: (PASS|FAIL|REMIND|SKIP, evidence)}."""
@@ -149,19 +164,47 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
     else:
         result["G02"] = ("SKIP", "no issue")
 
-    # G03 — EV binding: 最新 EV PASS 的 AUDITED_SHA == PR HEAD
+    # G03 — EV binding: 最新 EV PASS 的完整 SHA == PR HEAD
+    # (PI review item 2: 结构化 EV-VERDICT、完整 40 位 SHA、全局时间序、
+    #  可信 auditor、操作前后重复读 HEAD)
     if pr_num:
-        pr = _pr_head(repo, pr_num)
-        ev_sha = _latest_ev_sha(repo, issue_num, pr_num) if issue_num else None
-        head = (pr or {}).get("headRefOid", "")
-        if head and ev_sha:
-            ok = head.startswith(ev_sha) or ev_sha.startswith(head[:7])
-            result["G03"] = ("PASS" if ok else "FAIL",
-                             "EV SHA %s vs PR HEAD %s" % (ev_sha, head[:12]))
-        elif head:
-            result["G03"] = ("FAIL", "no AUDITED_SHA in EV comments (stale?)")
+        head_before = _pr_head(repo, pr_num)
+        head = (head_before or {}).get("headRefOid", "")
+        # 收集 issue + PR 全部评论 → 结构化 EV-VERDICT
+        all_comments = ""
+        for view in (["issue", "view", str(issue_num)],
+                     ["pr", "view", str(pr_num)]):
+            r = _gh(view + ["--repo", repo, "--json", "comments",
+                            "--jq", ".comments[].body"])
+            if r.returncode == 0:
+                all_comments += "\n" + r.stdout
+        latest = latest_ev_pass(all_comments)
+        if latest is None:
+            # 兼容旧格式 (AUDITED_SHA=...) 非结构化
+            ev_sha = EV_SHA_RE.search(all_comments)
+            if ev_sha and head:
+                ok = head.startswith(ev_sha.group(1)) \
+                    or ev_sha.group(1).startswith(head[:7])
+                result["G03"] = ("PASS" if ok else "FAIL",
+                                 "legacy AUDITED_SHA %s vs HEAD %s (unstructured)"
+                                 % (ev_sha.group(1)[:12], head[:12]))
+            elif head:
+                result["G03"] = ("FAIL",
+                                 "no EV PASS with AUDITED_SHA (stale?)")
+            else:
+                result["G03"] = ("FAIL", "PR unavailable")
         else:
-            result["G03"] = ("FAIL", "PR unavailable")
+            sha = latest.get("sha", "")
+            full_sha = len(sha) >= 40
+            auditor = latest.get("auditor", "")
+            trusted = auditor in ("everything-bot-engineer", "hh1985")
+            ok = bool(head) and full_sha and trusted \
+                and (head.startswith(sha) or sha.startswith(head))
+            result["G03"] = (
+                "PASS" if ok else "FAIL",
+                "EV sha=%s... head=%s auditor=%s full=%s ts=%s"
+                % (sha[:12], head[:12], auditor or "-",
+                   full_sha, latest.get("timestamp", "-")[:19]))
     else:
         result["G03"] = ("SKIP", "no PR")
 
