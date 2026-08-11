@@ -50,10 +50,13 @@ def test_gate_for_pr_closing_fail():
     pr = json.dumps({"headRefOid": "a" * 40, "title": "feat: x",
                      "closingIssuesReferences": [{"number": 1}],
                      "state": "OPEN"})
-    # check_pi_gates 会调用很多 gh — 全返回失败 → G01 FAIL
+    # gate_for_pr 的 pr view + check_pi_gates 内部多个 gh 调用
     fake = FakeGh([pr, None, None, None, None, None, None, None, None])
     with mock.patch.object(gate_check, "_gh", fake):
-        c, t, s = gate_check.gate_for_pr("r", 5)
+        # 同时 mock pi_gates._gh (check_pi_gates 内部用)
+        import pi_gates
+        with mock.patch.object(pi_gates, "_gh", FakeGh([None] * 20)):
+            c, t, s = gate_check.gate_for_pr("r", 5)
     assert c == "failure"
 
 
@@ -77,6 +80,7 @@ def test_scan_publish():
                             "closingIssuesReferences": [], "state": "OPEN"})
     fake = FakeGh([prs, pr_detail, json.dumps({"id": 1})])
     with mock.patch.object(gate_check, "_gh", fake):
+        # 无 closing issue → gate_for_pr 直接返回, 不调 check_pi_gates
         out = gate_check.scan_and_publish("r")
     assert out[0]["pr"] == 5
     assert out[0]["conclusion"] == "success"
