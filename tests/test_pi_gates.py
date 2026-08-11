@@ -153,10 +153,19 @@ def test_g02_req_missing_evidence():
 
 
 def test_g02_no_req_remind():
+    """非 merge 操作: 无 REQ = REMIND."""
     fake = FakeGh([_graph_ok(), "no req here", ""])
     with mock.patch.object(pi_gates, "_gh", fake):
-        res = pi_gates.check_pi_gates("r", issue_num=1)
+        res = pi_gates.check_pi_gates("r", issue_num=1, operation="check")
     assert res["G02"][0] == "REMIND"
+
+
+def test_g02_no_req_fail_on_merge():
+    """merge 操作: 无 REQ = FAIL (P1-1, 不能 REMIND 跳过)."""
+    fake = FakeGh([_graph_ok(), "no req here", ""])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, operation="merge")
+    assert res["G02"][0] == "FAIL"
 
 
 # ── G03 ──
@@ -300,23 +309,42 @@ def test_g04_structured_marker():
 
 
 def test_g04_invalid_marker_remind():
-    """[ADVERSARIAL] hello (无键值对) → REMIND."""
+    """[ADVERSARIAL] hello (无键值对) → 非 merge 时 REMIND."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
                    _comments_json(["[ADVERSARIAL] hello"],
                                   authors=["hh1985"])])
     with mock.patch.object(pi_gates, "_gh", fake):
-        res = pi_gates.check_pi_gates("r", issue_num=1)
+        res = pi_gates.check_pi_gates("r", issue_num=1, operation="check")
     assert res["G04"][0] == "REMIND"
 
 
 def test_g04_non_pi_author_remind():
-    """非 PI 评论的对抗标记 → REMIND (P1-B 作者验证)."""
+    """非 PI 评论的对抗标记 → 非 merge 时 REMIND (P1-B 作者验证)."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
                    _comments_json(["[ADVERSARIAL] baseline=pass"],
                                   authors=["attacker-account"])])
     with mock.patch.object(pi_gates, "_gh", fake):
-        res = pi_gates.check_pi_gates("r", issue_num=1)
+        res = pi_gates.check_pi_gates("r", issue_num=1, operation="check")
     assert res["G04"][0] == "REMIND"
+
+
+def test_g04_no_receipt_fail_on_merge():
+    """merge 操作: 无 PI receipt = FAIL (P1-1)."""
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   _comments_json(["no adversarial"], authors=["hh1985"])])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, operation="merge")
+    assert res["G04"][0] == "FAIL"
+
+
+def test_g04_fail_value_blocks():
+    """baseline=fail → FAIL (P1-2: fail/no 必须阻断)."""
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   _comments_json(["[ADVERSARIAL] baseline=fail leak=pass"],
+                                  authors=["hh1985"])])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, operation="merge")
+    assert res["G04"][0] == "FAIL"
 
 
 # ── G05 ──

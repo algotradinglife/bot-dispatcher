@@ -242,8 +242,10 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
                         delivered_reqs.add(m.group(1))
         missing = [r for r in contract_reqs if r not in delivered_reqs]
         if not contract_reqs:
-            result["G02"] = ("REMIND",
-                             "no REQ referenced (template E01-E08 recommended)")
+            # P1-1: merge 操作中, 无 REQ 引用 = FAIL (不能 REMIND 跳过)
+            result["G02"] = (
+                "FAIL" if operation == "merge" else "REMIND",
+                "no REQ referenced (template E01-E08 required for merge)")
         elif missing:
             result["G02"] = ("FAIL",
                              "REQ missing evidence: %s" % ",".join(missing))
@@ -288,27 +290,36 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
         result["G03"] = ("SKIP", "no PR")
 
     # G04 — Adversarial: PI 终审评论的 [ADVERSARIAL] 结构化标记
-    # P1-7: 标记必须含有效键值 (baseline=/leak=/selection=/overfit=)
-    # P1-B: 必须是 PI (hh1985) 的真实评论 — 验证 comment author
+    # P1-2: 解析键值结果 — 仅允许 pass/checked/n-a; fail/no 必须阻断
     if issue_num:
-        # 用带元数据的评论获取 — 验证作者
         meta = _fetch_comments_meta(repo, issue_num, None)
-        valid_markers = []
+        ALLOWED = ("pass", "checked", "n-a", "na", "n/a", "ok", "yes")
+        verdicts = []  # (created_at, summary)
         for cm in meta:
             if cm["author"] not in ("hh1985",):
                 continue  # 只信 PI 的评论
             for m in ADVERSARIAL_RE.findall(cm["body"]):
-                if re.search(r"\b(baseline|leak|selection|overfit|confound|robust)"
-                             r"\s*=\s*\S+", m, re.IGNORECASE):
-                    valid_markers.append((cm["created_at"][:19], m.strip()[:30]))
-        if valid_markers:
-            # 取最新的 PI 对抗标记
-            valid_markers.sort()
-            latest_marker = valid_markers[-1]
-            result["G04"] = ("PASS",
-                             "PI adversarial @%s: %s" % latest_marker)
+                kvs = re.findall(
+                    r"\b(baseline|leak|selection|overfit|confound|robust)"
+                    r"\s*=\s*(\S+)", m, re.IGNORECASE)
+                if not kvs:
+                    continue
+                bad = [k.lower() for k, v in kvs
+                       if v.lower() not in ALLOWED]
+                if bad:
+                    verdicts.append((cm["created_at"][:19],
+                                     ("FAIL", "blocked: %s" % ",".join(bad))))
+                else:
+                    verdicts.append((cm["created_at"][:19], ("PASS", "ok")))
+        if verdicts:
+            verdicts.sort()
+            ts, (status, detail) = verdicts[-1]  # 最新
+            result["G04"] = (status, "PI adversarial @%s: %s" % (ts, detail))
         else:
-            result["G04"] = ("REMIND", "no PI structured adversarial evidence")
+            # P1-1: merge 操作中, 无 PI receipt = FAIL
+            result["G04"] = (
+                "FAIL" if operation == "merge" else "REMIND",
+                "no PI structured adversarial evidence (required for merge)")
     else:
         result["G04"] = ("SKIP", "no issue")
 
