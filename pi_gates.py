@@ -46,7 +46,8 @@ def _issue_graph(repo, issue_num):
         "blocked_by": _nums("blockedBy"),
         "blocking": _nums("blocking"),
         "parent": (d.get("parent") or {}).get("number"),
-        "assignees": [a.get("login") for a in d.get("assignees", [])],
+        "assignees": [a.get("login") if isinstance(a, dict) else a
+                      for a in d.get("assignees", [])],
     }
 
 
