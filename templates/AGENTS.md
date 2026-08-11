@@ -10,6 +10,8 @@ kanban 是执行态（工作卡），单向映射、不双写。
 **PI → worker → EV → PI review + merge → roadmap update**
 
 1. PI 开 Issue（含验收标准）→ 加入 Project → 置 `Ready`
+   - **验收标准按 REQ 编号**（`REQ-template.md` 通用条款 E01-E08 +
+     issue 特定条款）— 每条可执行验证，worker 交付逐条对照，EV 按 REQ verdict
 2. dispatcher（cron）检测 → kanban 建卡（幂等于 issue 号）
 3. 唯一 owner worker（researcher/engineer 二选一）执行 → 完成卡 →
    提交证据 PR（body 含 `Closes #N`）

@@ -1,0 +1,103 @@
+# REQ 模板 — 通用可执行验收条款（跨 issue 复用）
+
+> 用途：PI 开 issue 时，把验收标准编号为 REQ（每条可执行验证）。
+> worker 交付时逐条对照（REQ → evidence），EV 按 REQ 编号 verdict。
+> 通用条款（本文）跨 issue 复用；issue 特定条款在契约中补充。
+>
+> 来源：2026-08-11 复盘（#205/#206 返工缺陷提炼）+ codex 审核。
+> 核心原则：REQ 必须"能跑命令验证"，空话不写；类别按失败频次排序。
+
+## REQ-E01 — Clean-run 命令可执行（#205-①、#206-① 教训）
+
+**条款**：README/契约中所有文档化命令（notebook 执行、verify、replay）必须
+在**干净 checkout**（无 data/、无 .venv、无 worktree 残留）中逐字执行成功。
+
+**验证**：
+```bash
+git clean -fdx && git checkout <HEAD>
+# 按 README 逐字执行每个文档化命令（含路径、环境、参数）
+# 每条命令必须 exit 0
+```
+**对抗测试**：notebook 执行用 `--kernel python3`（安装的 kernelspec），
+不得依赖自定义/未注册内核名；模块导入不得依赖隐式仓库根路径。
+
+## REQ-E02 — 输入 fail-fast（#205-②、#206-② 教训）
+
+**条款**：所有读入（panel/矩阵/ticket 源）必须对 malformed 数据**显式失败**，
+不得静默归一化/丢弃/截断。校验项：finite、严格正、simplex 和=1（容差显式）、
+唯一键（issue/match/split/model/seed）、最小规模（如 M≥7 或显式 NO_BET）。
+
+**验证**：对抗测试覆盖 NaN/Inf/零概率/非归一化行/重复键/空输入/少场次 —
+每条必须显式抛错或走显式 NO_BET 路径，且有 exclusion ledger（若契约允许排除）。
+
+## REQ-E03 — 依赖与环境锁定（#205-④ 教训）
+
+**条款**：`requirements.txt` 必须精确版本（`==`，无 `>=`）；科学依赖实测版本
+与 provenance 记录一致；replay 命令绑定 requirements 的 SHA-256。
+
+**验证**：fresh venv 从提交 requirements 安装 → `pip freeze` 关键包版本
+== provenance 记录 → replay 产出与提交 manifest byte-identical。
+
+## REQ-E04 — 原子写与异常清理（#205-③ 教训）
+
+**条款**：所有持久化（notebook、artifact、JSON/Markdown）用同目录临时文件 +
+`flush/fsync` + `os.replace`；异常时显式递归清理；输出已存在则 fail-closed
+（不覆盖 immutable package）。
+
+**验证**：中断写入测试（kill -9 模拟）→ 原内容不变、无半文件；异常路径
+清理测试通过。
+
+## REQ-E05 — 证据链三层完整（契约硬性）
+
+**条款**：交付含 ① 可执行 notebook（clean-run）② 可复用代码（package-first）
+③ 生成工件（机器可读 + 图 + decision report + schema + trace + provenance
++ SHA256 manifest）。
+
+**验证**：`verify` 命令 18/18 payloads（或契约数量）→ manifest SHA-256
+与提交一致 → 独立 replay 到新目录 byte-identical。
+
+## REQ-E06 — 无泄漏与溯源（#206-03~05 教训）
+
+**条款**：标签/事后信息不得进入特征/选择/结算（如 final-SP 仅输出通道）；
+每 ticket 的 source trace 必须绑定回冻结源矩阵（cell 级）；不确定性/概率/
+SP 输入可溯源。
+
+**验证**：极端改写标签值 → 全链路 byte-identical（无泄漏）；semantic verifier
+拒绝伪造/不匹配的 source trace；OOD fallback 显式。
+
+## REQ-E07 — 科学结论边界（PI 层，防过度外推）
+
+**条款**：结论必须严格限定在契约范围（候选池/特征/方法）；"X 没进步"≠
+"Y 是答案"；对照 vs 实验通道命名不混淆（control_/experimental_ 前缀）；
+未晋级结果必须标 source grade + promoted=false + confirmation dependency。
+
+**验证**：decision report 的结论与契约 scope 逐句对照；命名约定检查。
+
+## REQ-E08 — 交接块（返工上下文连续性）
+
+**条款**：交付评论含 `[SESSION] <session_id>` + HANDOFF 摘要（HEAD/已完成/
+关键决策/已知问题/下一步）+ 状态指令。
+
+**验证**：评论含三要素；RESUME_SESSION 注入后返工 run 可 --resume 续接。
+
+---
+
+## Worker 交付对照表格式
+
+```markdown
+| REQ | 证据 | 状态 |
+|-----|------|------|
+| E01 | notebooks/research/issue-N/…（clean-run 截图/日志）| PASS |
+| E02 | tests/test_…（对抗测试 12 passed）| PASS |
+| … | … | … |
+```
+
+## EV 报告按 REQ verdict 格式
+
+```markdown
+| REQ | EV 验证 | Verdict |
+|-----|---------|---------|
+| E01 | 独立 clean checkout 执行文档命令 | PASS |
+| E02 | 对抗测试重跑 | PASS |
+| … | … | … |
+```
