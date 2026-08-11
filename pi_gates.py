@@ -79,14 +79,14 @@ def _issue_graph(repo, issue_num):
     except Exception:
         return None
     projects = [p for p in d.get("projectItems", []) if p.get("status")]
-    # blockedBy/blocking 可能是 dict 或 list (gh 版本差异)
+    # blockedBy/blocking 结构: list / dict / {nodes: [...]} (gh 版本差异)
     def _blockers(field):
         v = d.get(field)
         items = []
         if isinstance(v, list):
             items = v
         elif isinstance(v, dict):
-            items = [v]
+            items = v.get("nodes") if isinstance(v.get("nodes"), list) else [v]
         out = []
         for b in items:
             if not isinstance(b, dict):
