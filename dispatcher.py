@@ -505,10 +505,12 @@ def main():
     # ── PI-GATE G05: 合并后对账 (独立段 — 每次 tick 都对已 merged 的
     #    PR 跑对账; P0-4: 不在首次 merged 检测内, 避免 prev_m==merged
     #    continue 导致 G05 只跑一次). 去重限频 (PI review item 5):
-    #    同一 PR 的同一缺失项 G05_DEDUP_HOURS 内只报警一次. ──
+    #    同一 PR 的同一缺失项 G05_DEDUP_HOURS 内只报警一次.
+    #    P0-D: 用轻量 check_g05_only (单 issue 查询) 避免 API 限流.
+    #    P1-D: 对 PR 的【所有】closing issues 对账 (不只第一个). ──
     G05_DEDUP_HOURS = 24
     try:
-        from pi_gates import check_pi_gates
+        from pi_gates import check_g05_only
         mrun2 = subprocess.run(
             ["gh", "pr", "list", "--repo", repo, "--state", "merged",
              "--limit", "15", "--json", "number"],
@@ -522,21 +524,19 @@ def main():
                      "--jq", ".closingIssuesReferences[].number"],
                     capture_output=True, text=True, timeout=15)
                 linked = [int(x) for x in lr.stdout.split() if x.strip()]
-                for li in linked[:1]:  # 只对第一个关联 issue 对账
-                    res = check_pi_gates(repo, issue_num=li, pr_num=pn,
-                                         operation="merge-reconcile")
-                    g05 = res.get("G05", ("SKIP", ""))
+                for li in linked:  # P1-D: 所有 closing issues
+                    g05 = check_g05_only(repo, li)
                     if g05[0] in ("REMIND", "FAIL"):
                         item = g05[1][:60]
-                        dedup_key = "g05:%d:%s" % (pn, item)
+                        dedup_key = "g05:%d:%d:%s" % (pn, li, item)
                         now_ts = time.time()
                         prev_ts = prev_state.get(dedup_key) or new_state.get(dedup_key)
                         if prev_ts and (now_ts - float(prev_ts)) < G05_DEDUP_HOURS * 3600:
                             continue  # 已报警过, 限频跳过
                         icon = "⚠️" if g05[0] == "REMIND" else "⛔"
                         output["warnings"].append(
-                            "%s %s PI-GATE G05: PR #%d merged 后对账 — %s"
-                            % (prefix, icon, pn, g05[1][:80]))
+                            "%s %s PI-GATE G05: PR #%d issue #%d 对账 — %s"
+                            % (prefix, icon, pn, li, g05[1][:70]))
                         new_state[dedup_key] = str(now_ts)
     except Exception as e:
         output["warnings"].append(

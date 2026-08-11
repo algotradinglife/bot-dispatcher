@@ -10,6 +10,7 @@ Design: docs/PI-GATE.md (2026-08-11, PI self-proposed).
 import json
 import re
 import subprocess
+import sys
 import time
 
 GATE_NAMES = ["G01", "G02", "G03", "G04", "G05", "G06"]
@@ -62,11 +63,13 @@ def _fetch_comments_meta(repo, issue_num, pr_num):
     """Fetch comments with REAL author.login + createdAt (P0-2).
 
     不信任正文自报的 auditor=/timestamp= — 读取 GitHub comment 的真实
-    元数据. 返回 [{author, created_at, body}] (issue 评论在前).
+    元数据. 返回 [{author, created_at, body}]. pr_num=None 时只查 issue.
     """
     out = []
-    for view in (["issue", "view", str(issue_num)],
-                 ["pr", "view", str(pr_num)]):
+    views = [["issue", "view", str(issue_num)]]
+    if pr_num:
+        views.append(["pr", "view", str(pr_num)])
+    for view in views:
         r = _gh(view + ["--repo", repo, "--json", "comments",
                         "--jq", ".comments[] | {a: .author.login, t: .createdAt, b: .body}"])
         if r.returncode != 0:
@@ -177,6 +180,28 @@ def _pr_head(repo, pr_num):
         return None
 
 
+def check_g05_only(repo, issue_num):
+    """轻量 G05 对账 (P0-D): 单次 issue 查询, 不跑完整 gate.
+
+    Returns ("PASS"|"REMIND"|"FAIL", evidence). dispatcher 用它替代
+    完整 check_pi_gates — 避免每分钟 ~150 次 gh 调用触发 API 限流.
+    """
+    r = _gh(["issue", "view", str(issue_num), "--repo", repo,
+             "--json", "state,projectItems"])
+    if r.returncode != 0:
+        return ("FAIL", "issue unavailable")
+    try:
+        d = json.loads(r.stdout)
+    except Exception:
+        return ("FAIL", "issue unavailable")
+    closed = d.get("state") == "CLOSED"
+    done = any((p.get("status") or {}).get("name") == "Done"
+               for p in d.get("projectItems", []))
+    if closed and done:
+        return ("PASS", "issue closed=True project Done=True")
+    return ("REMIND", "issue closed=%s project Done=%s" % (closed, done))
+
+
 def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
                    title="", url=""):
     """Run the 6 PI gates. Returns {gate: (PASS|FAIL|REMIND|SKIP, evidence)}."""
@@ -210,8 +235,10 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
             for line in r2.stdout.splitlines():
                 m = REQ_ROW_RE.match(line.strip())
                 if m:
-                    # P1-6: 交付表行必须带 PASS 才算覆盖 (FAIL/N/A/空不算)
-                    if "PASS" in line.upper():
+                    # P1-A: 解析 Markdown 列, 要求【最终状态列】== PASS
+                    # (| REQ-E01 | evidence | FAIL | 不算; not PASS 不算)
+                    cols = [c.strip().upper() for c in line.strip().strip("|").split("|")]
+                    if cols and cols[-1] == "PASS":
                         delivered_reqs.add(m.group(1))
         missing = [r for r in contract_reqs if r not in delivered_reqs]
         if not contract_reqs:
@@ -227,42 +254,29 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
         result["G02"] = ("SKIP", "no issue")
 
     # G03 — EV binding: 最新 EV PASS 的完整 SHA == PR HEAD
-    # (P0-1: later REJECT 拒绝; P0-2: 真实 author/createdAt; P0-3: HEAD
-    #  前后两次读取防竞态; 41 位 SHA 拒绝)
+    # (P0-A: HEAD 两次读取都必须成功且相等 — fail-closed;
+    #  P0-B: 结构化契约已启用, 删除 legacy AUDITED_SHA fallback)
     if pr_num:
         head_before = _pr_head(repo, pr_num)
         head = (head_before or {}).get("headRefOid", "")
         comments_meta = _fetch_comments_meta(repo, issue_num, pr_num)
         latest = latest_ev_pass_meta(comments_meta)
-        # P0-3: 操作后重复读 HEAD — 审计与读取之间被 push 则检测
+        # P0-A: fail-closed — 两次读取都必须成功且相等
         head_after = _pr_head(repo, pr_num)
         head_after_val = (head_after or {}).get("headRefOid", "")
-        head_stable = (not head) or (not head_after_val) or head == head_after_val
+        head_stable = bool(head) and bool(head_after_val) \
+            and head == head_after_val
 
         if latest is None:
-            # 兼容旧格式 (AUDITED_SHA=...) 非结构化 — 但仅当真实作者可信
-            legacy = None
-            for cm in comments_meta:
-                if cm["author"] in TRUSTED_AUDITORS:
-                    m = EV_SHA_RE.search(cm["body"])
-                    if m:
-                        legacy = m.group(1)
-            if legacy and head and head_stable:
-                ok = head == legacy or legacy == head
-                result["G03"] = ("PASS" if ok else "FAIL",
-                                 "legacy AUDITED_SHA %s vs HEAD %s (unstructured)"
-                                 % (legacy[:12], head[:12]))
-            elif head:
-                result["G03"] = ("FAIL",
-                                 "no trusted EV PASS with AUDITED_SHA (stale?)")
-            else:
-                result["G03"] = ("FAIL", "PR unavailable")
+            # P0-B: 结构化契约已启用, 无 legacy fallback
+            result["G03"] = ("FAIL",
+                             "no trusted structured EV PASS (EV-VERDICT required)")
         else:
             sha = latest.get("sha", "")
-            # P0: 只接受正则严格匹配的完整 40 位 SHA, 用 == (41 位拒绝)
+            # 只接受正则严格匹配的完整 40 位 SHA, 用 ==
             full_sha = bool(re.fullmatch(r"[0-9a-f]{40}", sha))
             auditor = latest.get("_author", "")
-            ok = bool(head) and head_stable and full_sha \
+            ok = head_stable and full_sha \
                 and head == sha and auditor in TRUSTED_AUDITORS
             result["G03"] = (
                 "PASS" if ok else "FAIL",
@@ -274,24 +288,27 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
         result["G03"] = ("SKIP", "no PR")
 
     # G04 — Adversarial: PI 终审评论的 [ADVERSARIAL] 结构化标记
-    # P1-7: 标记必须含有效键值 (baseline=/leak=/selection=/overfit=),
-    # [ADVERSARIAL] hello 或普通评论含 baseline 不再直接 PASS.
+    # P1-7: 标记必须含有效键值 (baseline=/leak=/selection=/overfit=)
+    # P1-B: 必须是 PI (hh1985) 的真实评论 — 验证 comment author
     if issue_num:
-        r = _gh(["issue", "view", str(issue_num), "--repo", repo,
-                 "--json", "comments", "--jq", ".comments[].body"])
-        comments = r.stdout if r.returncode == 0 else ""
-        markers = ADVERSARIAL_RE.findall(comments)
+        # 用带元数据的评论获取 — 验证作者
+        meta = _fetch_comments_meta(repo, issue_num, None)
         valid_markers = []
-        for m in markers:
-            # 要求含至少一个 键=值 对 (key=pass|fail|checked|yes|no|...)
-            if re.search(r"\b(baseline|leak|selection|overfit|confound|robust)"
-                         r"\s*=\s*\S+", m, re.IGNORECASE):
-                valid_markers.append(m.strip()[:40])
+        for cm in meta:
+            if cm["author"] not in ("hh1985",):
+                continue  # 只信 PI 的评论
+            for m in ADVERSARIAL_RE.findall(cm["body"]):
+                if re.search(r"\b(baseline|leak|selection|overfit|confound|robust)"
+                             r"\s*=\s*\S+", m, re.IGNORECASE):
+                    valid_markers.append((cm["created_at"][:19], m.strip()[:30]))
         if valid_markers:
+            # 取最新的 PI 对抗标记
+            valid_markers.sort()
+            latest_marker = valid_markers[-1]
             result["G04"] = ("PASS",
-                             "adversarial markers: %s" % "; ".join(valid_markers))
+                             "PI adversarial @%s: %s" % latest_marker)
         else:
-            result["G04"] = ("REMIND", "no structured adversarial evidence")
+            result["G04"] = ("REMIND", "no PI structured adversarial evidence")
     else:
         result["G04"] = ("SKIP", "no issue")
 
@@ -313,8 +330,8 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
         result["G05"] = ("SKIP", "no issue")
 
     # G06 — Downstream activation: 下游 issue 是否在 PI 授权前置 Ready
-    # P1-8: 只把"Ready 且无 PI [ACTIVATE] receipt"视为 premature —
-    # PI 显式授权 (评论含 [ACTIVATE] issue=<num>) 不算违规.
+    # P1-8: 只把"Ready 且无 PI [ACTIVATE] receipt"视为 premature
+    # P1-C: [ACTIVATE] 必须来自 PI (hh1985) 的真实评论 — 不能伪造
     if graph and graph["blocking"]:
         premature = []
         for child in graph["blocking"]:
@@ -322,19 +339,21 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
             if num is None or not child.get("open"):
                 continue
             r = _gh(["issue", "view", str(num), "--repo", repo,
-                     "--json", "projectItems,comments",
-                     "--jq", "{st: .projectItems[].status.name, c: [.comments[].body]}"])
+                     "--json", "projectItems",
+                     "--jq", ".projectItems[].status.name"])
             if r.returncode != 0:
                 continue
-            try:
-                cd = json.loads(r.stdout)
-            except Exception:
-                continue
-            status = cd.get("st") or ""
-            comments = " ".join(cd.get("c") or [])
-            activated = bool(re.search(
-                r"\[ACTIVATE\]\s*(?:issue\s*[=:]?\s*)?%d\b" % num, comments,
-                re.IGNORECASE))
+            status = r.stdout
+            # [ACTIVATE] receipt: 只信 hh1985 的真实评论 (P1-C)
+            child_meta = _fetch_comments_meta(repo, num, None)
+            activated = False
+            for cm in child_meta:
+                if cm["author"] != "hh1985":
+                    continue
+                if re.search(r"\[ACTIVATE\]\s*(?:issue\s*[=:]?\s*)?%d\b" % num,
+                             cm["body"], re.IGNORECASE):
+                    activated = True
+                    break
             if "Ready" in status and not activated:
                 premature.append(num)
         result["G06"] = ("FAIL" if premature else "PASS",
@@ -392,6 +411,12 @@ if __name__ == "__main__":
     ap.add_argument("--operation", default="merge")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable JSON receipt")
+    ap.add_argument("--exit-on-block", action="store_true",
+                    help="exit non-zero when any gate FAILs (P0-C: live gate)")
     args = ap.parse_args()
     res = check_pi_gates(args.repo, args.issue, args.pr, args.operation)
     print(render_receipt(res, args.operation, as_json=args.json))
+    if args.exit_on_block:
+        blocked = [g for g, (s, _) in res.items() if s == "FAIL"]
+        if blocked:
+            sys.exit(1)
