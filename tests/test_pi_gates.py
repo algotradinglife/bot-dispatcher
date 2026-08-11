@@ -31,8 +31,12 @@ class FakeGh:
         idx = len(self.calls) - 1
         if idx < len(self.responses):
             r = mock.Mock()
-            r.returncode = 0
-            r.stdout = self.responses[idx]
+            if self.responses[idx] is None:
+                r.returncode = 1  # 模拟 gh 失败
+                r.stdout = ""
+            else:
+                r.returncode = 0
+                r.stdout = self.responses[idx]
             r.stderr = ""
             return r
         r = mock.Mock()
@@ -233,10 +237,21 @@ def test_g03_fail_later_reject():
 
 def test_g03_fail_head_changed():
     """HEAD 二次变化 (P0-3): head_before != head_after → FAIL."""
-    head1 = json.dumps({"headRefOid": "5622a4091378abc", "state": "OPEN"})
+    head1 = json.dumps({"headRefOid": "5622a4091378abc" + "0" * 25, "state": "OPEN"})
     head2 = json.dumps({"headRefOid": "deadbeef" + "0" * 33, "state": "OPEN"})
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
                    head1, _comments_json([_ev_block()]), "", head2])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
+    assert res["G03"][0] == "FAIL"
+
+
+def test_g03_fail_head_second_read_error():
+    """P0-A fail-closed: 第二次 HEAD 读取失败 → FAIL (不得判定稳定)."""
+    head1 = json.dumps({"headRefOid": "5622a4091378abc" + "0" * 25, "state": "OPEN"})
+    fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
+                   head1, _comments_json([_ev_block()]), "",
+                   None])  # 第二次读失败 (FakeGh 超限返回 rc=1)
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1, pr_num=5)
     assert res["G03"][0] == "FAIL"
@@ -272,36 +287,41 @@ def test_parse_ev_verdicts():
 
 
 # ── G04 ──
+# 调用序: G01 graph, G02 body, G02 comments, G04 issue comments meta
 
 def test_g04_structured_marker():
-    """[ADVERSARIAL] 结构化标记 (含键值对) → PASS."""
+    """PI (hh1985) 评论含 [ADVERSARIAL] 键值对 → PASS."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   "[ADVERSARIAL] baseline=pass leak=pass"])
+                   _comments_json(["[ADVERSARIAL] baseline=pass leak=pass"],
+                                  authors=["hh1985"])])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
     assert res["G04"][0] == "PASS"
 
 
 def test_g04_invalid_marker_remind():
-    """[ADVERSARIAL] hello (无键值对) → REMIND (P1-7 严格化)."""
+    """[ADVERSARIAL] hello (无键值对) → REMIND."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   "[ADVERSARIAL] hello"])
+                   _comments_json(["[ADVERSARIAL] hello"],
+                                  authors=["hh1985"])])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
     assert res["G04"][0] == "REMIND"
 
 
-def test_g04_keywords_no_longer_pass():
-    """普通评论含 baseline 不再 PASS (P1-7)."""
+def test_g04_non_pi_author_remind():
+    """非 PI 评论的对抗标记 → REMIND (P1-B 作者验证)."""
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   "baseline comparison done"])
+                   _comments_json(["[ADVERSARIAL] baseline=pass"],
+                                  authors=["attacker-account"])])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
     assert res["G04"][0] == "REMIND"
 
 
 # ── G05 ──
-# 调用序: G01 graph, G02 body, G02 comments, G04 comments, G05 state
+# 调用序: G01 graph, G02 body, G02 comments, G04 issue comments meta,
+#         G05 state
 
 def test_g05_pass_closed_done():
     closed = json.dumps({
@@ -309,7 +329,7 @@ def test_g05_pass_closed_done():
         "projectItems": [{"status": {"name": "Done"}}],
     })
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   "adv", closed])
+                   _comments_json(["adv"], authors=["hh1985"]), closed])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
     assert res["G05"][0] == "PASS"
@@ -321,41 +341,58 @@ def test_g05_remind_open():
         "projectItems": [{"status": {"name": "EV Review"}}],
     })
     fake = FakeGh([_graph_ok(), "REQ-E01", "| REQ-E01 | x | PASS |",
-                   "adv", closed])
+                   _comments_json(["adv"], authors=["hh1985"]), closed])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
     assert res["G05"][0] == "REMIND"
 
 
 # ── G06 ──
-# 调用序: G01 graph, G02 body, G02 comments, G04 comments, G05 state,
-#         G06 child issue {st, c}
+# 调用序: G01 graph, G02 body, G02 comments, G04 issue comments meta,
+#         G05 state, G06 child status, G06 child comments meta
 
 def test_g06_premature_activation():
-    """下游 Ready 且无 [ACTIVATE] receipt → FAIL."""
+    """下游 Ready 且无 PI [ACTIVATE] → FAIL."""
     d = json.loads(_graph_ok())
     d["blocking"] = [{"number": 300, "state": "OPEN"}]
     graph = json.dumps(d)
-    child = json.dumps({"st": "Ready", "c": ["no activation"]})
     fake = FakeGh([graph, "REQ-E01", "| REQ-E01 | x | PASS |",
-                   "adv", "{}", child])
+                   _comments_json(["adv"], authors=["hh1985"]),
+                   "{}", '"Ready"',
+                   _comments_json(["no activation"], authors=["hh1985"])])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
     assert res["G06"][0] == "FAIL"
 
 
 def test_g06_authorized_activation_pass():
-    """下游 Ready 但有 PI [ACTIVATE] receipt → PASS (P1-8)."""
+    """下游 Ready + PI [ACTIVATE] receipt → PASS."""
     d = json.loads(_graph_ok())
     d["blocking"] = [{"number": 300, "state": "OPEN"}]
     graph = json.dumps(d)
-    child = json.dumps({"st": "Ready",
-                        "c": ["[ACTIVATE] issue=300 by PI"]})
     fake = FakeGh([graph, "REQ-E01", "| REQ-E01 | x | PASS |",
-                   "adv", "{}", child])
+                   _comments_json(["adv"], authors=["hh1985"]),
+                   "{}", '"Ready"',
+                   _comments_json(["[ACTIVATE] issue=300 by PI"],
+                                  authors=["hh1985"])])
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
     assert res["G06"][0] == "PASS"
+
+
+def test_g06_forged_activate_remind():
+    """[ACTIVATE] 来自非 PI → 不算授权 → FAIL (P1-C)."""
+    d = json.loads(_graph_ok())
+    d["blocking"] = [{"number": 300, "state": "OPEN"}]
+    graph = json.dumps(d)
+    fake = FakeGh([graph, "REQ-E01", "| REQ-E01 | x | PASS |",
+                   _comments_json(["adv"], authors=["hh1985"]),
+                   "{}", '"Ready"',
+                   _comments_json(["[ACTIVATE] issue=300"],
+                                  authors=["attacker-account"])])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1)
+    assert res["G06"][0] == "FAIL"
 
 
 def test_g06_skip_no_children():
