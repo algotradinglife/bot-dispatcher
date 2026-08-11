@@ -501,7 +501,9 @@ def main():
 
                 # ── PI-GATE G05: 合并后对账 ──
                 # 合并后应: Issue 关闭 + Project Done + Roadmap 更新.
-                # 发现不一致 → warning (进用户 digest, GitHub warnings 白名单).
+                # 去重限频 (PI review item 5): 同一 PR 的同一缺失项
+                # G05_DEDUP_HOURS 内只报警一次 (state 记 g05:<pr>:<item>).
+                G05_DEDUP_HOURS = 24
                 try:
                     from pi_gates import check_pi_gates
                     # 找关联 issue (linked_issues 或 closingIssuesReferences)
@@ -515,14 +517,18 @@ def main():
                         res = check_pi_gates(repo, issue_num=li, pr_num=pn,
                                              operation="merge-reconcile")
                         g05 = res.get("G05", ("SKIP", ""))
-                        if g05[0] == "REMIND":
+                        if g05[0] in ("REMIND", "FAIL"):
+                            item = g05[1][:60]
+                            dedup_key = "g05:%d:%s" % (pn, item)
+                            now_ts = time.time()
+                            prev_ts = prev_state.get(dedup_key) or new_state.get(dedup_key)
+                            if prev_ts and (now_ts - float(prev_ts)) < G05_DEDUP_HOURS * 3600:
+                                continue  # 已报警过, 限频跳过
+                            icon = "⚠️" if g05[0] == "REMIND" else "⛔"
                             output["warnings"].append(
-                                "%s ⚠️ PI-GATE G05: PR #%d merged 后对账 — %s"
-                                % (prefix, pn, g05[1][:80]))
-                        elif g05[0] == "FAIL":
-                            output["warnings"].append(
-                                "%s ⛔ PI-GATE G05: PR #%d 对账失败 — %s"
-                                % (prefix, pn, g05[1][:80]))
+                                "%s %s PI-GATE G05: PR #%d merged 后对账 — %s"
+                                % (prefix, icon, pn, g05[1][:80]))
+                            new_state[dedup_key] = str(now_ts)
                 except Exception as e:
                     output["warnings"].append(
                         "%s PI-GATE G05 reconcile: %s" % (prefix, str(e)[:100]))
