@@ -46,7 +46,7 @@ jobs:
           python-version: "3.12"
       - name: Run live PI-GATE
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN_PAT }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN_PAT || github.token }}
         run: |
           # 解析 PR 关联的 closing issue
           ISSUE=$(
