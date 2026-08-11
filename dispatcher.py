@@ -499,41 +499,48 @@ def main():
                 queue_goal(output, "user", msg, issue_num=pn)
                 new_state[key] = "merged"
 
-                # ── PI-GATE G05: 合并后对账 ──
-                # 合并后应: Issue 关闭 + Project Done + Roadmap 更新.
-                # 去重限频 (PI review item 5): 同一 PR 的同一缺失项
-                # G05_DEDUP_HOURS 内只报警一次 (state 记 g05:<pr>:<item>).
-                G05_DEDUP_HOURS = 24
-                try:
-                    from pi_gates import check_pi_gates
-                    # 找关联 issue (linked_issues 或 closingIssuesReferences)
-                    lr = subprocess.run(
-                        ["gh", "pr", "view", str(pn), "--repo", repo,
-                         "--json", "closingIssuesReferences",
-                         "--jq", ".closingIssuesReferences[].number"],
-                        capture_output=True, text=True, timeout=15)
-                    linked = [int(x) for x in lr.stdout.split() if x.strip()]
-                    for li in linked[:1]:  # 只对第一个关联 issue 对账
-                        res = check_pi_gates(repo, issue_num=li, pr_num=pn,
-                                             operation="merge-reconcile")
-                        g05 = res.get("G05", ("SKIP", ""))
-                        if g05[0] in ("REMIND", "FAIL"):
-                            item = g05[1][:60]
-                            dedup_key = "g05:%d:%s" % (pn, item)
-                            now_ts = time.time()
-                            prev_ts = prev_state.get(dedup_key) or new_state.get(dedup_key)
-                            if prev_ts and (now_ts - float(prev_ts)) < G05_DEDUP_HOURS * 3600:
-                                continue  # 已报警过, 限频跳过
-                            icon = "⚠️" if g05[0] == "REMIND" else "⛔"
-                            output["warnings"].append(
-                                "%s %s PI-GATE G05: PR #%d merged 后对账 — %s"
-                                % (prefix, icon, pn, g05[1][:80]))
-                            new_state[dedup_key] = str(now_ts)
-                except Exception as e:
-                    output["warnings"].append(
-                        "%s PI-GATE G05 reconcile: %s" % (prefix, str(e)[:100]))
     except Exception as e:
         output["warnings"].append("%s PR merged scan: %s" % (prefix, str(e)[:120]))
+
+    # ── PI-GATE G05: 合并后对账 (独立段 — 每次 tick 都对已 merged 的
+    #    PR 跑对账; P0-4: 不在首次 merged 检测内, 避免 prev_m==merged
+    #    continue 导致 G05 只跑一次). 去重限频 (PI review item 5):
+    #    同一 PR 的同一缺失项 G05_DEDUP_HOURS 内只报警一次. ──
+    G05_DEDUP_HOURS = 24
+    try:
+        from pi_gates import check_pi_gates
+        mrun2 = subprocess.run(
+            ["gh", "pr", "list", "--repo", repo, "--state", "merged",
+             "--limit", "15", "--json", "number"],
+            capture_output=True, text=True, timeout=20)
+        if mrun2.returncode == 0:
+            for pr in json.loads(mrun2.stdout):
+                pn = pr["number"]
+                lr = subprocess.run(
+                    ["gh", "pr", "view", str(pn), "--repo", repo,
+                     "--json", "closingIssuesReferences",
+                     "--jq", ".closingIssuesReferences[].number"],
+                    capture_output=True, text=True, timeout=15)
+                linked = [int(x) for x in lr.stdout.split() if x.strip()]
+                for li in linked[:1]:  # 只对第一个关联 issue 对账
+                    res = check_pi_gates(repo, issue_num=li, pr_num=pn,
+                                         operation="merge-reconcile")
+                    g05 = res.get("G05", ("SKIP", ""))
+                    if g05[0] in ("REMIND", "FAIL"):
+                        item = g05[1][:60]
+                        dedup_key = "g05:%d:%s" % (pn, item)
+                        now_ts = time.time()
+                        prev_ts = prev_state.get(dedup_key) or new_state.get(dedup_key)
+                        if prev_ts and (now_ts - float(prev_ts)) < G05_DEDUP_HOURS * 3600:
+                            continue  # 已报警过, 限频跳过
+                        icon = "⚠️" if g05[0] == "REMIND" else "⛔"
+                        output["warnings"].append(
+                            "%s %s PI-GATE G05: PR #%d merged 后对账 — %s"
+                            % (prefix, icon, pn, g05[1][:80]))
+                        new_state[dedup_key] = str(now_ts)
+    except Exception as e:
+        output["warnings"].append(
+            "%s PI-GATE G05 reconcile: %s" % (prefix, str(e)[:100]))
 
     delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run, cfg=cfg)
     # Human 兜底: dispatcher 侧仅尽力而为的飞书提醒 (monitor 锁内计数限频);

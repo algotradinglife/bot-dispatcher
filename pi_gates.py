@@ -37,16 +37,75 @@ def parse_ev_verdicts(text):
 
 
 def latest_ev_pass(text):
-    """Latest (by timestamp field) EV PASS verdict, or None.
+    """Latest (by timestamp field) EV verdict that is PASS, or None.
 
-    全局时间顺序: 按 timestamp 字段排序取最后 — 不是文本顺序.
+    PI review P0-1: 必须按时间选择最新的有效 verdict，然后要求它是
+    PASS。先过滤 REJECT 再选最新 PASS 会漏掉"10:00 PASS、11:00 REJECT"
+    的场景 — 最新 verdict 是 REJECT, 必须拒绝.
     """
     verdicts = parse_ev_verdicts(text)
-    passes = [v for v in verdicts if v.get("verdict", "").upper() == "PASS"]
-    if not passes:
+    if not verdicts:
         return None
-    passes.sort(key=lambda v: v.get("timestamp", ""))
-    return passes[-1]
+    # 按 timestamp 排序取最新 (全局时间序, 不依赖文本位置)
+    verdicts.sort(key=lambda v: v.get("timestamp", ""))
+    latest = verdicts[-1]
+    if latest.get("verdict", "").upper() == "PASS":
+        return latest
+    return None
+
+
+# 可信 auditor 白名单 (独立审计账号; PI 不是独立 auditor — P0-2)
+TRUSTED_AUDITORS = ("everything-bot-engineer",)
+
+
+def _fetch_comments_meta(repo, issue_num, pr_num):
+    """Fetch comments with REAL author.login + createdAt (P0-2).
+
+    不信任正文自报的 auditor=/timestamp= — 读取 GitHub comment 的真实
+    元数据. 返回 [{author, created_at, body}] (issue 评论在前).
+    """
+    out = []
+    for view in (["issue", "view", str(issue_num)],
+                 ["pr", "view", str(pr_num)]):
+        r = _gh(view + ["--repo", repo, "--json", "comments",
+                        "--jq", ".comments[] | {a: .author.login, t: .createdAt, b: .body}"])
+        if r.returncode != 0:
+            continue
+        try:
+            items = json.loads(r.stdout)
+        except Exception:
+            items = []
+        for it in items if isinstance(items, list) else [items]:
+            out.append({
+                "author": (it.get("a") or "").lower(),
+                "created_at": it.get("t") or "",
+                "body": it.get("b") or "",
+            })
+    return out
+
+
+def latest_ev_pass_meta(comments):
+    """Latest (by real createdAt) EV verdict that is PASS, from trusted
+    auditor only. P0-2: 身份/时间取自 comment 元数据, 非正文.
+
+    Returns dict or None. 正文仍需含 EV-VERDICT 块 (sha/verdict), 但
+    auditor 以 comment 真实 author 为准; timestamp 以 createdAt 为准.
+    """
+    candidates = []
+    for cm in comments:
+        if cm["author"] not in TRUSTED_AUDITORS:
+            continue
+        for v in parse_ev_verdicts(cm["body"]):
+            v["_author"] = cm["author"]
+            v["_created_at"] = cm["created_at"]
+            candidates.append(v)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda v: v.get("_created_at", ""))
+    latest = candidates[-1]
+    if latest.get("verdict", "").upper() == "PASS":
+        return latest
+    return None
 
 # REQ 编号 (契约 body) — E01-E08 + issue 特定 (如 REQ-207-01)
 # 支持 REQ-E01 和 REQ-E-01 两种写法; 捕获完整 REQ-xxx (统一格式)
@@ -123,7 +182,7 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
     """Run the 6 PI gates. Returns {gate: (PASS|FAIL|REMIND|SKIP, evidence)}."""
     result = {}
 
-    # G01 — Graph: 唯一 owner + 无未关 blocker + milestone
+    # G01 — Graph: 唯一 owner + 无未关 blocker + milestone 存在
     graph = _issue_graph(repo, issue_num) if issue_num else None
     if graph is None:
         result["G01"] = ("FAIL", "graph unavailable (control plane)")
@@ -131,9 +190,10 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
         owners = {p.get("title") for p in graph["projects"]}
         open_blockers = [b["number"] for b in graph["blocked_by"]
                          if b.get("open")]
+        has_milestone = bool(graph.get("milestone"))
         evidence = "projects=%s blockedBy(open)=%s milestone=%s" % (
-            sorted(owners), open_blockers, graph.get("milestone") or "-")
-        ok = len(owners) == 1 and not open_blockers
+            sorted(owners), open_blockers, graph.get("milestone") or "MISSING")
+        ok = len(owners) == 1 and not open_blockers and has_milestone
         result["G01"] = ("PASS" if ok else "FAIL", evidence)
 
     # G02 — Contract: REQ 完整性 (机器可解析: 契约 REQ 编号 vs 交付表)
@@ -150,7 +210,9 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
             for line in r2.stdout.splitlines():
                 m = REQ_ROW_RE.match(line.strip())
                 if m:
-                    delivered_reqs.add(m.group(1))
+                    # P1-6: 交付表行必须带 PASS 才算覆盖 (FAIL/N/A/空不算)
+                    if "PASS" in line.upper():
+                        delivered_reqs.add(m.group(1))
         missing = [r for r in contract_reqs if r not in delivered_reqs]
         if not contract_reqs:
             result["G02"] = ("REMIND",
@@ -165,64 +227,71 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
         result["G02"] = ("SKIP", "no issue")
 
     # G03 — EV binding: 最新 EV PASS 的完整 SHA == PR HEAD
-    # (PI review item 2: 结构化 EV-VERDICT、完整 40 位 SHA、全局时间序、
-    #  可信 auditor、操作前后重复读 HEAD)
+    # (P0-1: later REJECT 拒绝; P0-2: 真实 author/createdAt; P0-3: HEAD
+    #  前后两次读取防竞态; 41 位 SHA 拒绝)
     if pr_num:
         head_before = _pr_head(repo, pr_num)
         head = (head_before or {}).get("headRefOid", "")
-        # 收集 issue + PR 全部评论 → 结构化 EV-VERDICT
-        all_comments = ""
-        for view in (["issue", "view", str(issue_num)],
-                     ["pr", "view", str(pr_num)]):
-            r = _gh(view + ["--repo", repo, "--json", "comments",
-                            "--jq", ".comments[].body"])
-            if r.returncode == 0:
-                all_comments += "\n" + r.stdout
-        latest = latest_ev_pass(all_comments)
+        comments_meta = _fetch_comments_meta(repo, issue_num, pr_num)
+        latest = latest_ev_pass_meta(comments_meta)
+        # P0-3: 操作后重复读 HEAD — 审计与读取之间被 push 则检测
+        head_after = _pr_head(repo, pr_num)
+        head_after_val = (head_after or {}).get("headRefOid", "")
+        head_stable = (not head) or (not head_after_val) or head == head_after_val
+
         if latest is None:
-            # 兼容旧格式 (AUDITED_SHA=...) 非结构化
-            ev_sha = EV_SHA_RE.search(all_comments)
-            if ev_sha and head:
-                ok = head.startswith(ev_sha.group(1)) \
-                    or ev_sha.group(1).startswith(head[:7])
+            # 兼容旧格式 (AUDITED_SHA=...) 非结构化 — 但仅当真实作者可信
+            legacy = None
+            for cm in comments_meta:
+                if cm["author"] in TRUSTED_AUDITORS:
+                    m = EV_SHA_RE.search(cm["body"])
+                    if m:
+                        legacy = m.group(1)
+            if legacy and head and head_stable:
+                ok = head == legacy or legacy == head
                 result["G03"] = ("PASS" if ok else "FAIL",
                                  "legacy AUDITED_SHA %s vs HEAD %s (unstructured)"
-                                 % (ev_sha.group(1)[:12], head[:12]))
+                                 % (legacy[:12], head[:12]))
             elif head:
                 result["G03"] = ("FAIL",
-                                 "no EV PASS with AUDITED_SHA (stale?)")
+                                 "no trusted EV PASS with AUDITED_SHA (stale?)")
             else:
                 result["G03"] = ("FAIL", "PR unavailable")
         else:
             sha = latest.get("sha", "")
-            full_sha = len(sha) >= 40
-            auditor = latest.get("auditor", "")
-            trusted = auditor in ("everything-bot-engineer", "hh1985")
-            ok = bool(head) and full_sha and trusted \
-                and (head.startswith(sha) or sha.startswith(head))
+            # P0: 只接受正则严格匹配的完整 40 位 SHA, 用 == (41 位拒绝)
+            full_sha = bool(re.fullmatch(r"[0-9a-f]{40}", sha))
+            auditor = latest.get("_author", "")
+            ok = bool(head) and head_stable and full_sha \
+                and head == sha and auditor in TRUSTED_AUDITORS
             result["G03"] = (
                 "PASS" if ok else "FAIL",
-                "EV sha=%s... head=%s auditor=%s full=%s ts=%s"
+                "EV sha=%s... head=%s auditor=%s full40=%s stable=%s ts=%s"
                 % (sha[:12], head[:12], auditor or "-",
-                   full_sha, latest.get("timestamp", "-")[:19]))
+                   full_sha, head_stable,
+                   (latest.get("_created_at") or "-")[:19]))
     else:
         result["G03"] = ("SKIP", "no PR")
 
     # G04 — Adversarial: PI 终审评论的 [ADVERSARIAL] 结构化标记
+    # P1-7: 标记必须含有效键值 (baseline=/leak=/selection=/overfit=),
+    # [ADVERSARIAL] hello 或普通评论含 baseline 不再直接 PASS.
     if issue_num:
         r = _gh(["issue", "view", str(issue_num), "--repo", repo,
                  "--json", "comments", "--jq", ".comments[].body"])
         comments = r.stdout if r.returncode == 0 else ""
-        # 结构化: [ADVERSARIAL] baseline=pass leak=pass selection=pass
         markers = ADVERSARIAL_RE.findall(comments)
-        if markers:
+        valid_markers = []
+        for m in markers:
+            # 要求含至少一个 键=值 对 (key=pass|fail|checked|yes|no|...)
+            if re.search(r"\b(baseline|leak|selection|overfit|confound|robust)"
+                         r"\s*=\s*\S+", m, re.IGNORECASE):
+                valid_markers.append(m.strip()[:40])
+        if valid_markers:
             result["G04"] = ("PASS",
-                             "adversarial markers: %s" % ",".join(markers))
-        elif any(k in comments for k in
-                 ("baseline", "泄漏", "selection bias", "对抗", "adversarial")):
-            result["G04"] = ("PASS", "adversarial keywords found (unstructured)")
+                             "adversarial markers: %s" % "; ".join(valid_markers))
         else:
-            result["G04"] = ("REMIND", "no adversarial review evidence")
+            result["G04"] = ("REMIND", "no structured adversarial evidence")
     else:
         result["G04"] = ("SKIP", "no issue")
 
@@ -244,7 +313,8 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
         result["G05"] = ("SKIP", "no issue")
 
     # G06 — Downstream activation: 下游 issue 是否在 PI 授权前置 Ready
-    # (扫描 blocking 子项的状态 — 只查 OPEN 的下游)
+    # P1-8: 只把"Ready 且无 PI [ACTIVATE] receipt"视为 premature —
+    # PI 显式授权 (评论含 [ACTIVATE] issue=<num>) 不算违规.
     if graph and graph["blocking"]:
         premature = []
         for child in graph["blocking"]:
@@ -252,9 +322,20 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
             if num is None or not child.get("open"):
                 continue
             r = _gh(["issue", "view", str(num), "--repo", repo,
-                     "--json", "projectItems",
-                     "--jq", ".projectItems[].status.name"])
-            if r.returncode == 0 and "Ready" in r.stdout:
+                     "--json", "projectItems,comments",
+                     "--jq", "{st: .projectItems[].status.name, c: [.comments[].body]}"])
+            if r.returncode != 0:
+                continue
+            try:
+                cd = json.loads(r.stdout)
+            except Exception:
+                continue
+            status = cd.get("st") or ""
+            comments = " ".join(cd.get("c") or [])
+            activated = bool(re.search(
+                r"\[ACTIVATE\]\s*(?:issue\s*[=:]?\s*)?%d\b" % num, comments,
+                re.IGNORECASE))
+            if "Ready" in status and not activated:
                 premature.append(num)
         result["G06"] = ("FAIL" if premature else "PASS",
                          "downstream premature Ready: %s" % premature
