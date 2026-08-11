@@ -498,6 +498,34 @@ def main():
                                           "sent": msg[:80], "result": "queued"})
                 queue_goal(output, "user", msg, issue_num=pn)
                 new_state[key] = "merged"
+
+                # ── PI-GATE G05: 合并后对账 ──
+                # 合并后应: Issue 关闭 + Project Done + Roadmap 更新.
+                # 发现不一致 → warning (进用户 digest, GitHub warnings 白名单).
+                try:
+                    from pi_gates import check_pi_gates
+                    # 找关联 issue (linked_issues 或 closingIssuesReferences)
+                    lr = subprocess.run(
+                        ["gh", "pr", "view", str(pn), "--repo", repo,
+                         "--json", "closingIssuesReferences",
+                         "--jq", ".closingIssuesReferences[].number"],
+                        capture_output=True, text=True, timeout=15)
+                    linked = [int(x) for x in lr.stdout.split() if x.strip()]
+                    for li in linked[:1]:  # 只对第一个关联 issue 对账
+                        res = check_pi_gates(repo, issue_num=li, pr_num=pn,
+                                             operation="merge-reconcile")
+                        g05 = res.get("G05", ("SKIP", ""))
+                        if g05[0] == "REMIND":
+                            output["warnings"].append(
+                                "%s ⚠️ PI-GATE G05: PR #%d merged 后对账 — %s"
+                                % (prefix, pn, g05[1][:80]))
+                        elif g05[0] == "FAIL":
+                            output["warnings"].append(
+                                "%s ⛔ PI-GATE G05: PR #%d 对账失败 — %s"
+                                % (prefix, pn, g05[1][:80]))
+                except Exception as e:
+                    output["warnings"].append(
+                        "%s PI-GATE G05 reconcile: %s" % (prefix, str(e)[:100]))
     except Exception as e:
         output["warnings"].append("%s PR merged scan: %s" % (prefix, str(e)[:120]))
 
