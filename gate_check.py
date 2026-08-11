@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Live PI-GATE CheckRun publisher — external authoritative gate.
+"""Live PI-GATE status publisher — external advisory gate (C3).
 
-PI review round-4 收口: live gate 不应由 PR 内 workflow 自证 (可被
-PR 改 gate/泄露 PAT/评论时序问题). 改为受保护的 dispatcher 读取实时
-状态, 用 GitHub Checks API 向 PR HEAD 发布 required CheckRun:
+PI review 收口: live gate 不应由 PR 内 workflow 自证 (可被 PR 改
+gate/泄露 PAT/评论时序问题). 受保护的 dispatcher 读取实时状态, 用
+Status API 向 PR HEAD 发布 advisory commit status:
 
-  pi-gates-live  → 结论反映 check_pi_gates 结果 (PASS/FAIL/NEUTRAL)
+  pi-gates-live  → success/failure/pending (advisory — 不阻断 merge)
 
-分支保护 required checks 包含 pi-gates-live → 只有 dispatcher 发布
-的 CheckRun 通过才允许 merge.
+Hard gate (required CheckRun) 需 GitHub App, 已单独立项延期.
 """
 import json
 import os
@@ -41,10 +40,11 @@ def publish_status(repo, head_sha, conclusion, title, summary,
            "-f", "state=%s" % state,
            "-f", "context=%s" % CHECK_NAME,
            "-f", "description=%s" % title[:140]]
-    # bot 账号对 bot-dispatcher 无 push 权限 → hh1985 wrapper
+    # 硬编码 wrapper 违反"不得提交机器路径"原则 (C3) — 改为环境变量
+    # GH_PUSH_WRAPPER (由调度 wrapper 注入, 不提交机器路径).
     if repo == "algotradinglife/bot-dispatcher":
-        wrapper = os.path.expanduser("~/.hermes/scripts/gh-identity-pi.sh")
-        if os.path.exists(wrapper):
+        wrapper = os.environ.get("GH_PUSH_WRAPPER", "")
+        if wrapper and os.path.exists(wrapper):
             cmd = [wrapper] + cmd
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if r.returncode != 0:

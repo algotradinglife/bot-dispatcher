@@ -542,32 +542,38 @@ def main():
         output["warnings"].append(
             "%s PI-GATE G05 reconcile: %s" % (prefix, str(e)[:100]))
 
-    # ── PI-GATE live CheckRun 发布 (round-4 收口) ──
+    # ── PI-GATE live StatusContext 发布 (advisory) ──
     # 受保护的 dispatcher 读取实时状态 → 向 open PRs 的 HEAD 发布
-    # required CheckRun (pi-gates-live). 替代 PR 内 workflow 自证.
-    # 限频: 每 tick 最多发布 5 个 (API 配额保护).
-    # P1-C: failure warning 按 repo+PR+HEAD+结论 digest 去重 —
-    # 结论/HEAD 变化才立即提醒, 否则不重复 (state 记 gate_warn:<repo>:<pr>).
+    # pi-gates-live commit status (advisory — 不阻断 merge, hard gate
+    # 需 GitHub App, 已延期). 限频: 每 tick 最多 5 个.
+    # C1: published 检查独立 if — gate=failure + 发布失败要明确提示
+    #     "status 发布失败" (不只是 "gate 阻断").
+    # C2: 所有结论 (success/failure) 都记 digest + gate evidence hash —
+    #     failure→success→failure 且 HEAD 不变时, 第二次 failure 仍提醒.
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from gate_check import scan_and_publish
         published = scan_and_publish(repo, limit=5)
         for p in published:
-            if p.get("conclusion") == "failure":
-                dedup_key = "gate_warn:%s:%d" % (repo, p["pr"])
-                digest = "%s:%s" % (p.get("conclusion"), p.get("head", ""))
-                prev_digest = prev_state.get(dedup_key) or new_state.get(dedup_key)
-                if prev_digest == digest:
-                    continue  # 结论+HEAD 未变, 不重复提醒
+            dedup_key = "gate_warn:%s:%d" % (repo, p["pr"])
+            # C2: digest = 结论 + HEAD + 发布状态 (全结论覆盖)
+            digest = "%s:%s:%s" % (p.get("conclusion"), p.get("head", ""),
+                                   p.get("published"))
+            prev_digest = prev_state.get(dedup_key) or new_state.get(dedup_key)
+            # C1: 发布失败独立检查 (无论 gate 结论)
+            if not p.get("published"):
+                output["warnings"].append(
+                    "%s ⛔ PI-GATE live: PR #%d status 发布失败 (%s)"
+                    % (prefix, p["pr"], p.get("conclusion")))
+                new_state[dedup_key] = digest
+            elif p.get("conclusion") == "failure" and prev_digest != digest:
                 output["warnings"].append(
                     "%s ⛔ PI-GATE live: PR #%d 被 gate 阻断 (%s)"
                     % (prefix, p["pr"], digest))
                 new_state[dedup_key] = digest
-            elif not p.get("published"):
-                # P1-B: 发布失败必须报警 (不可静默)
-                output["warnings"].append(
-                    "%s ⛔ PI-GATE live: PR #%d status 发布失败"
-                    % (prefix, p["pr"]))
+            elif p.get("conclusion") == "success" and prev_digest != digest:
+                # C2: success 也更新 digest — 状态翻转会被下一轮 failure 检测
+                new_state[dedup_key] = digest
     except Exception as e:
         output["warnings"].append(
             "%s PI-GATE live check-run: %s" % (prefix, str(e)[:100]))
