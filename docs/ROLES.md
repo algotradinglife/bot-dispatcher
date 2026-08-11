@@ -144,6 +144,10 @@ v0_3 起 worker 载体为 **Hermes profiles**（命令行唤醒，不轮询 GitH
   "auditor profile 独立执行，bot 账号发布"。审计独立性由审计过程保证
   （独立 checkout/复算），非发布账号；PI Review 阶段 PI 对抗性审查
   独立复核 EV 证据（PI 不盲信 EV）
+- **EV 报告必须含 AUDITED_SHA**（PI-GATE G03）：裁决正文写
+  `AUDITED_SHA=<PR HEAD 前 12 位>`，dispatcher 比对 PR 当前 HEAD —
+  不一致即 stale PASS 阻断（根治并发审计/旧 HEAD 复审）。每次审计
+  重新读 headRefOid，禁止复制旧值
 - **worker 的自验职责**（不替代 EV）：worker 提交前自跑测试、自查证据
   链，但这是自验不是 EV——EV 的独立性不能被自验替代
 
