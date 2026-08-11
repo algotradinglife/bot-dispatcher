@@ -62,67 +62,106 @@ def publish_checkrun(repo, head_sha, conclusion, title, summary,
 
 
 def gate_for_pr(repo, pr_num):
-    """Run gates for a PR; returns (conclusion, title, summary)."""
+    """Run gates for a PR; returns (conclusion, title, summary, head_sha).
+
+    P1-3: 返回实际评估的 HEAD SHA, 由调用方用它发布 (避免 push 竞态).
+    P1-2: 评估所有 closing issues (任一 FAIL 即 FAIL).
+    P1-1: 无 closing issue → failure (advisory 也不显示绿 — 与
+    "每个变更对应 issue" 治理契约一致).
+    """
     # PR 信息
     pr = _gh(["pr", "view", str(pr_num), "--repo", repo,
               "--json", "headRefOid,title,closingIssuesReferences,state"])
     if pr.returncode != 0:
         return ("action_required", "PI-GATE: PR unavailable",
-                "Cannot read PR #%d" % pr_num)
+                "Cannot read PR #%d" % pr_num, None)
     try:
         d = json.loads(pr.stdout)
     except Exception:
-        return ("action_required", "PI-GATE: parse error", "bad PR JSON")
+        return ("action_required", "PI-GATE: parse error", "bad PR JSON", None)
     head = d.get("headRefOid", "")
     title = d.get("title") or ""
     closing = [c.get("number") for c in d.get("closingIssuesReferences", [])]
 
     if not closing:
-        # 无 closing issue: G02/G05 无法评估 — 用 neutral (不阻断)
-        # 文档/CI-only PR 允许通过; 有 issue 的 PR 必须完整 gate
-        return ("success", "PI-GATE: no linked issue (docs/CI-only)",
-                "PR #%d has no closing issue; gate not applicable. "
-                "If this PR resolves an issue, link it with 'Closes #N'."
-                % pr_num)
+        # P1-1: 无 closing issue = 违反治理契约 → failure (不显示绿)
+        return ("failure", "PI-GATE: no closing issue linked",
+                "PR #%d has no closing issue. Every change must map to an "
+                "issue ('Closes #N' in PR body)." % pr_num, head)
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from pi_gates import check_pi_gates, render_receipt
 
-    res = check_pi_gates(repo, issue_num=closing[0], pr_num=pr_num,
-                         operation="merge")
-    blocked = [g for g, (s, _) in res.items() if s == "FAIL"]
-    receipt = render_receipt(res, "merge", title=title,
-                             url="https://github.com/%s/pull/%d" % (repo, pr_num))
+    all_receipts = []
+    blocked = []
+    reminds = []
+    for ci in closing:  # P1-2: 所有 closing issues
+        res = check_pi_gates(repo, issue_num=ci, pr_num=pr_num,
+                             operation="merge")
+        all_receipts.append(render_receipt(
+            res, "merge", title=title,
+            url="https://github.com/%s/pull/%d" % (repo, pr_num)))
+        blocked += [g for g, (s, _) in res.items() if s == "FAIL"]
+        reminds += [g for g, (s, _) in res.items() if s == "REMIND"]
+    receipt = "\n\n".join(all_receipts)
 
     if blocked:
-        return ("failure", "PI-GATE: blocked by %s" % ",".join(blocked),
-                receipt)
-    # REMIND 不算阻断, 但提示
-    reminds = [g for g, (s, _) in res.items() if s == "REMIND"]
+        return ("failure", "PI-GATE: blocked by %s" % ",".join(sorted(set(blocked))),
+                receipt, head)
     if reminds:
-        return ("success", "PI-GATE: PASS (reminders: %s)" % ",".join(reminds),
-                receipt)
-    return ("success", "PI-GATE: PASS", receipt)
+        return ("success", "PI-GATE: PASS (reminders: %s)"
+                % ",".join(sorted(set(reminds))), receipt, head)
+    return ("success", "PI-GATE: PASS", receipt, head)
 
 
-def scan_and_publish(repo, limit=10):
-    """Scan open PRs and publish/update pi-gates-live CheckRuns."""
+def scan_and_publish(repo, limit=10, rotate_key="gate_rotate"):
+    """Scan open PRs and publish/update pi-gates-live statuses.
+
+    P1-3: 用 gate_for_pr 返回的实际评估 SHA 发布 (防 push 竞态).
+    P1-4: 轮转 — 从上次位置继续, 避免固定取前 N 个导致旧 PR 饥饿.
+    """
     r = _gh(["pr", "list", "--repo", repo, "--state", "open",
-             "--limit", str(limit), "--json", "number,headRefOid"])
+             "--limit", "30", "--json", "number,headRefOid,updatedAt"])
     if r.returncode != 0:
         return []
-    published = []
     try:
         prs = json.loads(r.stdout)
     except Exception:
         return []
-    for pr in prs:
+    if not prs:
+        return []
+    # 按更新时间排序 (最活跃优先)
+    prs.sort(key=lambda p: p.get("updatedAt") or "", reverse=True)
+    # 轮转起点 (跨 tick 记忆)
+    rotate = {}
+    rp = os.path.expanduser("~/.local/state/bot-dispatcher/gate_rotate.json")
+    try:
+        with open(rp) as f:
+            rotate = json.load(f)
+    except Exception:
+        rotate = {}
+    start = rotate.get(repo, 0)
+    # 取从 start 开始的 limit 个 (循环)
+    picked = [(prs[i % len(prs)]) for i in range(start, start + limit)]
+    # 更新轮转位置
+    rotate[repo] = (start + limit) % max(len(prs), 1)
+    try:
+        os.makedirs(os.path.dirname(rp), exist_ok=True)
+        with open(rp, "w") as f:
+            json.dump(rotate, f)
+    except Exception:
+        pass
+
+    published = []
+    for pr in picked:
         num = pr["number"]
-        head = pr.get("headRefOid", "")
-        conclusion, title, summary = gate_for_pr(repo, num)
-        cid = publish_checkrun(repo, head, conclusion, title, summary)
+        conclusion, title, summary, head = gate_for_pr(repo, num)
+        if head:  # P1-3: 用实际评估的 SHA
+            cid = publish_checkrun(repo, head, conclusion, title, summary)
+        else:
+            cid = None
         published.append({"pr": num, "conclusion": conclusion,
-                          "check_id": cid, "head": head[:12]})
+                          "check_id": cid, "head": (head or pr.get("headRefOid", ""))[:12]})
     return published
 
 
@@ -133,11 +172,10 @@ if __name__ == "__main__":
     ap.add_argument("--pr", type=int)
     args = ap.parse_args()
     if args.pr:
-        conclusion, title, summary = gate_for_pr(args.repo, args.pr)
-        pr = _gh(["pr", "view", str(args.pr), "--repo", args.repo,
-                  "--json", "headRefOid", "--jq", ".headRefOid"])
-        cid = publish_checkrun(args.repo, pr.stdout.strip(), conclusion,
-                               title, summary)
+        conclusion, title, summary, head = gate_for_pr(args.repo, args.pr)
+        cid = None
+        if head:
+            cid = publish_checkrun(args.repo, head, conclusion, title, summary)
         print(json.dumps({"pr": args.pr, "conclusion": conclusion,
                           "check_id": cid}))
     else:
