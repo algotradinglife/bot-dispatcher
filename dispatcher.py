@@ -546,15 +546,28 @@ def main():
     # 受保护的 dispatcher 读取实时状态 → 向 open PRs 的 HEAD 发布
     # required CheckRun (pi-gates-live). 替代 PR 内 workflow 自证.
     # 限频: 每 tick 最多发布 5 个 (API 配额保护).
+    # P1-C: failure warning 按 repo+PR+HEAD+结论 digest 去重 —
+    # 结论/HEAD 变化才立即提醒, 否则不重复 (state 记 gate_warn:<repo>:<pr>).
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from gate_check import scan_and_publish
         published = scan_and_publish(repo, limit=5)
         for p in published:
             if p.get("conclusion") == "failure":
+                dedup_key = "gate_warn:%s:%d" % (repo, p["pr"])
+                digest = "%s:%s" % (p.get("conclusion"), p.get("head", ""))
+                prev_digest = prev_state.get(dedup_key) or new_state.get(dedup_key)
+                if prev_digest == digest:
+                    continue  # 结论+HEAD 未变, 不重复提醒
                 output["warnings"].append(
                     "%s ⛔ PI-GATE live: PR #%d 被 gate 阻断 (%s)"
-                    % (prefix, p["pr"], p.get("check_id", "?")))
+                    % (prefix, p["pr"], digest))
+                new_state[dedup_key] = digest
+            elif not p.get("published"):
+                # P1-B: 发布失败必须报警 (不可静默)
+                output["warnings"].append(
+                    "%s ⛔ PI-GATE live: PR #%d status 发布失败"
+                    % (prefix, p["pr"]))
     except Exception as e:
         output["warnings"].append(
             "%s PI-GATE live check-run: %s" % (prefix, str(e)[:100]))
