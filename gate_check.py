@@ -25,40 +25,33 @@ def _gh(args, timeout=30):
     return r
 
 
-def publish_checkrun(repo, head_sha, conclusion, title, summary,
-                     details_url=""):
-    """Create/update a CheckRun on a commit via Checks API.
+def publish_status(repo, head_sha, conclusion, title, summary,
+                   details_url=""):
+    """Publish a commit status (pi-gates-live) — Status API.
 
-    conclusion: success | failure | neutral | cancelled | timed_out |
-                action_required
-    Returns the check-run id or None.
+    P1-D: 命名 publish_status (语义 = 一次性 commit status, 非 CheckRun).
+    P1-B: 返回 True/False — 失败显式返回 False (调用方必须报警).
+    Checks API (CheckRun) 需 GitHub App token; Status API 接受普通
+    PAT/OAuth, 分支保护 required status checks 同样识别.
     """
-    payload = {
-        "name": CHECK_NAME,
-        "head_sha": head_sha,
-        "status": "completed",
-        "conclusion": conclusion,
-        "output": {
-            "title": title[:140],
-            "summary": summary[:64000],
-        },
-    }
-    if details_url:
-        payload["details_url"] = details_url
-    # stdin 传 payload (--input -)
-    r = subprocess.run(
-        ["gh", "api", "--method", "POST",
-         "-H", "Accept: application/vnd.github+json",
-         "repos/%s/check-runs" % repo, "--input", "-"],
-        input=json.dumps(payload), capture_output=True, text=True, timeout=30)
+    state = {"success": "success", "failure": "failure"}.get(
+        conclusion, "pending")
+    cmd = ["gh", "api", "--method", "POST",
+           "repos/%s/statuses/%s" % (repo, head_sha),
+           "-f", "state=%s" % state,
+           "-f", "context=%s" % CHECK_NAME,
+           "-f", "description=%s" % title[:140]]
+    # bot 账号对 bot-dispatcher 无 push 权限 → hh1985 wrapper
+    if repo == "algotradinglife/bot-dispatcher":
+        wrapper = os.path.expanduser("~/.hermes/scripts/gh-identity-pi.sh")
+        if os.path.exists(wrapper):
+            cmd = [wrapper] + cmd
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
-        print("⚠️ check-run publish failed: %s" % r.stderr[:150],
-              file=sys.stderr)
-        return None
-    try:
-        return json.loads(r.stdout).get("id")
-    except Exception:
-        return None
+        print("⚠️ status publish failed (%s): %s"
+              % (head_sha[:12], r.stderr[:150]), file=sys.stderr)
+        return False
+    return True
 
 
 def gate_for_pr(repo, pr_num):
@@ -119,6 +112,7 @@ def scan_and_publish(repo, limit=10, rotate_key="gate_rotate"):
 
     P1-3: 用 gate_for_pr 返回的实际评估 SHA 发布 (防 push 竞态).
     P1-4: 轮转 — 从上次位置继续, 避免固定取前 N 个导致旧 PR 饥饿.
+    P1-A: count = min(limit, len(prs)) — 单 tick 每个 PR 最多一次.
     """
     r = _gh(["pr", "list", "--repo", repo, "--state", "open",
              "--limit", "30", "--json", "number,headRefOid,updatedAt"])
@@ -141,10 +135,11 @@ def scan_and_publish(repo, limit=10, rotate_key="gate_rotate"):
     except Exception:
         rotate = {}
     start = rotate.get(repo, 0)
-    # 取从 start 开始的 limit 个 (循环)
-    picked = [(prs[i % len(prs)]) for i in range(start, start + limit)]
+    # P1-A: 取 min(limit, len(prs)) 个 (循环, 但不多于 PR 总数)
+    count = min(limit, len(prs))
+    picked = [(prs[(start + i) % len(prs)]) for i in range(count)]
     # 更新轮转位置
-    rotate[repo] = (start + limit) % max(len(prs), 1)
+    rotate[repo] = (start + count) % max(len(prs), 1)
     try:
         os.makedirs(os.path.dirname(rp), exist_ok=True)
         with open(rp, "w") as f:
@@ -157,11 +152,13 @@ def scan_and_publish(repo, limit=10, rotate_key="gate_rotate"):
         num = pr["number"]
         conclusion, title, summary, head = gate_for_pr(repo, num)
         if head:  # P1-3: 用实际评估的 SHA
-            cid = publish_checkrun(repo, head, conclusion, title, summary)
+            ok = publish_status(repo, head, conclusion, title, summary)
         else:
-            cid = None
+            ok = False
+        # P1-B: 发布失败必须显式记录 (check_id=None 不可静默)
         published.append({"pr": num, "conclusion": conclusion,
-                          "check_id": cid, "head": (head or pr.get("headRefOid", ""))[:12]})
+                          "published": ok,
+                          "head": (head or pr.get("headRefOid", ""))[:12]})
     return published
 
 
@@ -173,10 +170,10 @@ if __name__ == "__main__":
     args = ap.parse_args()
     if args.pr:
         conclusion, title, summary, head = gate_for_pr(args.repo, args.pr)
-        cid = None
+        ok = False
         if head:
-            cid = publish_checkrun(args.repo, head, conclusion, title, summary)
+            ok = publish_status(args.repo, head, conclusion, title, summary)
         print(json.dumps({"pr": args.pr, "conclusion": conclusion,
-                          "check_id": cid}))
+                          "published": ok}))
     else:
         print(json.dumps(scan_and_publish(args.repo), ensure_ascii=False))

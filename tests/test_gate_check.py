@@ -61,18 +61,47 @@ def test_gate_for_pr_closing_fail():
     assert c == "failure"
 
 
-def test_publish_checkrun():
+def test_publish_status():
     def fake_run(args, input=None, capture_output=True, text=True, timeout=30):
-        assert "--input" in args and "-" in args
+        joined = " ".join(args)
+        assert "statuses/" in joined and "-f" in joined
         r = mock.Mock()
         r.returncode = 0
         r.stdout = json.dumps({"id": 42})
         r.stderr = ""
         return r
     with mock.patch.object(gate_check.subprocess, "run", fake_run):
-        cid = gate_check.publish_checkrun("r", "a" * 40, "success",
-                                          "title", "summary")
-    assert cid == 42
+        ok = gate_check.publish_status("r", "a" * 40, "success",
+                                       "title", "summary")
+    assert ok is True
+
+
+def test_publish_status_failure_returns_false():
+    """发布失败 → False (P1-B: 显式报警, 不静默)."""
+    def fake_run(args, input=None, capture_output=True, text=True, timeout=30):
+        r = mock.Mock()
+        r.returncode = 1
+        r.stdout = ""
+        r.stderr = "error"
+        return r
+    with mock.patch.object(gate_check.subprocess, "run", fake_run):
+        ok = gate_check.publish_status("r", "a" * 40, "failure", "t", "s")
+    assert ok is False
+
+
+def test_publish_failure_state():
+    """failure 结论 → state=failure."""
+    seen = {}
+    def fake_run(args, input=None, capture_output=True, text=True, timeout=30):
+        seen["args"] = args
+        r = mock.Mock()
+        r.returncode = 0
+        r.stdout = json.dumps({"id": 1})
+        r.stderr = ""
+        return r
+    with mock.patch.object(gate_check.subprocess, "run", fake_run):
+        gate_check.publish_status("r", "a" * 40, "failure", "t", "s")
+    assert "state=failure" in " ".join(seen["args"])
 
 
 def test_scan_publish():
@@ -86,6 +115,20 @@ def test_scan_publish():
     assert out[0]["pr"] == 5
     assert out[0]["conclusion"] == "failure"  # 无 closing issue
     assert out[0]["head"] == "a" * 12
+    assert "published" in out[0]  # P1-B: published 字段
+
+
+def test_scan_publish_single_pr_no_dup():
+    """P1-A: 单 PR + limit=5 → 只取 1 次 (不重复)."""
+    prs = json.dumps([{"number": 7, "headRefOid": "b" * 40,
+                       "updatedAt": "2026-08-11T00:00:00Z"}])
+    pr_detail = json.dumps({"headRefOid": "b" * 40, "title": "t",
+                            "closingIssuesReferences": [], "state": "OPEN"})
+    fake = FakeGh([prs, pr_detail, json.dumps({"id": 1})])
+    with mock.patch.object(gate_check, "_gh", fake):
+        out = gate_check.scan_and_publish("r", limit=5)
+    assert len(out) == 1  # 只有 1 个 PR → 只发布 1 次
+    assert out[0]["pr"] == 7
 
 
 def test_fetch_comments_meta_array():
