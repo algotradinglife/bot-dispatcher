@@ -10,11 +10,22 @@ Design: docs/PI-GATE.md (2026-08-11, PI self-proposed).
 import json
 import re
 import subprocess
+import time
 
 GATE_NAMES = ["G01", "G02", "G03", "G04", "G05", "G06"]
 
 # EV PASS 评论中的审计 SHA 标记 (auditor 交付规范)
 EV_SHA_RE = re.compile(r"AUDITED_SHA=([0-9a-f]{7,40})", re.IGNORECASE)
+
+# REQ 编号 (契约 body) — E01-E08 + issue 特定 (如 REQ-207-01)
+# 支持 REQ-E01 和 REQ-E-01 两种写法; 捕获完整 REQ-xxx (统一格式)
+REQ_RE = re.compile(r"\b(REQ-[A-Z][A-Z0-9]*-?\d{1,2})\b")
+
+# worker 交付表行: | REQ-E01 | evidence | PASS |
+REQ_ROW_RE = re.compile(r"\|\s*(REQ-[A-Z][A-Z0-9]*-?\d{1,2})\s*\|")
+
+# PI 对抗性标记: [ADVERSARIAL] baseline=pass leak=pass ...
+ADVERSARIAL_RE = re.compile(r"\[ADVERSARIAL\]\s*([^\]]+)", re.IGNORECASE)
 
 
 def _gh(args, timeout=20):
@@ -110,15 +121,31 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
         ok = len(owners) == 1 and not open_blockers
         result["G01"] = ("PASS" if ok else "FAIL", evidence)
 
-    # G02 — Contract: REQ 完整性 (通过 issue body 是否含 REQ 引用粗略检查)
+    # G02 — Contract: REQ 完整性 (机器可解析: 契约 REQ 编号 vs 交付表)
     if issue_num:
         r = _gh(["issue", "view", str(issue_num), "--repo", repo,
                  "--json", "body", "--jq", ".body"])
         body = r.stdout if r.returncode == 0 else ""
-        has_req = "REQ-" in body
-        result["G02"] = ("PASS" if has_req else "REMIND",
-                         "REQ referenced in contract" if has_req
-                         else "no REQ reference (template E01-E08 recommended)")
+        contract_reqs = sorted(set(REQ_RE.findall(body)))
+        # worker 交付表: REQ→evidence (PR/issue 评论里的表格行)
+        r2 = _gh(["issue", "view", str(issue_num), "--repo", repo,
+                  "--json", "comments", "--jq", ".comments[].body"])
+        delivered_reqs = set()
+        if r2.returncode == 0:
+            for line in r2.stdout.splitlines():
+                m = REQ_ROW_RE.match(line.strip())
+                if m:
+                    delivered_reqs.add(m.group(1))
+        missing = [r for r in contract_reqs if r not in delivered_reqs]
+        if not contract_reqs:
+            result["G02"] = ("REMIND",
+                             "no REQ referenced (template E01-E08 recommended)")
+        elif missing:
+            result["G02"] = ("FAIL",
+                             "REQ missing evidence: %s" % ",".join(missing))
+        else:
+            result["G02"] = ("PASS",
+                             "REQ covered: %s" % ",".join(contract_reqs))
     else:
         result["G02"] = ("SKIP", "no issue")
 
@@ -138,16 +165,21 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
     else:
         result["G03"] = ("SKIP", "no PR")
 
-    # G04 — Adversarial: 终审评论是否含对抗性证据 (粗略)
+    # G04 — Adversarial: PI 终审评论的 [ADVERSARIAL] 结构化标记
     if issue_num:
         r = _gh(["issue", "view", str(issue_num), "--repo", repo,
                  "--json", "comments", "--jq", ".comments[].body"])
         comments = r.stdout if r.returncode == 0 else ""
-        adv_kw = any(k in comments for k in
-                     ("baseline", "泄漏", "selection bias", "对抗", "adversarial"))
-        result["G04"] = ("PASS" if adv_kw else "REMIND",
-                         "adversarial keywords found" if adv_kw
-                         else "no adversarial review evidence")
+        # 结构化: [ADVERSARIAL] baseline=pass leak=pass selection=pass
+        markers = ADVERSARIAL_RE.findall(comments)
+        if markers:
+            result["G04"] = ("PASS",
+                             "adversarial markers: %s" % ",".join(markers))
+        elif any(k in comments for k in
+                 ("baseline", "泄漏", "selection bias", "对抗", "adversarial")):
+            result["G04"] = ("PASS", "adversarial keywords found (unstructured)")
+        else:
+            result["G04"] = ("REMIND", "no adversarial review evidence")
     else:
         result["G04"] = ("SKIP", "no issue")
 
@@ -190,8 +222,25 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
     return result
 
 
-def render_receipt(result, operation, title="", url=""):
-    """Render a gate receipt table (PI 终审前展示)."""
+def render_receipt(result, operation, title="", url="", as_json=False):
+    """Render a gate receipt — human table or machine JSON.
+
+    as_json=True → {"operation", "title", "gates": {G01: {status,
+    evidence}}, "blocked": [..], "timestamp"}. PI 工具/CI 可直接消费.
+    """
+    if as_json:
+        gates = {g: {"status": s, "evidence": e}
+                 for g, (s, e) in result.items()}
+        blocked = sorted(g for g, (s, _) in result.items() if s == "FAIL")
+        return json.dumps({
+            "operation": operation,
+            "title": title,
+            "url": url,
+            "gates": gates,
+            "blocked": blocked,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, ensure_ascii=False)
+
     lines = ["## PI-GATE receipt — %s" % operation]
     if title:
         lines.append("> %s" % title)
@@ -217,6 +266,8 @@ if __name__ == "__main__":
     ap.add_argument("--issue", type=int)
     ap.add_argument("--pr", type=int)
     ap.add_argument("--operation", default="merge")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable JSON receipt")
     args = ap.parse_args()
     res = check_pi_gates(args.repo, args.issue, args.pr, args.operation)
-    print(render_receipt(res, args.operation))
+    print(render_receipt(res, args.operation, as_json=args.json))
