@@ -48,13 +48,20 @@ def _graph_ok():
         "blockedBy": [],
         "blocking": [],
         "parent": None,
+        "milestone": {"title": "v0_4"},
         "assignees": ["everything-bot-engineer"],
     })
 
 
 def _graph_blocked():
     d = json.loads(_graph_ok())
-    d["blockedBy"] = [{"number": 999}]
+    d["blockedBy"] = [{"number": 999, "state": "OPEN"}]
+    return json.dumps(d)
+
+
+def _graph_blocked_closed():
+    d = json.loads(_graph_ok())
+    d["blockedBy"] = [{"number": 999, "state": "CLOSED"}]
     return json.dumps(d)
 
 
@@ -86,6 +93,14 @@ def test_g01_fail_open_blocker():
     with mock.patch.object(pi_gates, "_gh", fake):
         res = pi_gates.check_pi_gates("r", issue_num=1)
     assert res["G01"][0] == "FAIL"
+
+
+def test_g01_pass_closed_blocker():
+    """CLOSED blocker 不阻塞 (PI review item 3)."""
+    fake = FakeGh([_graph_blocked_closed()])
+    with mock.patch.object(pi_gates, "_gh", fake):
+        res = pi_gates.check_pi_gates("r", issue_num=1)
+    assert res["G01"][0] == "PASS"
 
 
 def test_g01_fail_graph_unavailable():
@@ -174,7 +189,7 @@ def test_g05_remind_open():
 
 def test_g06_premature_activation():
     d = json.loads(_graph_ok())
-    d["blocking"] = [{"number": 300}]
+    d["blocking"] = [{"number": 300, "state": "OPEN"}]
     graph = json.dumps(d)
     fake = FakeGh([graph, "REQ-E01", "adv", "{}", '"Ready"'])
     with mock.patch.object(pi_gates, "_gh", fake):

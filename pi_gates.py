@@ -23,9 +23,13 @@ def _gh(args, timeout=20):
 
 
 def _issue_graph(repo, issue_num):
-    """Live graph receipt: project/milestone/blockedBy/blocking/parent/owner."""
+    """Live graph receipt: project/milestone/blockedBy/blocking/parent/owner.
+
+    PI-GATE G01 增强 (PI review item 3): blocker 状态 OPEN/CLOSED,
+    Milestone, 唯一 Project 都解析; 只把 OPEN 的 blocker 视为阻塞.
+    """
     r = _gh(["issue", "view", str(issue_num), "--repo", repo,
-             "--json", "projectItems,blockedBy,blocking,parent,assignees"])
+             "--json", "projectItems,blockedBy,blocking,parent,assignees,milestone"])
     if r.returncode != 0:
         return None
     try:
@@ -34,18 +38,28 @@ def _issue_graph(repo, issue_num):
         return None
     projects = [p for p in d.get("projectItems", []) if p.get("status")]
     # blockedBy/blocking 可能是 dict 或 list (gh 版本差异)
-    def _nums(field):
+    def _blockers(field):
         v = d.get(field)
+        items = []
         if isinstance(v, list):
-            return [b.get("number") for b in v if isinstance(b, dict)]
-        if isinstance(v, dict):
-            return [v.get("number")] if v.get("number") else []
-        return []
+            items = v
+        elif isinstance(v, dict):
+            items = [v]
+        out = []
+        for b in items:
+            if not isinstance(b, dict):
+                continue
+            num = b.get("number")
+            st = (b.get("state") or b.get("status") or "").upper()
+            # 只统计 OPEN 的 blocker (CLOSED 不算阻塞)
+            out.append({"number": num, "open": st in ("", "OPEN")})
+        return out
     return {
         "projects": projects,
-        "blocked_by": _nums("blockedBy"),
-        "blocking": _nums("blocking"),
+        "blocked_by": _blockers("blockedBy"),
+        "blocking": _blockers("blocking"),
         "parent": (d.get("parent") or {}).get("number"),
+        "milestone": (d.get("milestone") or {}).get("title"),
         "assignees": [a.get("login") if isinstance(a, dict) else a
                       for a in d.get("assignees", [])],
     }
@@ -83,15 +97,16 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
     """Run the 6 PI gates. Returns {gate: (PASS|FAIL|REMIND|SKIP, evidence)}."""
     result = {}
 
-    # G01 — Graph: 唯一 owner + 无未关 blocker
+    # G01 — Graph: 唯一 owner + 无未关 blocker + milestone
     graph = _issue_graph(repo, issue_num) if issue_num else None
     if graph is None:
         result["G01"] = ("FAIL", "graph unavailable (control plane)")
     else:
         owners = {p.get("title") for p in graph["projects"]}
-        open_blockers = [b for b in graph["blocked_by"]]
-        evidence = "projects=%s blockedBy=%s" % (
-            sorted(owners), open_blockers)
+        open_blockers = [b["number"] for b in graph["blocked_by"]
+                         if b.get("open")]
+        evidence = "projects=%s blockedBy(open)=%s milestone=%s" % (
+            sorted(owners), open_blockers, graph.get("milestone") or "-")
         ok = len(owners) == 1 and not open_blockers
         result["G01"] = ("PASS" if ok else "FAIL", evidence)
 
@@ -154,15 +169,18 @@ def check_pi_gates(repo, issue_num=None, pr_num=None, operation="merge",
         result["G05"] = ("SKIP", "no issue")
 
     # G06 — Downstream activation: 下游 issue 是否在 PI 授权前置 Ready
-    # (扫描 blocking 子项的状态 — 简化: 依赖 G01 的 blocking 列表)
+    # (扫描 blocking 子项的状态 — 只查 OPEN 的下游)
     if graph and graph["blocking"]:
         premature = []
         for child in graph["blocking"]:
-            r = _gh(["issue", "view", str(child), "--repo", repo,
+            num = child.get("number")
+            if num is None or not child.get("open"):
+                continue
+            r = _gh(["issue", "view", str(num), "--repo", repo,
                      "--json", "projectItems",
                      "--jq", ".projectItems[].status.name"])
             if r.returncode == 0 and "Ready" in r.stdout:
-                premature.append(child)
+                premature.append(num)
         result["G06"] = ("FAIL" if premature else "PASS",
                          "downstream premature Ready: %s" % premature
                          if premature else "no premature activation")
