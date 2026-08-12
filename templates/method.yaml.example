@@ -34,6 +34,36 @@ metrics:
     definition: "completed recovery vs terminal-open separated"
     golden_test: "tests/golden_metrics.py::test_drawdown"
 
+# 板块拆解 — 探索/分析类工作按板块交付（每板块有交付标准）
+# skill 引用 = analyst/engineer profile 已装的 data-science skills
+# （eda-checklist / data-preprocessing / experiment-tracking /
+#   split-strategy / model-card / reproducibility-checklist）
+stages:
+  - name: data_stats          # 数据统计
+    deliverable: "行/列/类型/缺失率/分布摘要"
+    skill: "eda-checklist"
+    constraints: []
+  - name: preprocessing       # 预处理
+    deliverable: "清洗/校验/转换 前后对比 + 处理理由"
+    skill: "data-preprocessing"
+    constraints: ["fail-fast 校验", "原子写"]
+  - name: eda                 # 探索性分析
+    deliverable: "分布/聚类/相关性发现 + 对建模的含义"
+    skill: "eda-checklist"
+    constraints: []
+  - name: feature_engineering # 特征工程
+    deliverable: "特征定义表 + 信息量指标 + 为什么"
+    skill: "data-preprocessing"
+    constraints: ["标签/未来信息不得进特征（REQ-E06）"]
+  - name: model_selection     # 模型选择
+    deliverable: "候选集 + 选择 split 声明 + 对比指标"
+    skill: "split-strategy"
+    constraints: ["选择只用 selection_split（治泄漏）"]
+  - name: model_evaluation    # 参数优化/对比
+    deliverable: "对比方式/指标定义/结论边界 + 实验日志"
+    skill: "experiment-tracking"
+    constraints: ["指标按 metrics 段定义实现 + golden tests"]
+
 # 预算/停止规则
 budget:
   max_runtime_h: 8
