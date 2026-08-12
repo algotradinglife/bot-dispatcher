@@ -92,6 +92,26 @@ realized_gross/SP/概率/不确定性等），且能**从冻结源头逐行重�
 
 **验证**：评论含三要素；RESUME_SESSION 注入后返工 run 可 --resume 续接。
 
+## REQ-M — 方法协议冻结（delivery-improvement v2，可选但研究/模型类必带）
+
+> 契约带 `method.yaml`（见 templates/method.yaml.example）时启用。
+> 治 R2 类方法缺陷（#207 R2-01 模型选择泄漏教训）。
+
+**条款**：模型/消融选择只能在 `selection_split` 冻结；`terminal_split`
+只执行一次冻结后的 terminal decision。指标（HHI/rolling/回撤）按
+method.yaml 的 definition 实现 + golden tests。协议变更必须记入
+PROTOCOL-LOG（追加式，`supersede` 引用旧行），禁止静默修改。
+
+**验证**：
+```bash
+python method_preflight.py --worktree <交付路径>   # exit 0 = PASS
+```
+- REQ-M01 协议冻结：method.yaml 存在 + schema 合法 + receipt hash 匹配
+- REQ-M02 holdout 隔离：selection 数据不得出现在 terminal 评估路径
+  （holdout_isolated=true 时）；false 时 report 显式记录剩余风险
+- REQ-M03 指标定义：golden tests 逐条（`tests/golden_metrics.py`）
+- REQ-M04 协议修订：PROTOCOL-LOG 追加式完整 + 无隐藏修订
+
 ---
 
 ## Worker 交付对照表格式
