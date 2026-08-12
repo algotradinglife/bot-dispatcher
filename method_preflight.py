@@ -26,6 +26,7 @@ REQUIRED_KEYS = [
 ]
 SPLIT_KEYS = ["selection_split", "terminal_split", "holdout_isolated"]
 METRIC_KEYS = ["name", "definition", "golden_test"]
+STAGE_KEYS = ["name", "deliverable", "skill", "constraints"]
 LOG_EVENT_RE = re.compile(
     r"^\|\s*(revise|add|supersede)\s*\|.*\|.*\|.*\|.*\|.*\|")
 
@@ -64,6 +65,14 @@ def check_schema(m):
     arts = m.get("required_artifacts", [])
     if not isinstance(arts, list) or not arts:
         errors.append("required_artifacts 必须是非空列表")
+    stages = m.get("stages", [])
+    if stages is not None and not isinstance(stages, list):
+        errors.append("stages 必须是列表")
+    elif isinstance(stages, list):
+        for i, st in enumerate(stages):
+            for k in STAGE_KEYS:
+                if k not in st:
+                    errors.append("stages[%d] 缺少字段: %s" % (i, k))
     return not errors, errors
 
 

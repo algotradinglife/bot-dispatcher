@@ -81,6 +81,41 @@ def test_bad_schema_fails():
     assert not res["checks"]["schema"]["ok"]
 
 
+def test_stages_schema():
+    """stages 结构校验: 缺 skill 字段 → FAIL."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace(
+        "required_artifacts: [\"results/ledger.parquet\"]",
+        "stages:\n  - {name: eda, deliverable: x}\n"
+        "required_artifacts: [\"results/ledger.parquet\"]")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert not res["checks"]["schema"]["ok"]
+
+
+def test_stages_valid():
+    """stages 合法 → PASS."""
+    d = _make_worktree()
+    ok = VALID_YAML.replace(
+        "required_artifacts: [\"results/ledger.parquet\"]",
+        "stages:\n"
+        "  - {name: data_stats, deliverable: x, skill: eda-checklist, constraints: []}\n"
+        "  - {name: model_selection, deliverable: y, skill: split-strategy, constraints: [\"CV_2022 only\"]}\n"
+        "required_artifacts: [\"results/ledger.parquet\"]")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(ok)
+    # 重建 manifest 匹配新 method.yaml hash
+    import hashlib
+    h = hashlib.sha256(open(os.path.join(d, "method.yaml"), "rb").read()).hexdigest()
+    with open(os.path.join(d, "results", "manifest.sha256"), "w") as f:
+        f.write("%s  method.yaml\n" % h)
+    res, code = mp.run(d, verbose=False)
+    assert code == 0, res
+    assert res["checks"]["schema"]["ok"]
+
+
 def test_json_output():
     d = _make_worktree()
     with mock.patch.object(sys, "argv", ["method_preflight.py", "--worktree", d, "--json"]):
