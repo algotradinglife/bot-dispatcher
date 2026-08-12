@@ -179,6 +179,72 @@ def save_state(state_file, state):
     tmp.replace(state_file)
 
 
+def g05_reconcile(repo, prev_state, new_state, prefix, output,
+                  batch=30, dedup_hours=24):
+    """PI-GATE G05 合并后对账 — 分页全量扫描 merged PR.
+
+    每 tick 处理一批 (batch 个), 游标 g05_cursor:<repo> 轮转推进,
+    最终覆盖所有 merged PR (不再只扫最近 15 个). 同一 PR 的同一
+    缺失项 dedup_hours 内只报警一次.
+
+    Returns: 无 (结果写入 output["warnings"], 游标写入 new_state).
+    """
+    from pi_gates import check_g05_only
+    # 分页获取全部 merged PR (按 merged 时间倒序)
+    all_merged = []
+    page = 1
+    while True:
+        mrun2 = subprocess.run(
+            ["gh", "pr", "list", "--repo", repo, "--state", "merged",
+             "--limit", "100", "--page", str(page),
+             "--json", "number,mergedAt"],
+            capture_output=True, text=True, timeout=20)
+        if mrun2.returncode != 0:
+            break
+        batch_resp = json.loads(mrun2.stdout)
+        if not batch_resp:
+            break
+        all_merged.extend(batch_resp)
+        if len(batch_resp) < 100:
+            break
+        page += 1
+        if page > 10:  # 最多 1000 个 PR 的安全上限
+            break
+    if not all_merged:
+        return
+    # 按 merged 时间倒序 (新的先对账)
+    all_merged.sort(key=lambda p: p.get("mergedAt") or "", reverse=True)
+    # 游标轮转: 从上次位置继续
+    cursor_key = "g05_cursor:%s" % repo
+    cursor = int(prev_state.get(cursor_key) or new_state.get(cursor_key) or 0)
+    if cursor >= len(all_merged):
+        cursor = 0  # 一轮完成, 重新开始
+    batch_prs = all_merged[cursor:cursor + batch]
+    new_state[cursor_key] = str(cursor + batch)
+    for pr in batch_prs:
+        pn = pr["number"]
+        lr = subprocess.run(
+            ["gh", "pr", "view", str(pn), "--repo", repo,
+             "--json", "closingIssuesReferences",
+             "--jq", ".closingIssuesReferences[].number"],
+            capture_output=True, text=True, timeout=15)
+        linked = [int(x) for x in lr.stdout.split() if x.strip()]
+        for li in linked:  # P1-D: 所有 closing issues
+            g05 = check_g05_only(repo, li)
+            if g05[0] in ("REMIND", "FAIL"):
+                item = g05[1][:60]
+                dedup_key = "g05:%d:%d:%s" % (pn, li, item)
+                now_ts = time.time()
+                prev_ts = prev_state.get(dedup_key) or new_state.get(dedup_key)
+                if prev_ts and (now_ts - float(prev_ts)) < dedup_hours * 3600:
+                    continue  # 已报警过, 限频跳过
+                icon = "⚠️" if g05[0] == "REMIND" else "⛔"
+                output["warnings"].append(
+                    "%s %s PI-GATE G05: PR #%d issue #%d 对账 — %s"
+                    % (prefix, icon, pn, li, g05[1][:70]))
+                new_state[dedup_key] = str(now_ts)
+
+
 def gql_query(query, retries=4, base_delay=1.0):
     """Run a GraphQL query with retry on transient failures (rate limit, network)."""
     last_err = None
@@ -504,40 +570,10 @@ def main():
 
     # ── PI-GATE G05: 合并后对账 (独立段 — 每次 tick 都对已 merged 的
     #    PR 跑对账; P0-4: 不在首次 merged 检测内, 避免 prev_m==merged
-    #    continue 导致 G05 只跑一次). 去重限频 (PI review item 5):
-    #    同一 PR 的同一缺失项 G05_DEDUP_HOURS 内只报警一次.
-    #    P0-D: 用轻量 check_g05_only (单 issue 查询) 避免 API 限流.
-    #    P1-D: 对 PR 的【所有】closing issues 对账 (不只第一个). ──
-    G05_DEDUP_HOURS = 24
+    #    continue 导致 G05 只跑一次). 全量分页 + 游标轮转 + 去重限频.
+    #    已抽成 g05_reconcile() (可单测). ──
     try:
-        from pi_gates import check_g05_only
-        mrun2 = subprocess.run(
-            ["gh", "pr", "list", "--repo", repo, "--state", "merged",
-             "--limit", "15", "--json", "number"],
-            capture_output=True, text=True, timeout=20)
-        if mrun2.returncode == 0:
-            for pr in json.loads(mrun2.stdout):
-                pn = pr["number"]
-                lr = subprocess.run(
-                    ["gh", "pr", "view", str(pn), "--repo", repo,
-                     "--json", "closingIssuesReferences",
-                     "--jq", ".closingIssuesReferences[].number"],
-                    capture_output=True, text=True, timeout=15)
-                linked = [int(x) for x in lr.stdout.split() if x.strip()]
-                for li in linked:  # P1-D: 所有 closing issues
-                    g05 = check_g05_only(repo, li)
-                    if g05[0] in ("REMIND", "FAIL"):
-                        item = g05[1][:60]
-                        dedup_key = "g05:%d:%d:%s" % (pn, li, item)
-                        now_ts = time.time()
-                        prev_ts = prev_state.get(dedup_key) or new_state.get(dedup_key)
-                        if prev_ts and (now_ts - float(prev_ts)) < G05_DEDUP_HOURS * 3600:
-                            continue  # 已报警过, 限频跳过
-                        icon = "⚠️" if g05[0] == "REMIND" else "⛔"
-                        output["warnings"].append(
-                            "%s %s PI-GATE G05: PR #%d issue #%d 对账 — %s"
-                            % (prefix, icon, pn, li, g05[1][:70]))
-                        new_state[dedup_key] = str(now_ts)
+        g05_reconcile(repo, prev_state, new_state, prefix, output)
     except Exception as e:
         output["warnings"].append(
             "%s PI-GATE G05 reconcile: %s" % (prefix, str(e)[:100]))
