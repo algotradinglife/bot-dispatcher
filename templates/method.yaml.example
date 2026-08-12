@@ -16,7 +16,13 @@ splits:
   selection_split: "CV_2022"     # 模型/消融选择冻结处（只能在这选）
   terminal_split: "CV_2023"      # 只执行一次冻结后的 terminal decision
   holdout_isolated: true          # true=selection 数据不出现在 terminal 路径；false=记录剩余风险
-  enforce_distinct: true          # 强制 selection != terminal (preflight 校验)
+  # enforce_distinct 已删除 — codex: 不变量应无条件成立, 不做可关闭开关
+
+# terminal 访问控制 (codex 结构化字段 — 不再埋在 constraints 自由文本)
+# model_selection 阶段: forbidden; terminal_evaluation 阶段: exactly_once
+terminal_access:
+  model_selection: forbidden
+  terminal_evaluation: exactly_once
 
 # 选择算法（防泄漏的声明）
 selection_algorithm:

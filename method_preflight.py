@@ -54,12 +54,34 @@ def check_schema(m):
     for k in SPLIT_KEYS:
         if k not in splits:
             errors.append("splits 缺少字段: %s" % k)
-    # codex P0-3: selection_split != terminal_split 强制（防泄漏）
+    # codex 复审 (2026-08-12): split 必须是 strip 后非空字符串
     sel = splits.get("selection_split")
     term = splits.get("terminal_split")
-    if sel and term and sel == term:
+    for k, v in (("selection_split", sel), ("terminal_split", term)):
+        if not isinstance(v, str) or not v.strip():
+            errors.append("splits.%s 必须是非空字符串（不能 null/空串）" % k)
+    # codex: selection_split != terminal_split 无条件强制（防泄漏）
+    if (isinstance(sel, str) and isinstance(term, str)
+            and sel.strip() and term.strip() and sel.strip() == term.strip()):
         errors.append("selection_split == terminal_split（%s）— 必须不同，"
-                      "否则选择与评估共用数据 = 泄漏" % sel)
+                      "否则选择与评估共用数据 = 泄漏" % sel.strip())
+    # codex: terminal_access 结构化字段 — 不再埋在 constraints 自由文本
+    TA = m.get("terminal_access", {})
+    if not isinstance(TA, dict):
+        errors.append("terminal_access 必须是 mapping")
+    else:
+        for stage, expect in (("model_selection", "forbidden"),
+                              ("terminal_evaluation", "exactly_once")):
+            v = TA.get(stage)
+            if v != expect:
+                errors.append("terminal_access.%s 必须是 %r（实际 %r）"
+                              % (stage, expect, v))
+    # codex: preregistered 必须 True
+    sel_alg = m.get("selection_algorithm", {})
+    if not isinstance(sel_alg, dict):
+        errors.append("selection_algorithm 必须是 mapping")
+    elif sel_alg.get("preregistered") is not True:
+        errors.append("selection_algorithm.preregistered 必须为 true")
     metrics = m.get("metrics", [])
     if not isinstance(metrics, list) or not metrics:
         errors.append("metrics 必须是非空列表")

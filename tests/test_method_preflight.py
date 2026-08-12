@@ -13,6 +13,9 @@ protocol_version: 1
 candidate_pool: {source: "frozen", size: 100}
 splits: {selection_split: CV_2022, terminal_split: CV_2023, holdout_isolated: true}
 selection_algorithm: {method: frozen, preregistered: true, seed: 42}
+terminal_access:
+  model_selection: forbidden
+  terminal_evaluation: exactly_once
 metrics:
   - {name: hhi, definition: "agg by identity", golden_test: "t.py::test_hhi"}
 stages:
@@ -225,3 +228,39 @@ def test_holdout_false_requires_report():
     res, code = mp.run(d, verbose=False)
     assert code == 1
     assert "剩余风险" in res["checks"]["holdout"]["msg"]
+
+
+def test_terminal_access_wrong_fails():
+    """codex: terminal_access 错误值 → FAIL (不再靠自由文本)."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace(
+        "  terminal_evaluation: exactly_once",
+        "  terminal_evaluation: allowed")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert any("terminal_access.terminal_evaluation" in m
+               for m in res["checks"]["schema"]["msg"])
+
+
+def test_split_null_fails():
+    """codex: selection_split: null → FAIL (不能空值绕过)."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace("selection_split: CV_2022", "selection_split: null")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert any("非空字符串" in m for m in res["checks"]["schema"]["msg"])
+
+
+def test_preregistered_false_fails():
+    """codex: preregistered: false → FAIL."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace("preregistered: true", "preregistered: false")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert any("preregistered" in m for m in res["checks"]["schema"]["msg"])
