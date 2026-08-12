@@ -56,14 +56,26 @@ git clean -fdx && git checkout <HEAD>
 **验证**：`verify` 命令 18/18 payloads（或契约数量）→ manifest SHA-256
 与提交一致 → 独立 replay 到新目录 byte-identical。
 
-## REQ-E06 — 无泄漏与溯源（#206-03~05 教训）
+## REQ-E06 — 无泄漏与溯源 + 强制 tamper 自测（#206-03~05 + #207-02/03 教训）
 
 **条款**：标签/事后信息不得进入特征/选择/结算（如 final-SP 仅输出通道）；
 每 ticket 的 source trace 必须绑定回冻结源矩阵（cell 级）；不确定性/概率/
-SP 输入可溯源。
+SP 输入可溯源。semantic verifier 必须覆盖**全部结算字段**（realized_hit/
+realized_gross/SP/概率/不确定性等），且能**从冻结源头逐行重算** ledger
+（不是只查内部自洽）。
 
-**验证**：极端改写标签值 → 全链路 byte-identical（无泄漏）；semantic verifier
-拒绝伪造/不匹配的 source trace；OOD fallback 显式。
+**验证**：
+- 极端改写标签值 → 全链路 byte-identical（无泄漏）
+- semantic verifier 拒绝伪造/不匹配的 source trace；OOD fallback 显式
+- **tamper 自测（强制，worker 交付前必做）**：worker 必须编写并运行
+  对抗性 tamper 测试，攻击自己的 verifier — 至少覆盖：
+  1. 篡改结算字段（realized_gross/payout 改值）→ verifier 必须 FAIL
+  2. 篡改 ledger 某行但保持会计等式成立 → verifier 必须 FAIL
+  3. 重写 manifest 伪造 → verifier 必须 FAIL
+  4. 伪造 source trace / 改 label / future 信息 → verifier 必须 FAIL
+  **任何 tamper 测试通过 verifier = 交付缺陷**（EV-B207-02/03 模式：
+  verifier 字段覆盖不全被伪造穿透，已两次发生，必须根治）
+- tamper 测试本身必须提交（tests/ 下），EV 会重跑并追加自己的攻击
 
 ## REQ-E07 — 科学结论边界（PI 层，防过度外推）
 
