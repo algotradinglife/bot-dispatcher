@@ -96,20 +96,25 @@ realized_gross/SP/概率/不确定性等），且能**从冻结源头逐行重�
 
 > 契约带 `method.yaml`（见 templates/method.yaml.example）时启用。
 > 治 R2 类方法缺陷（#207 R2-01 模型选择泄漏教训）。
+> **偏简版（风险前置）**：先做声明 + 自检，不强制物理隔离；
+> 若 pilot/失败数据显示兜不住，再逐级加码（EV 认可修订 →
+> holdout 隔离 runner → 独立复算基准）。
 
-**条款**：模型/消融选择只能在 `selection_split` 冻结；`terminal_split`
+**条款**：模型/消融选择应在 `selection_split` 冻结；`terminal_split`
 只执行一次冻结后的 terminal decision。指标（HHI/rolling/回撤）按
-method.yaml 的 definition 实现 + golden tests。协议变更必须记入
-PROTOCOL-LOG（追加式，`supersede` 引用旧行），禁止静默修改。
+method.yaml 的 definition 实现 + golden tests（worker 自写，EV 抽查）。
+协议变更记入 PROTOCOL-LOG（追加式，`supersede` 引用旧行）—
+**修订无需 EV 预先批准**，但 EV 审计时抽查一致性；涉及 split/选择
+算法的重大修订，worker 应在交付评论中显式标注。
 
 **验证**：
 ```bash
 python method_preflight.py --worktree <交付路径>   # exit 0 = PASS
 ```
 - REQ-M01 协议冻结：method.yaml 存在 + schema 合法 + receipt hash 匹配
-- REQ-M02 holdout 隔离：selection 数据不得出现在 terminal 评估路径
-  （holdout_isolated=true 时）；false 时 report 显式记录剩余风险
-- REQ-M03 指标定义：golden tests 逐条（`tests/golden_metrics.py`）
+- REQ-M02 声明一致性：holdout_isolated 声明与实际执行一致
+  （物理隔离不强求；false 时 report 显式记录剩余风险）
+- REQ-M03 指标定义：golden tests 存在（EV 抽查语义正确性）
 - REQ-M04 协议修订：PROTOCOL-LOG 追加式完整 + 无隐藏修订
 
 ---
