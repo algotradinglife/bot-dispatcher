@@ -136,9 +136,47 @@ worker 自审发现数 / preflight 阻断数 / EV 新发现数 / PI 新发现数
 |---|---|
 | REQ-E06 tamper 自测 | 保留（工程层）；方法层由 REQ-M + preflight 覆盖 |
 | 契约 REQ 编号 | + method.yaml 协议冻结 |
-| 交付三要素 | + PROTOCOL-LOG（协议修订）|
+| 交付三要素 | + PROTOCOL-LOG（协议修订） |
 | EV 两轮深审 | preflight 前置拦截 + REQ-M rubric |
+| 探索类交付 | 板块 verdict + codex subagent 自检（预筛，不进 issue 状态） |
+
+## 八、探索类研究：板块化交付 + codex subagent 自检（2026-08-13 定）
+
+### 8.1 板块拆解（探索类默认形态）
+
+探索类研究（统计/预处理/EDA/特征/模型/对比）默认**单 issue 内按板块交付**，
+不拆 sub-issue（sub-issue 只留给需要并行或独立验收的场景；串行 sub-issue 的
+每 issue 固定开销吃掉收益，已用期望时长模型验证）：
+
+- 板块固定：统计 → 预处理 → EDA → 特征 → 模型 → 对比
+- 每板块三层交付标准：**问题 / 工件 / 约束**，交付前预注册
+- 单 notebook 实现；EV 按板块 verdict（板块 pass/fail），不做整轮 REJECT
+- 后置板块发现问题 → 同分支修 + EV 重验该板块（无 reopen 开销）
+
+### 8.2 codex subagent 自检（每板块交付前强制）
+
+每个板块实现并交付 EV 前，worker 必须调用 **codex subagent** 做自检：
+
+- **清单对位**：codex 自检必须用 EV 同一套标准——三层交付标准
+  （问题/工件/约束）+ preflight 硬门禁 + REQ-E06 tamper 自测；
+  泛泛 review 无效（delta≈0 = 白加开销，实测 26.1h > 纯板块 verdict 24.7h）
+- **就地修**：自检发现问题 → 交付前就地修（下游未建，无连锁返工）；
+  有效自检（delta≥0.5）时 EV 返工概率减半，EV 从"迭代打磨"变"确认性检查"
+- **不进 issue 状态**：自检结果不写 issue 状态、不产 EV 裁决、不留 kanban 痕迹
+- **不替代 EV**：EV 仍是唯一正式门禁（结构化 verdict + 审计独立性不变）；
+  codex 自检是"同模型家族自审"，只做预筛，独立性弱于 EV
+- 预期：高返工概率场景（p≥0.3）期望时长最优 + 尾部最短（p90 30.1h
+  vs 板块 verdict 32.9h vs sub-issue 34.3h）
+
+### 8.3 形态判定规则
+
+| 场景 | 形态 |
+|---|---|
+| 探索类（默认） | 单 issue + 板块 verdict + codex subagent 自检 |
+| 需要并行 / 独立验收 | 拆 sub-issue（blockedBy 串行，Issue Graph 表达） |
+| 工程类原子任务（如 finalize_delivery） | 单 issue 不拆，事务性交付 |
 
 ---
 *codex 审核（2026-08-12）：核心修正 = 机制硬化（method.yaml/preflight/
 holdout 隔离）优先于文书（DECISION/grill/SOUL）；#208 shadow pilot 验证。*
+*2026-08-13：探索类板块化交付 + codex subagent 自检写入（期望时长模型验证）。*
