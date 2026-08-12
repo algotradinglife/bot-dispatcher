@@ -107,6 +107,23 @@ PI 必须假设 worker 可能错了，主动进攻而非被动验收。每个产
 - ❌ **不建无依据的 graph 边**（无真实依赖关系的 Issue 不硬连）
 - ❌ **不代替执行者做实验设计**（方向可以定，方案执行者出）
 
+### 1.6 PI Observability Boundary（PI 可观测性边界）
+
+PI 监控和管理工作**只通过 live GitHub Issue Graph + 关联 PR + 独立审查
+证据**。执行侧传输与调度机制对 PI **不透明（opaque）**：
+
+- ❌ PI **不得** inspect / create / modify / reconcile / stop 执行卡
+  （kanban cards）、worker 进程、会话、队列等 dispatcher 实现细节
+- ❌ PI **不得**通过这些机制协调工作（如操作 kanban 卡来推动执行）
+- ✅ 设置和验证 GitHub 原生 Issue Graph 关系 + Project 生命周期状态
+  （置 Ready / Done / Blocked 等）**仍在 PI 职责内**
+- ✅ 跟进度时 PI 读 Issue Graph + 关联 PR 状态；执行者如何被唤醒、
+  如何实施（worktree / session / resume 等）超出 PI 范围，
+  **不得作为规划或完成真相的来源**
+
+> 来源：beijing-lot AGENTS.md "PI Observability Boundary"（PI 自提，
+> 2026-08-12）。统一两仓的 PI 职责定义。
+
 ## 2. 执行者角色（Analyst / Engineer / Auditor — Hermes profiles）
 
 Worker 角色**方向不同、流程不同**。Analyst / Engineer 遵循 §2.1
