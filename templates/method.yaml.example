@@ -11,10 +11,12 @@ candidate_pool:
   description: "55,042 exact-N7 frozen candidates (label-blind, source-bound)"
 
 # split 职责 — 模型/消融选择与 terminal 评估必须隔离
+# codex 审核 (2026-08-12): selection_split != terminal_split 必须成立
 splits:
   selection_split: "CV_2022"     # 模型/消融选择冻结处（只能在这选）
   terminal_split: "CV_2023"      # 只执行一次冻结后的 terminal decision
   holdout_isolated: true          # true=selection 数据不出现在 terminal 路径；false=记录剩余风险
+  enforce_distinct: true          # 强制 selection != terminal (preflight 校验)
 
 # 选择算法（防泄漏的声明）
 selection_algorithm:
@@ -36,33 +38,33 @@ metrics:
 
 # 板块拆解 — 探索/分析类工作按板块交付（每板块有交付标准）
 # skill 引用 = analyst/engineer profile 已装的 data-science skills
-# （eda-checklist / data-preprocessing / experiment-tracking /
-#   split-strategy / model-card / reproducibility-checklist）
+# codex 审核 (2026-08-12): terminal_evaluation 只评估冻结结果,
+# HPO/消融/比较全归 model_selection — 封死 terminal 二次选择泄漏
 stages:
-  - name: data_stats          # 数据统计
-    deliverable: "行/列/类型/缺失率/分布摘要"
+  - name: data_stats          # 数据统计（确定性审计）
+    deliverable: "数据来源/schema/规模/缺失/异常/split 统计"
     skill: "eda-checklist"
     constraints: []
-  - name: preprocessing       # 预处理
-    deliverable: "清洗/校验/转换 前后对比 + 处理理由"
+  - name: preprocessing       # 预处理（原始清洗，无监督）
+    deliverable: "清洗/校验/转换规则 + 前后行数 + 丢弃原因"
     skill: "data-preprocessing"
     constraints: ["fail-fast 校验", "原子写"]
-  - name: eda                 # 探索性分析
-    deliverable: "分布/聚类/相关性发现 + 对建模的含义"
+  - name: eda                 # 探索性分析（假设生成，不做模型选择）
+    deliverable: "分布/聚类发现 + 假设 + 数据范围标记"
     skill: "eda-checklist"
-    constraints: []
+    constraints: ["禁止 terminal 数据"]
   - name: feature_engineering # 特征工程
-    deliverable: "特征定义表 + 信息量指标 + 为什么"
+    deliverable: "特征 registry（来源列/可用时间/拟合范围）+ 泄漏测试"
     skill: "data-preprocessing"
     constraints: ["标签/未来信息不得进特征（REQ-E06）"]
-  - name: model_selection     # 模型选择
-    deliverable: "候选集 + 选择 split 声明 + 对比指标"
+  - name: model_selection     # 模型选择（HPO/消融/比较全在这）
+    deliverable: "候选空间/折定义/seed/排名规则/tie-break/最终 pipeline hash"
     skill: "split-strategy"
-    constraints: ["选择只用 selection_split（治泄漏）"]
-  - name: model_evaluation    # 参数优化/对比
-    deliverable: "对比方式/指标定义/结论边界 + 实验日志"
+    constraints: ["选择只用 selection_split", "terminal_access: forbidden"]
+  - name: terminal_evaluation # 终期评估（只评估冻结结果，一次）
+    deliverable: "冻结 pipeline hash + 一次性执行 receipt + 指标/区间/结论边界"
     skill: "experiment-tracking"
-    constraints: ["指标按 metrics 段定义实现 + golden tests"]
+    constraints: ["terminal_access: exactly_once", "禁止 HPO/比较/调参"]
 
 # 预算/停止规则
 budget:

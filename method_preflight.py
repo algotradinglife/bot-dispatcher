@@ -54,6 +54,12 @@ def check_schema(m):
     for k in SPLIT_KEYS:
         if k not in splits:
             errors.append("splits 缺少字段: %s" % k)
+    # codex P0-3: selection_split != terminal_split 强制（防泄漏）
+    sel = splits.get("selection_split")
+    term = splits.get("terminal_split")
+    if sel and term and sel == term:
+        errors.append("selection_split == terminal_split（%s）— 必须不同，"
+                      "否则选择与评估共用数据 = 泄漏" % sel)
     metrics = m.get("metrics", [])
     if not isinstance(metrics, list) or not metrics:
         errors.append("metrics 必须是非空列表")
@@ -65,14 +71,49 @@ def check_schema(m):
     arts = m.get("required_artifacts", [])
     if not isinstance(arts, list) or not arts:
         errors.append("required_artifacts 必须是非空列表")
-    stages = m.get("stages", [])
-    if stages is not None and not isinstance(stages, list):
+    # codex 审核 (2026-08-12) P0-1/2: stages 强制 + 结构化校验
+    # 研究/建模协议必须带 stages; 六阶段各恰好一次; 值非空; 类型安全
+    STAGE_ENUM = ["data_stats", "preprocessing", "eda",
+                  "feature_engineering", "model_selection",
+                  "terminal_evaluation"]
+    if "stages" not in m or m.get("stages") is None:
+        errors.append("stages 缺失（研究/建模协议必须带板块拆解）")
+    elif not isinstance(m["stages"], list):
         errors.append("stages 必须是列表")
-    elif isinstance(stages, list):
-        for i, st in enumerate(stages):
+    elif not m["stages"]:
+        errors.append("stages 不能是空列表")
+    else:
+        seen = []
+        for i, st in enumerate(m["stages"]):
+            if not isinstance(st, dict):
+                errors.append("stages[%d] 必须是 mapping（不是 %s）"
+                              % (i, type(st).__name__))
+                continue
             for k in STAGE_KEYS:
                 if k not in st:
                     errors.append("stages[%d] 缺少字段: %s" % (i, k))
+            name = st.get("name")
+            if name not in STAGE_ENUM:
+                errors.append("stages[%d] 未知阶段名: %r（允许: %s）"
+                              % (i, name, "/".join(STAGE_ENUM)))
+            else:
+                seen.append(name)
+            for k in ("deliverable", "skill"):
+                v = st.get(k)
+                if not isinstance(v, str) or not v.strip():
+                    errors.append("stages[%d].%s 必须是非空字符串" % (i, k))
+            cons = st.get("constraints")
+            if not isinstance(cons, list) or not all(
+                    isinstance(c, str) and c.strip() for c in cons):
+                errors.append("stages[%d].constraints 必须是非空字符串列表" % i)
+        # 六阶段各恰好一次（缺/重复/乱序）
+        for s in STAGE_ENUM:
+            if seen.count(s) > 1:
+                errors.append("阶段 %s 重复出现 %d 次（必须恰好一次）"
+                              % (s, seen.count(s)))
+        missing = [s for s in STAGE_ENUM if s not in seen]
+        if missing:
+            errors.append("缺少阶段: %s" % ", ".join(missing))
     return not errors, errors
 
 
@@ -125,13 +166,30 @@ def check_protocol_log(worktree):
     return True, "PROTOCOL-LOG %d 条修订事件" % len(events)
 
 
-def check_holdout(m):
-    """holdout 隔离声明: true=隔离; false=剩余风险必须记录. Returns (ok, msg)."""
+def check_holdout(m, worktree):
+    """holdout 隔离: true=隔离; false=report 必须显式记录剩余风险.
+
+    codex P0-3: false 无条件 PASS 太松 — 必须检查 report 存在且声明风险.
+    """
     isolated = (m.get("splits") or {}).get("holdout_isolated")
     if isolated is True:
         return True, "holdout 隔离已声明"
     if isolated is False:
-        return True, "holdout 未隔离 — 剩余风险需在 report 显式记录（advisory）"
+        # 找 report（results/report.md 或类似）
+        report = None
+        for cand in ("results/report.md", "results/report.json",
+                     "report.md", "results/decision.csv"):
+            p = os.path.join(worktree, cand)
+            if os.path.exists(p):
+                report = p
+                break
+        if not report:
+            return False, "holdout 未隔离 — 必须有 report 显式记录剩余风险（未找到 report）"
+        text = open(report).read().lower()
+        if any(k in text for k in ("剩余风险", "residual risk", "holdout",
+                                   "risk:", "风险")):
+            return True, "holdout 未隔离 — report 已记录剩余风险（advisory）"
+        return False, "holdout 未隔离 — report 未显式记录剩余风险"
     return False, "splits.holdout_isolated 必须是布尔"
 
 
@@ -141,19 +199,24 @@ def run(worktree, verbose=True):
     if not os.path.exists(mpath):
         return {"status": "FAIL", "checks": {
             "schema": (False, "method.yaml 缺失")}}, 1
-    m = load_yaml(mpath)
-    checks = {}
-    checks["schema"] = check_schema(m)
-    if checks["schema"][0]:
-        checks["artifacts"] = check_artifacts(worktree, m.get("required_artifacts", []))
-        checks["receipt_hash"] = check_receipt_hash(m, worktree)
-        checks["protocol_log"] = check_protocol_log(worktree)
-        checks["holdout"] = check_holdout(m)
-    else:
-        checks["artifacts"] = (False, ["schema FAIL — 跳过工件检查"])
-        checks["receipt_hash"] = (False, ["schema FAIL — 跳过 hash 检查"])
-        checks["protocol_log"] = (True, "schema FAIL — 跳过")
-        checks["holdout"] = (False, ["schema FAIL — 跳过"])
+    try:
+        m = load_yaml(mpath)
+        checks = {}
+        checks["schema"] = check_schema(m)
+        if checks["schema"][0]:
+            checks["artifacts"] = check_artifacts(worktree, m.get("required_artifacts", []))
+            checks["receipt_hash"] = check_receipt_hash(m, worktree)
+            checks["protocol_log"] = check_protocol_log(worktree)
+            checks["holdout"] = check_holdout(m, worktree)
+        else:
+            checks["artifacts"] = (False, ["schema FAIL — 跳过工件检查"])
+            checks["receipt_hash"] = (False, ["schema FAIL — 跳过 hash 检查"])
+            checks["protocol_log"] = (True, "schema FAIL — 跳过")
+            checks["holdout"] = (False, ["schema FAIL — 跳过"])
+    except Exception as e:
+        # codex P0-2: malformed YAML / 非预期结构 → 受控 FAIL, 不 traceback
+        return {"status": "FAIL", "checks": {
+            "schema": (False, "解析/校验异常: %s" % str(e)[:120])}}, 1
     failed = [k for k, (ok, _) in checks.items() if not ok]
     status = "PASS" if not failed else "FAIL"
     if verbose:

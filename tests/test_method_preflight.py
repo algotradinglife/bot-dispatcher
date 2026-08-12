@@ -15,6 +15,13 @@ splits: {selection_split: CV_2022, terminal_split: CV_2023, holdout_isolated: tr
 selection_algorithm: {method: frozen, preregistered: true, seed: 42}
 metrics:
   - {name: hhi, definition: "agg by identity", golden_test: "t.py::test_hhi"}
+stages:
+  - {name: data_stats, deliverable: x, skill: eda-checklist, constraints: []}
+  - {name: preprocessing, deliverable: x, skill: data-preprocessing, constraints: ["fail-fast"]}
+  - {name: eda, deliverable: x, skill: eda-checklist, constraints: []}
+  - {name: feature_engineering, deliverable: x, skill: data-preprocessing, constraints: ["no leak"]}
+  - {name: model_selection, deliverable: x, skill: split-strategy, constraints: ["CV_2022 only"]}
+  - {name: terminal_evaluation, deliverable: x, skill: experiment-tracking, constraints: ["exactly_once"]}
 budget: {max_runtime_h: 8, max_cpu_hours: 64}
 required_artifacts: ["results/ledger.parquet"]
 schema_ref: "results/schema.yaml"
@@ -96,13 +103,17 @@ def test_stages_schema():
 
 
 def test_stages_valid():
-    """stages 合法 → PASS."""
+    """stages 合法（六阶段齐全）→ PASS."""
     d = _make_worktree()
     ok = VALID_YAML.replace(
         "required_artifacts: [\"results/ledger.parquet\"]",
         "stages:\n"
         "  - {name: data_stats, deliverable: x, skill: eda-checklist, constraints: []}\n"
-        "  - {name: model_selection, deliverable: y, skill: split-strategy, constraints: [\"CV_2022 only\"]}\n"
+        "  - {name: preprocessing, deliverable: x, skill: data-preprocessing, constraints: [\"fail-fast\"]}\n"
+        "  - {name: eda, deliverable: x, skill: eda-checklist, constraints: []}\n"
+        "  - {name: feature_engineering, deliverable: x, skill: data-preprocessing, constraints: [\"no leak\"]}\n"
+        "  - {name: model_selection, deliverable: x, skill: split-strategy, constraints: [\"CV_2022 only\"]}\n"
+        "  - {name: terminal_evaluation, deliverable: x, skill: experiment-tracking, constraints: [\"exactly_once\"]}\n"
         "required_artifacts: [\"results/ledger.parquet\"]")
     with open(os.path.join(d, "method.yaml"), "w") as f:
         f.write(ok)
@@ -121,3 +132,96 @@ def test_json_output():
     with mock.patch.object(sys, "argv", ["method_preflight.py", "--worktree", d, "--json"]):
         res, code = mp.run(d, verbose=False)
     assert code == 0
+
+
+def test_stages_missing_fails():
+    """codex P0-1: stages 缺失 → FAIL (不再可选)."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace(
+        "stages:\n  - {name: data_stats, deliverable: x, skill: eda-checklist, constraints: []}\n"
+        "  - {name: preprocessing, deliverable: x, skill: data-preprocessing, constraints: [\"fail-fast\"]}\n"
+        "  - {name: eda, deliverable: x, skill: eda-checklist, constraints: []}\n"
+        "  - {name: feature_engineering, deliverable: x, skill: data-preprocessing, constraints: [\"no leak\"]}\n"
+        "  - {name: model_selection, deliverable: x, skill: split-strategy, constraints: [\"CV_2022 only\"]}\n"
+        "  - {name: terminal_evaluation, deliverable: x, skill: experiment-tracking, constraints: [\"exactly_once\"]}\n",
+        "")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert any("stages 缺失" in m for m in res["checks"]["schema"]["msg"])
+
+
+def test_stages_dup_fails():
+    """codex: 阶段重复 → FAIL."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace(
+        "  - {name: eda, deliverable: x, skill: eda-checklist, constraints: []}\n",
+        "  - {name: eda, deliverable: x, skill: eda-checklist, constraints: []}\n"
+        "  - {name: eda, deliverable: x, skill: eda-checklist, constraints: []}\n")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert any("重复" in m for m in res["checks"]["schema"]["msg"])
+
+
+def test_stages_unknown_fails():
+    """codex: 未知阶段名 → FAIL."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace(
+        "- {name: terminal_evaluation,", "- {name: foo_phase,")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert any("未知阶段名" in m for m in res["checks"]["schema"]["msg"])
+
+
+def test_splits_same_fails():
+    """codex P0-3: selection_split == terminal_split → FAIL (泄漏)."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace("terminal_split: CV_2023", "terminal_split: CV_2022")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert any("必须不同" in m for m in res["checks"]["schema"]["msg"])
+
+
+def test_stages_int_fails_controlled():
+    """codex P0-2: stages: [42] → 受控 FAIL, 不 traceback."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace(
+        "stages:\n  - {name: data_stats, deliverable: x, skill: eda-checklist, constraints: []}\n",
+        "stages: [42]\n")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert res["status"] == "FAIL"  # 受控失败, 无异常
+
+
+def test_constraints_string_fails():
+    """codex: constraints 是字符串 → FAIL."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace(
+        "  - {name: preprocessing, deliverable: x, skill: data-preprocessing, constraints: [\"fail-fast\"]}",
+        "  - {name: preprocessing, deliverable: x, skill: data-preprocessing, constraints: \"fail-fast\"}")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert any("constraints" in m for m in res["checks"]["schema"]["msg"])
+
+
+def test_holdout_false_requires_report():
+    """codex: holdout_isolated: false 无 report → FAIL."""
+    d = _make_worktree()
+    bad = VALID_YAML.replace("holdout_isolated: true", "holdout_isolated: false")
+    with open(os.path.join(d, "method.yaml"), "w") as f:
+        f.write(bad)
+    # 无 report 文件 → FAIL
+    res, code = mp.run(d, verbose=False)
+    assert code == 1
+    assert "剩余风险" in res["checks"]["holdout"]["msg"]
