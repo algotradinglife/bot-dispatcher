@@ -1,0 +1,14 @@
+# PROTOCOL-LOG.md — 本 issue 方法协议修订记录
+
+> 最小化修订日志（delivery-improvement v2 机制 2）。只记：协议修订 /
+> 偏离 / 升级 / 重大取舍。**追加式，不删改历史行** — 修正用新行
+> `supersede` 引用旧行。EV 检查完整性（preflight protocol_log 检查）。
+
+| 事件 | 协议项 | 变更 | 理由 | 证据 | supersedes |
+|------|--------|------|------|------|-----------|
+| add | metrics.hhi | 初始定义 | 契约冻结 | golden test | — |
+
+<!-- 示例（正式记录时复制行并替换）：
+| revise | splits.selection_split | CV_2022 → CV_2021 | CV_2022 数据质量问题 | golden test + issue 评论 | LOG-001 |
+| supersede | metrics.rolling | 锚点调整 | 发现 time-zero 缺失 | issue 评论 | LOG-002 |
+-->
