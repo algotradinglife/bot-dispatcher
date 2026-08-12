@@ -1,0 +1,54 @@
+# method.yaml — 方法协议（PI 写契约时冻结，codex 审核，hash 绑定执行）
+# 每研究 issue 契约必带。机器可读 — preflight 检查器校验。
+# 参考：docs/delivery-improvement-2026-08-12.md 机制 1
+
+protocol_version: 1
+
+# 候选池（数据/模型空间边界）
+candidate_pool:
+  source: "冻结上游 issue 编号 + 工件"
+  size: 55042
+  description: "55,042 exact-N7 frozen candidates (label-blind, source-bound)"
+
+# split 职责 — 模型/消融选择与 terminal 评估必须隔离
+splits:
+  selection_split: "CV_2022"     # 模型/消融选择冻结处（只能在这选）
+  terminal_split: "CV_2023"      # 只执行一次冻结后的 terminal decision
+  holdout_isolated: true          # true=selection 数据不出现在 terminal 路径；false=记录剩余风险
+
+# 选择算法（防泄漏的声明）
+selection_algorithm:
+  method: "frozen selector, no terminal peeking"
+  preregistered: true             # 选择决策必须预注册，禁止实现后发现回填
+  seed: 42
+
+# 指标定义 — 逐条 golden test 验证
+metrics:
+  - name: hhi
+    definition: "aggregate by immutable ticket identity"
+    golden_test: "tests/golden_metrics.py::test_hhi"
+  - name: rolling
+    definition: "5/10/20 with ¥100k time-zero anchor"
+    golden_test: "tests/golden_metrics.py::test_rolling"
+  - name: drawdown
+    definition: "completed recovery vs terminal-open separated"
+    golden_test: "tests/golden_metrics.py::test_drawdown"
+
+# 预算/停止规则
+budget:
+  max_runtime_h: 8
+  max_cpu_hours: 64
+
+# 必需工件 — preflight 检查存在性
+required_artifacts:
+  - "results/ledger.parquet"
+  - "results/decision.csv"
+  - "results/report.md"
+  - "results/schema.yaml"
+
+# schema 引用（机器可读 table schema 契约）
+schema_ref: "results/schema.yaml"
+
+# 执行 receipt 绑定（preflight 校验 hash 一致性）
+receipt:
+  bind_to: "results/manifest.sha256"

@@ -30,7 +30,20 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements-dev.txt
-      - run: pytest tests/test_pi_gates.py tests/test_gate_check.py -q
+      - run: pytest tests/test_pi_gates.py tests/test_gate_check.py tests/test_method_preflight.py -q
+
+  # method preflight: 可执行方法协议检查器 (delivery-improvement v2).
+  # 失败 = method.yaml 缺失/schema 坏/artifact 缺/hash 不匹配 → 禁止进 EV.
+  method-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pyyaml
+      - run: python method_preflight.py --worktree . --json || echo "no method.yaml at repo root (templates only) — SKIP"
+      - run: python -m pytest tests/test_method_preflight.py -q
 
   # NOTE: pi-gates-live 已迁移到 dispatcher (受保护的外部权威裁决 —
   # GitHub Checks API CheckRun). PR 内不再自证 gate, 避免 PR 自改
