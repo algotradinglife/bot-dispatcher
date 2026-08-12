@@ -92,6 +92,19 @@ realized_gross/SP/概率/不确定性等），且能**从冻结源头逐行重�
 
 **验证**：评论含三要素；RESUME_SESSION 注入后返工 run 可 --resume 续接。
 
+## REQ-E09 — 返工同类问题完整排查（2026-08-12 定，#207 R1→R3 教训）
+
+**条款**：EV REJECT 返工时，worker 不仅修所列 defect，还必须对每个
+defect 的**根因类别**做完整排查 — 检查该类别的所有出现点（不只是
+EV 指出的那一个），并提交排查证据。
+
+**验证**：
+- 返工交付附"同类排查声明"：每个 defect 归类 + 该类别的完整检查范围
+  （如泄漏 → 选择函数+comparator+replay+汇总；fsync → 所有写点+
+  目录+rename+异常路径；指标 → 所有窗口/聚合的局部 vs 全局语义）
+- 排查证据（检查了哪些调用点/文件/路径）随交付提交
+- EV 复审时抽查声明覆盖度 — 找声明之外的同类点（找到 = 声明不完整）
+
 ## REQ-M — 方法协议冻结（delivery-improvement v2，可选但研究/模型类必带）
 
 > 契约带 `method.yaml`（见 templates/method.yaml.example）时启用。
