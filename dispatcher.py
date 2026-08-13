@@ -357,6 +357,103 @@ def build_issue_proj_map(cfg):
 
 
 
+def stale_status_check(items, projects, sm, prev_state, new_state, output,
+                       now=None, stale_minutes=5, dedup_minutes=30):
+    """Ready/EV Review/Blocked 停留超阈值 → 报警 + 重唤醒 (防静默断链).
+
+    2026-08-13: #208 Ready 静默 14min 无人认领 (dispatcher 通知一次失败即丢失).
+    对每个卡住状态: 若停留 > stale_minutes 且 dedup 窗口内未报过 →
+    warning + 重发唤醒消息 (Ready→owner / EV Review→auditor / Blocked→user).
+
+    注意 (codex 审核修复):
+    - items 由调用方传入 (主循环已查询, 避免重复控制面快照/API 消耗)
+    - 同一 role 的多个 stale issue 聚合成一条通知 (防 /goal 扇出覆盖)
+    - dedup 随状态变化清除 (防重入静默); warnings 用字符串 (兼容现有消费者)
+    - float 解析安全 (坏值跳过); 无 try 外层崩溃
+    """
+    now = now or time.time()
+    if not items:
+        return
+    role_map = {"Ready": None, "EV Review": "auditor", "Blocked": "user"}
+    import math
+    stale_hits = []  # (issue_num, cur_s, age_min, target_role, msg)
+    for item in items:
+        if item.get("is_pr"):
+            continue
+        issue_num = item["number"]
+        pn = item["project_num"]
+        cur_s = item.get("status", "Inbox")
+        if cur_s not in role_map:
+            continue
+        sk = project_state_key(pn, issue_num)
+        since_key = "stale_since:%d" % issue_num
+        status_key = "stale_status:%d" % issue_num
+        dedup_key = "stale_dedup:%d:%s" % (issue_num, cur_s)
+        now_ts = now
+        try:
+            if prev_state.get(since_key) and prev_state.get(status_key) == cur_s:
+                since_ts = float(prev_state[since_key])
+                if not math.isfinite(since_ts):
+                    raise ValueError("non-finite timestamp")
+            else:
+                since_ts = now_ts
+                new_state[since_key] = str(now_ts)
+                new_state[status_key] = cur_s
+                continue  # 刚进入该状态, 未停留
+            age_min = (now_ts - since_ts) / 60.0
+            if age_min < stale_minutes:
+                continue
+            # dedup 只限制"通知频率" (30min 一次), 不抑制 warning —
+            # warning 每 tick 输出 (cron digest 持续可见, 通知丢失不静默).
+            # at-least-once 语义: 通知进队列即记 dedup 是 best-effort,
+            # wrapper 无回写确认 — 由 warning 持续可见兜底 (codex P1-3 折中).
+            last_dedup = prev_state.get(dedup_key)
+            notify_now = True
+            if last_dedup:
+                try:
+                    dedup_ts = float(last_dedup)
+                    if not math.isfinite(dedup_ts):
+                        raise ValueError("non-finite dedup")
+                    if (now_ts - dedup_ts) < dedup_minutes * 60:
+                        notify_now = False
+                except (TypeError, ValueError):
+                    pass  # 坏 dedup 值 → 忽略, 重新报警
+        except (TypeError, ValueError):
+            new_state.pop(since_key, None)
+            new_state.pop(status_key, None)
+            continue  # 坏状态值 → 重置计时, 跳过本轮
+        owner = resolve_owner(pn, projects, sm)
+        if cur_s == "Ready":
+            target_role = owner
+        elif cur_s == "EV Review":
+            target_role = sm.get("auditor")  # session_map 映射; 缺失 → fail closed
+        else:  # Blocked
+            target_role = "user"
+        if not target_role:
+            # 映射缺失 → 报警 (fail closed, 不静默投递字面角色)
+            output["warnings"].append(
+                "config_error: stale %s for Issue #%d has no target role (session_map 缺映射)"
+                % (cur_s, issue_num))
+            continue
+        # warning 每 tick 输出 (即使 dedup 抑制通知 — 保证可见性)
+        output["warnings"].append(
+            "status_stale: Issue #%d %s for %.0f min (role: %s%s)"
+            % (issue_num, cur_s, age_min, target_role,
+               " — re-notified" if notify_now else " — still stale"))
+        if notify_now:
+            stale_hits.append((issue_num, cur_s, age_min, target_role))
+            new_state[dedup_key] = str(now_ts)
+    # 按 role 聚合 → 一条通知 (防同一 session 多 /goal 扇出覆盖)
+    by_role = {}
+    for issue_num, cur_s, age_min, target_role in stale_hits:
+        by_role.setdefault(target_role, []).append(issue_num)
+    for role, nums in by_role.items():
+        msg = format_goal(
+            "Issue(s) %s 状态停留超阈值 (Ready/EV Review/Blocked, ≥%dmin) — 需动作"
+            % (",".join("#%d" % n for n in nums), stale_minutes), "")
+        queue_goal(output, role, msg)
+
+
 def flush_goals(output, dry_run=False, baseline=False, cfg=None):
     """Emit queued notifications as structured output.
 
@@ -422,6 +519,7 @@ def main():
     # 通知对象: worker (Ready), auditor (EV Review), 用户 (Human).
     # PI 不接收通知 (主动轮询 GitHub); In Progress/PI Review/Blocked/Done
     # 仅记录状态 (PI 轮询自行感知, 成果汇报走 PM 对话接口).
+    items = []
     try:
         proj_map, items = build_issue_proj_map(cfg)
         for item in items:
@@ -469,10 +567,15 @@ def main():
 
             elif cur_s == "EV Review":
                 # 契约: worker 完成拨 EV Review → 通知 auditor 独立审计
-                notify_role = "auditor"
-                msg = format_goal(
-                    "Issue #%d in EV Review — %s (worker 已完成, 待独立审计)"
-                    % (issue_num, title), url)
+                # (session_map 映射 — codex P1-B; 缺失 → fail closed 报警)
+                notify_role = sm.get("auditor")
+                if not notify_role:
+                    output["warnings"].append(
+                        "config_error: session_map missing 'auditor' — EV Review 通知无法路由")
+                else:
+                    msg = format_goal(
+                        "Issue #%d in EV Review — %s (worker 已完成, 待独立审计)"
+                        % (issue_num, title), url)
                 reason = "ev_review_ready"
 
             elif cur_s == "PI Review":
@@ -509,6 +612,14 @@ def main():
                 queue_goal(output, notify_role, msg, issue_num=issue_num)
 
             new_state[sk] = cur_s
+            # 状态变化 → 清除 stale 停留记录 + dedup (避免返工/流转误报,
+            # 防重入相同状态继承旧 dedup 静默 — codex P1-2)
+            if prev_s != cur_s:
+                new_state.pop("stale_since:%d" % issue_num, None)
+                new_state.pop("stale_status:%d" % issue_num, None)
+                for dk in list(new_state):
+                    if dk.startswith("stale_dedup:%d:" % issue_num):
+                        new_state.pop(dk, None)
 
         control_plane_ok = True
     except Exception as e:
@@ -616,6 +727,14 @@ def main():
             "%s PI-GATE live check-run: %s" % (prefix, str(e)[:100]))
 
     delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run, cfg=cfg)
+    # 状态停留报警: Ready/EV Review/Blocked 超过阈值未动作 → 报警 + 重唤醒
+    # (items 用主循环已查询的, 不重复控制面查询; dry_run 下也标记不投递)
+    if not first_run:
+        stale_status_check(items, projects, sm, prev_state, new_state, output,
+                           stale_minutes=5, dedup_minutes=30)
+    if args.dry_run:
+        for n in output.get("notifications", []):
+            n["dry_run"] = True
     # Human 兜底: dispatcher 侧仅尽力而为的飞书提醒 (monitor 锁内计数限频);
     # 真正的 8h×3 邮件/短信兜底由 PI 第二通道负责 (独立轮询 GitHub,
     # 不依赖 dispatcher — 防 dispatcher 失灵). 见 docs/architecture-v0_3.md.

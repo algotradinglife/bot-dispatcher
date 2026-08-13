@@ -281,8 +281,14 @@ try:
         role = n.get('role', '?')
         icon = {{'worker': '🛠', 'auditor': '🔍', 'user': '⛔'}}.get(role, '•')
         lines.append('%s [%s] %s' % (icon, role, n.get('message', '')[:100]))
-    for w in d.get('warnings', [])[:3]:
-        lines.append('⚠️ %s' % w[:80])
+    # status_stale warning 优先且不截断 (静默断链可见性 — codex P1-A);
+    # 普通 warning 仍限前 3 条
+    stale_warns = [w for w in d.get('warnings', []) if str(w).startswith('status_stale')]
+    other_warns = [w for w in d.get('warnings', []) if not str(w).startswith('status_stale')]
+    for w in stale_warns:
+        lines.append('⚠️ %s' % str(w)[:80])
+    for w in other_warns[:3]:
+        lines.append('⚠️ %s' % str(w)[:80])
 except Exception:
     pass
 
