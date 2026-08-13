@@ -375,6 +375,7 @@ def stale_status_check(items, projects, sm, prev_state, new_state, output,
     if not items:
         return
     role_map = {"Ready": None, "EV Review": "auditor", "Blocked": "user"}
+    import math
     stale_hits = []  # (issue_num, cur_s, age_min, target_role, msg)
     for item in items:
         if item.get("is_pr"):
@@ -392,6 +393,8 @@ def stale_status_check(items, projects, sm, prev_state, new_state, output,
         try:
             if prev_state.get(since_key) and prev_state.get(status_key) == cur_s:
                 since_ts = float(prev_state[since_key])
+                if not math.isfinite(since_ts):
+                    raise ValueError("non-finite timestamp")
             else:
                 since_ts = now_ts
                 new_state[since_key] = str(now_ts)
@@ -400,11 +403,16 @@ def stale_status_check(items, projects, sm, prev_state, new_state, output,
             age_min = (now_ts - since_ts) / 60.0
             if age_min < stale_minutes:
                 continue
+            # dedup 只限制"通知频率" (30min 一次), 不抑制 warning —
+            # warning 每 tick 输出 (cron digest 持续可见, 通知丢失不静默).
+            # at-least-once 语义: 通知进队列即记 dedup 是 best-effort,
+            # wrapper 无回写确认 — 由 warning 持续可见兜底 (codex P1-3 折中).
             last_dedup = prev_state.get(dedup_key)
+            notify_now = True
             if last_dedup:
                 try:
                     if (now_ts - float(last_dedup)) < dedup_minutes * 60:
-                        continue
+                        notify_now = False
                 except (TypeError, ValueError):
                     pass  # 坏 dedup 值 → 忽略, 重新报警
         except (TypeError, ValueError):
@@ -415,16 +423,19 @@ def stale_status_check(items, projects, sm, prev_state, new_state, output,
         if cur_s == "Ready":
             target_role = owner
         elif cur_s == "EV Review":
-            target_role = "auditor"
+            target_role = sm.get("auditor", "auditor")  # session_map 映射
         else:  # Blocked
             target_role = "user"
         if not target_role:
             continue
+        # warning 每 tick 输出 (即使 dedup 抑制通知 — 保证可见性)
         output["warnings"].append(
-            "status_stale: Issue #%d %s for %.0f min (role: %s)"
-            % (issue_num, cur_s, age_min, target_role))
-        stale_hits.append((issue_num, cur_s, age_min, target_role))
-        new_state[dedup_key] = str(now_ts)
+            "status_stale: Issue #%d %s for %.0f min (role: %s%s)"
+            % (issue_num, cur_s, age_min, target_role,
+               " — re-notified" if notify_now else " — still stale"))
+        if notify_now:
+            stale_hits.append((issue_num, cur_s, age_min, target_role))
+            new_state[dedup_key] = str(now_ts)
     # 按 role 聚合 → 一条通知 (防同一 session 多 /goal 扇出覆盖)
     by_role = {}
     for issue_num, cur_s, age_min, target_role in stale_hits:

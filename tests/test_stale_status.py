@@ -66,14 +66,39 @@ def test_blocked_stale_alerts_user():
 
 
 def test_dedup_suppresses_repeat():
-    """同一状态 dedup 窗口 (30min) 内不重复报警."""
+    """同一状态 dedup 窗口 (30min) 内: warning 仍输出, 通知被抑制."""
     t0 = time.time() - 360
     prev = {"stale_since:100": str(t0), "stale_status:100": "Ready",
             "stale_dedup:100:Ready": str(time.time() - 60)}  # 1 min ago
     out = {"actions": [], "warnings": [], "notifications": []}
     dp.stale_status_check([_item(100, "Ready")], _projects(), _sm(), prev, dict(prev), out,
                           now=time.time(), stale_minutes=5)
-    assert not out["warnings"], "dedup should suppress repeat"
+    assert out["warnings"], "warning should still fire (visibility)"
+    assert not out["notifications"], "dedup should suppress re-notification"
+
+
+def test_dedup_expired_notifies_again():
+    """dedup 窗口过后 → 重新通知."""
+    t0 = time.time() - 360
+    prev = {"stale_since:100": str(t0), "stale_status:100": "Ready",
+            "stale_dedup:100:Ready": str(time.time() - 2000)}  # 33 min ago
+    out = {"actions": [], "warnings": [], "notifications": []}
+    dp.stale_status_check([_item(100, "Ready")], _projects(), _sm(), prev, dict(prev), out,
+                          now=time.time(), stale_minutes=5)
+    assert out["warnings"]
+    assert out["notifications"], "expired dedup should re-notify"
+
+
+def test_ev_review_session_map():
+    """EV Review → 走 session_map 的 auditor 映射 (非硬编码)."""
+    t0 = time.time() - 360
+    prev = {"stale_since:101": str(t0), "stale_status:101": "EV Review"}
+    out = {"actions": [], "warnings": [], "notifications": []}
+    sm = {"auditor": "team-EV", "user": "user", "analyst": "analyst"}
+    dp.stale_status_check([_item(101, "EV Review")], _projects(), sm, prev, dict(prev), out,
+                          now=time.time(), stale_minutes=5)
+    roles = {n["role"] for n in out["notifications"]}
+    assert "team-EV" in roles, "should use session_map auditor mapping"
 
 
 def test_status_change_clears_all_stale():
