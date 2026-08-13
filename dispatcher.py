@@ -426,10 +426,14 @@ def stale_status_check(items, projects, sm, prev_state, new_state, output,
         if cur_s == "Ready":
             target_role = owner
         elif cur_s == "EV Review":
-            target_role = sm.get("auditor", "auditor")  # session_map 映射
+            target_role = sm.get("auditor")  # session_map 映射; 缺失 → fail closed
         else:  # Blocked
             target_role = "user"
         if not target_role:
+            # 映射缺失 → 报警 (fail closed, 不静默投递字面角色)
+            output["warnings"].append(
+                "config_error: stale %s for Issue #%d has no target role (session_map 缺映射)"
+                % (cur_s, issue_num))
             continue
         # warning 每 tick 输出 (即使 dedup 抑制通知 — 保证可见性)
         output["warnings"].append(

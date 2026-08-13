@@ -101,6 +101,18 @@ def test_ev_review_session_map():
     assert "team-EV" in roles, "should use session_map auditor mapping"
 
 
+def test_ev_review_missing_mapping_fail_closed():
+    """session_map 缺 auditor → fail closed (config_error warning, 不投递字面角色)."""
+    t0 = time.time() - 360
+    prev = {"stale_since:101": str(t0), "stale_status:101": "EV Review"}
+    out = {"actions": [], "warnings": [], "notifications": []}
+    sm = {"user": "user", "analyst": "analyst"}  # 无 auditor
+    dp.stale_status_check([_item(101, "EV Review")], _projects(), sm, prev, dict(prev), out,
+                          now=time.time(), stale_minutes=5)
+    assert not out["notifications"], "should not deliver to literal 'auditor'"
+    assert any("config_error" in w for w in out["warnings"]), "should warn config_error"
+
+
 def test_status_change_clears_all_stale():
     """状态变化 (Ready→In Progress) 清除 stale 记录 + dedup (主循环逻辑)."""
     prev = {"stale_since:100": str(time.time() - 600),
