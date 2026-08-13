@@ -156,6 +156,39 @@ def test_bad_float_value_safe():
     assert "stale_since:100" not in new  # 已清除
 
 
+def test_nan_since_reset():
+    """NaN stale_since → 重置 (不产生负 age 永久静默)."""
+    prev = {"stale_since:100": "nan", "stale_status:100": "Ready"}
+    out = {"actions": [], "warnings": [], "notifications": []}
+    new = dict(prev)
+    dp.stale_status_check([_item(100, "Ready")], _projects(), _sm(), prev, new, out,
+                          now=time.time(), stale_minutes=5)
+    assert not out["warnings"]
+    assert "stale_since:100" not in new
+
+
+def test_inf_since_reset():
+    """Inf stale_since → 重置 (不产生负 age 永久静默)."""
+    prev = {"stale_since:100": "inf", "stale_status:100": "Ready"}
+    out = {"actions": [], "warnings": [], "notifications": []}
+    new = dict(prev)
+    dp.stale_status_check([_item(100, "Ready")], _projects(), _sm(), prev, new, out,
+                          now=time.time(), stale_minutes=5)
+    assert not out["warnings"]
+    assert "stale_since:100" not in new
+
+
+def test_nan_dedup_renotifies():
+    """NaN dedup → 视为坏值, 重新通知 (不抑制)."""
+    t0 = time.time() - 360
+    prev = {"stale_since:100": str(t0), "stale_status:100": "Ready",
+            "stale_dedup:100:Ready": "nan"}
+    out = {"actions": [], "warnings": [], "notifications": []}
+    dp.stale_status_check([_item(100, "Ready")], _projects(), _sm(), prev, dict(prev), out,
+                          now=time.time(), stale_minutes=5)
+    assert out["notifications"], "NaN dedup should not suppress"
+
+
 def test_empty_items_noop():
     """空 items → 直接返回 (无崩溃)."""
     out = {"actions": [], "warnings": [], "notifications": []}

@@ -411,7 +411,10 @@ def stale_status_check(items, projects, sm, prev_state, new_state, output,
             notify_now = True
             if last_dedup:
                 try:
-                    if (now_ts - float(last_dedup)) < dedup_minutes * 60:
+                    dedup_ts = float(last_dedup)
+                    if not math.isfinite(dedup_ts):
+                        raise ValueError("non-finite dedup")
+                    if (now_ts - dedup_ts) < dedup_minutes * 60:
                         notify_now = False
                 except (TypeError, ValueError):
                     pass  # 坏 dedup 值 → 忽略, 重新报警
@@ -560,10 +563,15 @@ def main():
 
             elif cur_s == "EV Review":
                 # 契约: worker 完成拨 EV Review → 通知 auditor 独立审计
-                notify_role = "auditor"
-                msg = format_goal(
-                    "Issue #%d in EV Review — %s (worker 已完成, 待独立审计)"
-                    % (issue_num, title), url)
+                # (session_map 映射 — codex P1-B; 缺失 → fail closed 报警)
+                notify_role = sm.get("auditor")
+                if not notify_role:
+                    output["warnings"].append(
+                        "config_error: session_map missing 'auditor' — EV Review 通知无法路由")
+                else:
+                    msg = format_goal(
+                        "Issue #%d in EV Review — %s (worker 已完成, 待独立审计)"
+                        % (issue_num, title), url)
                 reason = "ev_review_ready"
 
             elif cur_s == "PI Review":
