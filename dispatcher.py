@@ -524,7 +524,8 @@ def main():
         # 的去重 (codex P1 r3: 锚点丢失). 统一从返回值取通知.
         mon = run_monitor(repo, project=projects[0] if projects else None,
                           state_dir=args.state_dir, notify=None,
-                          items=items if control_plane_ok else None)
+                          items=items if control_plane_ok else None,
+                          dry_run=args.dry_run)
         for w in mon.get("warnings", []):
             output["warnings"].append("%s %s" % (prefix, w))
         for n in mon.get("notifications", []):
