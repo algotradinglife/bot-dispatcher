@@ -357,6 +357,77 @@ def build_issue_proj_map(cfg):
 
 
 
+def stale_status_check(repo, projects, sm, prev_state, new_state, output,
+                       now=None, stale_minutes=5, dedup_minutes=30):
+    """Ready/EV Review/Blocked 停留超阈值 → 报警 + 重唤醒 (防静默断链).
+
+    2026-08-13: #208 Ready 静默 14min 无人认领 (dispatcher 通知一次失败即丢失).
+    对每个卡住状态: 若停留 > stale_minutes 且 dedup 窗口内未报过 →
+    warning + 重发唤醒消息 (Ready→owner / EV Review→auditor / Blocked→user).
+
+    状态停留起点记录在 prev_state["stale_since:<issue>"], 状态变化清除.
+    """
+    now = now or time.time()
+    if not projects:
+        return
+    cfg_stub = {"repos": {repo: {"repo": repo, "projects": projects}}}
+    try:
+        _, items = build_issue_proj_map(cfg_stub)
+    except Exception:
+        return  # control plane 不可用 → fail closed (下轮重试)
+    role_map = {"Ready": None, "EV Review": "auditor", "Blocked": "user"}
+    for item in items:
+        if item.get("is_pr"):
+            continue
+        issue_num = item["number"]
+        pn = item["project_num"]
+        cur_s = item.get("status", "Inbox")
+        if cur_s not in role_map:
+            continue
+        sk = project_state_key(pn, issue_num)
+        since_key = "stale_since:%d" % issue_num
+        dedup_key = "stale_dedup:%d:%s" % (issue_num, cur_s)
+        now_ts = now
+        # 停留起点: 首次见该状态记录, 之后用记录值
+        if prev_state.get(since_key) and prev_state.get("stale_status:%d" % issue_num) == cur_s:
+            since_ts = float(prev_state[since_key])
+        else:
+            since_ts = now_ts
+            new_state[since_key] = str(now_ts)
+            new_state["stale_status:%d" % issue_num] = cur_s
+        if new_state.get(since_key) and since_ts == now_ts:
+            continue  # 刚进入该状态, 未停留
+        age_min = (now_ts - since_ts) / 60.0
+        if age_min < stale_minutes:
+            continue
+        # 超阈值 → 报警 (dedup 窗口内不重复)
+        last_dedup = prev_state.get(dedup_key)
+        if last_dedup and (now_ts - float(last_dedup)) < dedup_minutes * 60:
+            continue
+        owner = resolve_owner(pn, projects, sm)
+        if cur_s == "Ready":
+            target_role = owner
+            msg = format_goal(
+                "Issue #%d is READY and UNCLAIMED for %.0f min (owner: %s, 需认领开工)"
+                % (issue_num, age_min, owner), "")
+        elif cur_s == "EV Review":
+            target_role = "auditor"
+            msg = format_goal(
+                "Issue #%d in EV Review for %.0f min — 待独立审计 (auditor)"
+                % (issue_num, age_min), "")
+        else:  # Blocked
+            target_role = "user"
+            msg = format_goal(
+                "Issue #%d Blocked for %.0f min — 待 PI/用户决策 (key: %s)"
+                % (issue_num, age_min, prev_state.get("blocked_key:%d" % issue_num, "")), "")
+        output["warnings"].append({
+            "node": sk, "state": cur_s, "age_min": round(age_min, 1),
+            "role": target_role, "reason": "status_stale", "issue": issue_num})
+        if target_role:
+            queue_goal(output, target_role, msg, issue_num=issue_num)
+        new_state[dedup_key] = str(now_ts)
+
+
 def flush_goals(output, dry_run=False, baseline=False, cfg=None):
     """Emit queued notifications as structured output.
 
@@ -509,6 +580,10 @@ def main():
                 queue_goal(output, notify_role, msg, issue_num=issue_num)
 
             new_state[sk] = cur_s
+            # 状态变化 → 清除 stale 停留记录 (避免返工/流转误报)
+            if prev_s != cur_s:
+                new_state.pop("stale_since:%d" % issue_num, None)
+                new_state.pop("stale_status:%d" % issue_num, None)
 
         control_plane_ok = True
     except Exception as e:
@@ -616,6 +691,9 @@ def main():
             "%s PI-GATE live check-run: %s" % (prefix, str(e)[:100]))
 
     delivery_ok = flush_goals(output, dry_run=args.dry_run, baseline=first_run, cfg=cfg)
+    # 状态停留报警: Ready/EV Review/Blocked 超过阈值未动作 → 报警 + 重唤醒
+    stale_status_check(repo, projects, sm, prev_state, new_state, output,
+                       stale_minutes=5, dedup_minutes=30)
     # Human 兜底: dispatcher 侧仅尽力而为的飞书提醒 (monitor 锁内计数限频);
     # 真正的 8h×3 邮件/短信兜底由 PI 第二通道负责 (独立轮询 GitHub,
     # 不依赖 dispatcher — 防 dispatcher 失灵). 见 docs/architecture-v0_3.md.
