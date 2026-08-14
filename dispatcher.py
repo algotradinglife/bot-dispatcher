@@ -325,6 +325,7 @@ def get_project_items(cfg):
                         break
                 result.append({
                     "number": content["number"],
+                    "title": content.get("title", ""),
                     "status": status,
                     "project_num": pn,
                     "project_name": proj.get("name", str(pn)),
@@ -385,7 +386,9 @@ def stale_status_check(items, projects, sm, prev_state, new_state, output,
     now = now or time.time()
     if not items:
         return
-    role_map = {"Ready": None, "EV Review": "auditor", "Blocked": "user"}
+    # 契约: 只监控会 wake 的状态 (Ready→owner, EV Review→auditor)
+    # Blocked 不 wake (PI 主动轮询 — 简化契约, codex P1-4)
+    role_map = {"Ready": None, "EV Review": "auditor"}
     import math
     stale_hits = []  # (issue_num, cur_s, age_min, target_role, msg)
     for item in items:
@@ -396,8 +399,11 @@ def stale_status_check(items, projects, sm, prev_state, new_state, output,
         cur_s = item.get("status", "Inbox")
         if cur_s not in role_map:
             continue
-        # 依赖等待的 Ready (blockedBy 开放) 不是 stale — 跳过 (codex P1-2)
+        # 依赖等待的 Ready (blockedBy 开放) 不是 stale — 跳过, 且清除旧计时
+        # (等待期不计入 stale — codex P1-3)
         if cur_s == "Ready" and item.get("blocked_by_count", 0) > 0:
+            new_state.pop("stale_since:%d" % issue_num, None)
+            new_state.pop("stale_status:%d" % issue_num, None)
             continue
         sk = project_state_key(pn, issue_num)
         since_key = "stale_since:%d" % issue_num
@@ -509,25 +515,10 @@ def run_status_loop(items, projects, sm, prev_state, new_state, output,
         cur_s = item.get("status", "Inbox")
         dep_count = item.get("blocked_by_count", 0)
 
-        # Fetch title (pr view for PRs, issue view for issues)
-        if title_fetcher:
-            title = title_fetcher(issue_num, item.get("is_pr"))
-        elif item.get("is_pr"):
-            ir = subprocess.run(["gh", "pr", "view", str(issue_num), "--repo", repo,
-                                 "--json", "title", "--jq", ".title"],
-                                capture_output=True, text=True, timeout=10)
-            if ir.returncode != 0:
-                raise ControlPlaneUnavailable(
-                    "Unable to read title for PR #%d" % issue_num)
-            title = ir.stdout.strip()
-        else:
-            ir = subprocess.run(["gh", "issue", "view", str(issue_num), "--repo", repo,
-                                 "--json", "title", "--jq", ".title"],
-                                capture_output=True, text=True, timeout=10)
-            if ir.returncode != 0:
-                raise ControlPlaneUnavailable(
-                    "Unable to read title for Issue #%d" % issue_num)
-            title = ir.stdout.strip()
+        # title 来自 GraphQL (item["title"]), 无需额外 gh view 查询 (codex P1-2)
+        title = item.get("title") or title_fetcher(issue_num, item.get("is_pr")) if title_fetcher else ""
+        if not title and not title_fetcher:
+            raise ControlPlaneUnavailable("Unable to read title for #%d" % issue_num)
         url = ("https://github.com/%s/pull/%d" if item.get("is_pr") else "https://github.com/%s/issues/%d") % (repo, issue_num)
         owner = resolve_owner(pn, projects, sm)
 
@@ -595,14 +586,17 @@ def run_status_loop(items, projects, sm, prev_state, new_state, output,
             queue_goal(output, notify_role, msg, issue_num=issue_num)
 
         new_state[sk] = cur_s
-        # 状态变化 → 清除 stale 停留记录 + dedup (避免返工/流转误报,
-        # 防重入相同状态继承旧 dedup 静默 — codex P1-2)
+        # 状态变化 → 清除 stale 停留记录 + dedup + sent_* 去重标记
+        # (sent_* 必须离开状态时清除: Ready→In Progress→Ready 第二次要能唤醒 — codex P1-1)
         if prev_state.get(sk) != cur_s:
             new_state.pop("stale_since:%d" % issue_num, None)
             new_state.pop("stale_status:%d" % issue_num, None)
             for dk in list(new_state):
                 if dk.startswith("stale_dedup:%d:" % issue_num):
                     new_state.pop(dk, None)
+            new_state.pop("sent_ready:" + sk, None)
+            new_state.pop("sent_ev:" + sk, None)
+            new_state.pop("sent_human:" + sk, None)
 
     return output
 

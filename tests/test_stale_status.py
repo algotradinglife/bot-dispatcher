@@ -53,16 +53,15 @@ def test_ev_review_stale_alerts_auditor():
     assert "auditor" in roles
 
 
-def test_blocked_stale_alerts_user():
-    """Blocked 停留 ≥ 5min → 报警给 user."""
+def test_blocked_not_stale_monitored():
+    """Blocked 不监控 (契约: 不 wake — PI 主动轮询)."""
     t0 = time.time() - 360
     prev = {"stale_since:102": str(t0), "stale_status:102": "Blocked"}
     out = {"actions": [], "warnings": [], "notifications": []}
     dp.stale_status_check([_item(102, "Blocked")], _projects(), _sm(), prev, dict(prev), out,
                           now=time.time(), stale_minutes=5)
-    assert out["warnings"]
-    roles = {n["role"] for n in out["notifications"]}
-    assert "user" in roles
+    assert not any("status_stale" in str(w) for w in out["warnings"])
+    assert not out["notifications"]
 
 
 def test_dedup_suppresses_repeat():

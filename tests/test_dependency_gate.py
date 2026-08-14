@@ -86,6 +86,34 @@ def test_ready_dedup_no_resend():
     assert not out["notifications"], "should NOT re-dispatch same state"
 
 
+def test_ready_reentry_redispatches():
+    """Ready → In Progress → Ready 第二次要能唤醒 (sent_* 离开状态清除)."""
+    sk = dp.project_state_key(2, 100)
+    # 模拟 tick3: 状态已是 Ready, sent_ready 已被 tick2 (In Progress) 清除
+    prev = {sk: "Ready"}
+    out, _ = _run_tick([_item(100, "Ready", blocked_count=0)], prev)
+    roles = {n["role"] for n in out["notifications"]}
+    assert "analyst" in roles, "re-entry Ready should re-dispatch"
+
+
+def test_ev_reentry_redispatches():
+    """EV Review → Ready → EV Review 第二次要能唤醒 auditor."""
+    sk = dp.project_state_key(2, 100)
+    # 模拟重入: 状态是 EV Review, sent_ev 已被中间状态清除
+    prev = {sk: "EV Review"}
+    out, _ = _run_tick([_item(100, "EV Review")], prev)
+    roles = {n["role"] for n in out["notifications"]}
+    assert "auditor" in roles, "re-entry EV Review should re-wake auditor"
+
+
+def test_ev_dedup_same_state():
+    """EV Review 已通知过 (同状态) → 不重复唤醒."""
+    sk = dp.project_state_key(2, 100)
+    prev = {sk: "EV Review", "sent_ev:" + sk: "1"}
+    out, _ = _run_tick([_item(100, "EV Review")], prev)
+    assert not out["notifications"], "should NOT re-wake same EV Review state"
+
+
 def test_stale_skips_dep_wait_ready():
     """stale checker 跳过依赖等待的 Ready (不报 unclaimed)."""
     t0 = time.time() - 600  # 10 min stale
