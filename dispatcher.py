@@ -295,7 +295,8 @@ def get_project_items(cfg):
             after = "null" if cursor is None else json.dumps(cursor)
             query = (
                 '{node(id:%s){... on ProjectV2{items(first:%d,after:%s){'
-                'nodes{id content{__typename ... on Issue{number title} '
+                'nodes{id content{__typename ... on Issue{number title '
+                'blockedBy(first:5){nodes{... on Issue{number state}}}} '
                 '... on PullRequest{number title}} fieldValues(first:20){nodes{'
                 '__typename ... on ProjectV2ItemFieldSingleSelectValue{name '
                 'field{... on ProjectV2SingleSelectField{name}}}}}} '
@@ -328,6 +329,10 @@ def get_project_items(cfg):
                     "project_name": proj.get("name", str(pn)),
                     "_item_id": node["id"],
                     "is_pr": content.get("__typename") == "PullRequest",
+                    "blocked_by": [
+                        b["number"] for b in (content.get("blockedBy", {}).get("nodes") or [])
+                        if b.get("state") != "CLOSED"
+                    ],
                 })
             page = connection.get("pageInfo") or {}
             if not page.get("hasNextPage"):
@@ -557,9 +562,16 @@ def main():
 
             if cur_s == "Ready":
                 # 契约: PI 拨 Ready → 通知 owner worker (project owner 角色) 开工
-                notify_role = owner
-                msg = format_goal("Issue #%d is READY — %s" % (issue_num, title), url)
-                reason = "issue_ready"
+                # 依赖门禁: blockedBy 有未完成 (OPEN) → 等待依赖, 不派发 (状态保持 Ready)
+                if item.get("blocked_by"):
+                    reason = "issue_ready_dep_wait"
+                    output["warnings"].append(
+                        "dependency: Issue #%d READY but blockedBy %s not done — 等待依赖, 不派发"
+                        % (issue_num, item["blocked_by"]))
+                else:
+                    notify_role = owner
+                    msg = format_goal("Issue #%d is READY — %s" % (issue_num, title), url)
+                    reason = "issue_ready"
 
             elif cur_s == "In Progress":
                 # 通知 owner worker 知晓已认领; 状态切换对用户可见
