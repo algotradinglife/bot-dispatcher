@@ -296,7 +296,8 @@ def get_project_items(cfg):
             query = (
                 '{node(id:%s){... on ProjectV2{items(first:%d,after:%s){'
                 'nodes{id content{__typename ... on Issue{number title '
-                'blockedBy(first:5){nodes{... on Issue{number state}}}} '
+                'blockedBy(first:10){nodes{... on Issue{number state}} '
+                'issueDependenciesSummary{blockedBy}} '
                 '... on PullRequest{number title}} fieldValues(first:20){nodes{'
                 '__typename ... on ProjectV2ItemFieldSingleSelectValue{name '
                 'field{... on ProjectV2SingleSelectField{name}}}}}} '
@@ -329,6 +330,11 @@ def get_project_items(cfg):
                     "project_name": proj.get("name", str(pn)),
                     "_item_id": node["id"],
                     "is_pr": content.get("__typename") == "PullRequest",
+                    # 门禁依据: issueDependenciesSummary.blockedBy 开放依赖总数 (不受 first 限制)
+                    # 节点列表仅用于 warning 展示 (最多 10 个)
+                    "blocked_by_count": (
+                        content.get("issueDependenciesSummary", {}).get("blockedBy") or 0
+                    ),
                     "blocked_by": [
                         b["number"] for b in (content.get("blockedBy", {}).get("nodes") or [])
                         if b.get("state") != "CLOSED"
@@ -389,6 +395,9 @@ def stale_status_check(items, projects, sm, prev_state, new_state, output,
         pn = item["project_num"]
         cur_s = item.get("status", "Inbox")
         if cur_s not in role_map:
+            continue
+        # 依赖等待的 Ready (blockedBy 开放) 不是 stale — 跳过 (codex P1-2)
+        if cur_s == "Ready" and item.get("blocked_by_count", 0) > 0:
             continue
         sk = project_state_key(pn, issue_num)
         since_key = "stale_since:%d" % issue_num
@@ -480,13 +489,132 @@ def flush_goals(output, dry_run=False, baseline=False, cfg=None):
     return True
 
 
+def run_status_loop(items, projects, sm, prev_state, new_state, output,
+                    dry_run=False, repo="", title_fetcher=None):
+    """状态循环: 基于 GitHub 实时状态推导 → 通知对应角色 (简单推导).
+
+    决策完全由当前 GitHub 状态 (status + blockedBy) 推导, state 只做去重:
+      - Ready + 无开放依赖 → wake owner worker
+      - EV Review → wake auditor
+      - Human → wake user (飞书)
+      其余状态不 wake (PI 主动轮询).
+
+    去重: 用 "上次通知快照" (sent_ready/sent_ev/sent_human) 避免重复 wake;
+    依赖解除 (blocked_by_count 变化) 自然触发新通知.
+    """
+    for item in items:
+        issue_num = item["number"]
+        pn = item["project_num"]
+        sk = project_state_key(pn, issue_num)
+        cur_s = item.get("status", "Inbox")
+        dep_count = item.get("blocked_by_count", 0)
+
+        # Fetch title (pr view for PRs, issue view for issues)
+        if title_fetcher:
+            title = title_fetcher(issue_num, item.get("is_pr"))
+        elif item.get("is_pr"):
+            ir = subprocess.run(["gh", "pr", "view", str(issue_num), "--repo", repo,
+                                 "--json", "title", "--jq", ".title"],
+                                capture_output=True, text=True, timeout=10)
+            if ir.returncode != 0:
+                raise ControlPlaneUnavailable(
+                    "Unable to read title for PR #%d" % issue_num)
+            title = ir.stdout.strip()
+        else:
+            ir = subprocess.run(["gh", "issue", "view", str(issue_num), "--repo", repo,
+                                 "--json", "title", "--jq", ".title"],
+                                capture_output=True, text=True, timeout=10)
+            if ir.returncode != 0:
+                raise ControlPlaneUnavailable(
+                    "Unable to read title for Issue #%d" % issue_num)
+            title = ir.stdout.strip()
+        url = ("https://github.com/%s/pull/%d" if item.get("is_pr") else "https://github.com/%s/issues/%d") % (repo, issue_num)
+        owner = resolve_owner(pn, projects, sm)
+
+        notify_role = None
+        msg = None
+        reason = None
+
+        if cur_s == "Ready":
+            # 简单推导: Ready + 无开放依赖 → wake owner
+            if dep_count == 0:
+                # 去重: 上次通知过 (同依赖数) → 跳过
+                if prev_state.get("sent_ready:" + sk) == "d%d" % dep_count:
+                    reason = None  # 已通知过, 静默
+                else:
+                    notify_role = owner
+                    msg = format_goal("Issue #%d is READY — %s" % (issue_num, title), url)
+                    reason = "issue_ready"
+                    new_state["sent_ready:" + sk] = "d%d" % dep_count
+            else:
+                # 依赖等待: 不 wake; 记录 warning (每 tick 重算, 解除自然触发)
+                reason = None
+                new_state.pop("sent_ready:" + sk, None)  # 依赖变化 → 重置去重
+                output["warnings"].append(
+                    "dependency: Issue #%d READY but blockedBy %d open — 等待依赖, 不派发"
+                    % (issue_num, dep_count))
+
+        elif cur_s == "EV Review":
+            # 简单推导: EV Review → wake auditor (session_map 映射)
+            notify_role = sm.get("auditor")
+            if not notify_role:
+                output["warnings"].append(
+                    "config_error: session_map missing 'auditor' — EV Review 通知无法路由")
+            elif prev_state.get("sent_ev:" + sk) != "1":
+                msg = format_goal(
+                    "Issue #%d in EV Review — %s (worker 已完成, 待独立审计)"
+                    % (issue_num, title), url)
+                reason = "ev_review_ready"
+                new_state["sent_ev:" + sk] = "1"
+
+        elif cur_s == "PI Review":
+            # 待 PI 终审: 不自动通知 (PI 主动轮询)
+            reason = None
+
+        elif cur_s == "Human":
+            # 简单推导: Human → wake user (飞书主通道)
+            if prev_state.get("sent_human:" + sk) != "1":
+                notify_role = "user"
+                msg = format_goal(
+                    "⛔ Issue #%d 需【人工干预】— %s (owner: %s) — "
+                    "PI 判定超出 AI 循环, 等待真人决策/处理"
+                    % (issue_num, title, owner), url)
+                reason = "issue_human_escalate"
+                new_state["sent_human:" + sk] = "1"
+
+        # 其余状态 (In Progress / Blocked / Done / Inbox / Cancelled): 不 wake
+        # 状态切换事件对用户 digest 可见 (reason 非 None 即记录 action)
+        if reason:
+            action_msg = msg or format_notice(
+                "Issue #%d 状态: %s — %s" % (issue_num, cur_s, title), url)
+            output["actions"].append({"node": sk, "state": cur_s, "role": notify_role,
+                                      "reason": reason, "prev_status": prev_state.get(sk, "Inbox"),
+                                      "sent": action_msg[:80], "result": "queued"})
+
+        if notify_role and msg:
+            queue_goal(output, notify_role, msg, issue_num=issue_num)
+
+        new_state[sk] = cur_s
+        # 状态变化 → 清除 stale 停留记录 + dedup (避免返工/流转误报,
+        # 防重入相同状态继承旧 dedup 静默 — codex P1-2)
+        if prev_state.get(sk) != cur_s:
+            new_state.pop("stale_since:%d" % issue_num, None)
+            new_state.pop("stale_status:%d" % issue_num, None)
+            for dk in list(new_state):
+                if dk.startswith("stale_dedup:%d:" % issue_num):
+                    new_state.pop(dk, None)
+
+    return output
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generic repo dispatcher")
-    parser.add_argument("--repo", required=True, help="Repository key from the config file")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_FILE,
-                        help="YAML config path (default: %(default)s)")
+    """CLI 入口: 一轮 tick (no_agent cron 调用)."""
+    parser = argparse.ArgumentParser(description="GitHub Project dispatcher (one tick)")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_FILE,
+                        help="Path to dispatcher.yaml")
+    parser.add_argument("--repo", required=True, help="Repository key (config section)")
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR,
-                        help="State directory (default: %(default)s)")
+                        help="Directory for state files")
     parser.add_argument("--validate-config", action="store_true",
                         help="Validate the selected repository config and exit")
     parser.add_argument("--dry-run", action="store_true",
@@ -527,111 +655,8 @@ def main():
     items = []
     try:
         proj_map, items = build_issue_proj_map(cfg)
-        for item in items:
-            issue_num = item["number"]
-            pn = item["project_num"]
-            sk = project_state_key(pn, issue_num)
-            prev_s = prev_state.get(sk, "Inbox")
-            cur_s = item.get("status", "Inbox")
-
-            if prev_s == cur_s:
-                if sk not in prev_state:
-                    new_state[sk] = cur_s
-                continue
-
-            # Fetch title (pr view for PRs, issue view for issues)
-            if item.get("is_pr"):
-                ir = subprocess.run(["gh", "pr", "view", str(issue_num), "--repo", repo,
-                                     "--json", "title", "--jq", ".title"],
-                                    capture_output=True, text=True, timeout=10)
-            else:
-                ir = subprocess.run(["gh", "issue", "view", str(issue_num), "--repo", repo,
-                                     "--json", "title", "--jq", ".title"],
-                                    capture_output=True, text=True, timeout=10)
-            if ir.returncode != 0:
-                raise ControlPlaneUnavailable(
-                    "Unable to read title for %s #%d" %
-                    ("PR" if item.get("is_pr") else "Issue", issue_num))
-            title = ir.stdout.strip()
-            url = ("https://github.com/%s/pull/%d" if item.get("is_pr") else "https://github.com/%s/issues/%d") % (repo, issue_num)
-            owner = resolve_owner(pn, projects, sm)
-
-            notify_role = None
-            msg = None
-            reason = None
-
-            if cur_s == "Ready":
-                # 契约: PI 拨 Ready → 通知 owner worker (project owner 角色) 开工
-                # 依赖门禁: blockedBy 有未完成 (OPEN) → 等待依赖, 不派发 (状态保持 Ready)
-                if item.get("blocked_by"):
-                    reason = "issue_ready_dep_wait"
-                    output["warnings"].append(
-                        "dependency: Issue #%d READY but blockedBy %s not done — 等待依赖, 不派发"
-                        % (issue_num, item["blocked_by"]))
-                else:
-                    notify_role = owner
-                    msg = format_goal("Issue #%d is READY — %s" % (issue_num, title), url)
-                    reason = "issue_ready"
-
-            elif cur_s == "In Progress":
-                # 通知 owner worker 知晓已认领; 状态切换对用户可见
-                reason = "issue_in_progress"
-
-            elif cur_s == "EV Review":
-                # 契约: worker 完成拨 EV Review → 通知 auditor 独立审计
-                # (session_map 映射 — codex P1-B; 缺失 → fail closed 报警)
-                notify_role = sm.get("auditor")
-                if not notify_role:
-                    output["warnings"].append(
-                        "config_error: session_map missing 'auditor' — EV Review 通知无法路由")
-                else:
-                    msg = format_goal(
-                        "Issue #%d in EV Review — %s (worker 已完成, 待独立审计)"
-                        % (issue_num, title), url)
-                reason = "ev_review_ready"
-
-            elif cur_s == "PI Review":
-                # 待 PI 终审: 状态切换对用户可见 (PI 人工通知, 不自动)
-                reason = "issue_pi_review"
-
-            elif cur_s == "Blocked":
-                # worker 诉求: 状态切换对用户可见 (Blocked = 需 PI 决策)
-                reason = "issue_blocked"
-
-            elif cur_s == "Done":
-                # 完成: 已有 issue_done 语义 (含报告链接)
-                reason = "issue_done"
-
-            elif cur_s == "Human":
-                # 契约: PI 判定需真人干预 → 通知用户 (飞书主通道)
-                notify_role = "user"
-                msg = format_goal(
-                    "⛔ Issue #%d 需【人工干预】— %s (owner: %s) — "
-                    "PI 判定超出 AI 循环, 等待真人决策/处理"
-                    % (issue_num, title, owner), url)
-                reason = "issue_human_escalate"
-
-            # 其余状态 (Inbox / Cancelled): 仅记录
-            # 状态切换事件对用户 digest 可见 (reason 非 None 即记录 action)
-            if reason:
-                action_msg = msg or format_notice(
-                    "Issue #%d 状态: %s — %s" % (issue_num, cur_s, title), url)
-                output["actions"].append({"node": sk, "state": cur_s, "role": notify_role,
-                                          "reason": reason, "prev_status": prev_s,
-                                          "sent": action_msg[:80], "result": "queued"})
-
-            if notify_role and msg:
-                queue_goal(output, notify_role, msg, issue_num=issue_num)
-
-            new_state[sk] = cur_s
-            # 状态变化 → 清除 stale 停留记录 + dedup (避免返工/流转误报,
-            # 防重入相同状态继承旧 dedup 静默 — codex P1-2)
-            if prev_s != cur_s:
-                new_state.pop("stale_since:%d" % issue_num, None)
-                new_state.pop("stale_status:%d" % issue_num, None)
-                for dk in list(new_state):
-                    if dk.startswith("stale_dedup:%d:" % issue_num):
-                        new_state.pop(dk, None)
+        run_status_loop(items, projects, sm, prev_state, new_state, output,
+                        dry_run=args.dry_run, repo=repo)
 
         control_plane_ok = True
     except Exception as e:
