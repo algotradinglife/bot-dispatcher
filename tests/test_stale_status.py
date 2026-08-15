@@ -83,7 +83,7 @@ def test_dedup_expired_notifies_again():
             "stale_dedup:100:Ready": str(time.time() - 2000)}  # 33 min ago
     out = {"actions": [], "warnings": [], "notifications": []}
     dp.stale_status_check([_item(100, "Ready")], _projects(), _sm(), prev, dict(prev), out,
-                          now=time.time(), stale_minutes=5)
+                          now=time.time(), stale_minutes=5, dedup_minutes=30)
     assert out["warnings"]
     assert out["notifications"], "expired dedup should re-notify"
 
