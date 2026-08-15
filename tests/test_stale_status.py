@@ -88,6 +88,25 @@ def test_dedup_expired_notifies_again():
     assert out["notifications"], "expired dedup should re-notify"
 
 
+def test_dedup_60min_production_boundary():
+    """生产参数 (dedup_minutes=60): 61min 前 → 重通知; 30min 前 → 静默."""
+    t0 = time.time() - 360
+    # 61 min ago → 超过 60min 窗口 → 重新通知
+    prev = {"stale_since:103": str(t0), "stale_status:103": "Ready",
+            "stale_dedup:103:Ready": str(time.time() - 3660)}
+    out = {"actions": [], "warnings": [], "notifications": []}
+    dp.stale_status_check([_item(103, "Ready")], _projects(), _sm(), prev, dict(prev), out,
+                          now=time.time(), stale_minutes=5, dedup_minutes=60)
+    assert out["notifications"], "61min ago should re-notify (60min window)"
+    # 30 min ago → 在 60min 窗口内 → 静默
+    prev2 = {"stale_since:104": str(t0), "stale_status:104": "Ready",
+             "stale_dedup:104:Ready": str(time.time() - 1800)}
+    out2 = {"actions": [], "warnings": [], "notifications": []}
+    dp.stale_status_check([_item(104, "Ready")], _projects(), _sm(), prev2, dict(prev2), out2,
+                          now=time.time(), stale_minutes=5, dedup_minutes=60)
+    assert not out2["notifications"], "30min ago should stay silent (within 60min)"
+
+
 def test_ev_review_session_map():
     """EV Review → 走 session_map 的 auditor 映射 (非硬编码)."""
     t0 = time.time() - 360

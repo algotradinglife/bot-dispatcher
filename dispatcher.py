@@ -370,12 +370,13 @@ def build_issue_proj_map(cfg):
 
 
 def stale_status_check(items, projects, sm, prev_state, new_state, output,
-                       now=None, stale_minutes=5, dedup_minutes=30):
-    """Ready/EV Review/Blocked 停留超阈值 → 报警 + 重唤醒 (防静默断链).
+                       now=None, stale_minutes=5, dedup_minutes=60):
+    """Ready/EV Review 停留超阈值 → 报警 + 重唤醒 (防静默断链).
 
     2026-08-13: #208 Ready 静默 14min 无人认领 (dispatcher 通知一次失败即丢失).
     对每个卡住状态: 若停留 > stale_minutes 且 dedup 窗口内未报过 →
-    warning + 重发唤醒消息 (Ready→owner / EV Review→auditor / Blocked→user).
+    warning + 重发唤醒消息 (Ready→owner / EV Review→auditor).
+    Blocked 不监控 (PI 主动轮询, 不 wake). dedup_minutes 生产=60 (1h 一次).
 
     注意 (codex 审核修复):
     - items 由调用方传入 (主循环已查询, 避免重复控制面快照/API 消耗)

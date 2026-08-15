@@ -66,14 +66,14 @@ def test_ready_dep_open_defers():
 
 
 def test_ready_dep_release_dispatches():
-    """等待中 (sent_ready 已记录) → 依赖解除 → 自然触发派发."""
+    """等待中 (sent_ready=d1) → 依赖解除 → 自然触发派发."""
     sk = dp.project_state_key(2, 100)
-    prev = {sk: "Ready", "sent_ready:" + sk: "d1"}  # 之前依赖数=1 已通知过? 不 — 等待中无 sent
-    # 等待中: sent_ready 被清 → 依赖解除后无快照 → 触发
-    out, new_state = _run_tick([_item(100, "Ready", blocked_count=0)], {sk: "Ready"})
+    # 等待时快照 d1 → 依赖解除后 count=0 → 快照 d1≠d0 → 触发
+    prev = {sk: "Ready", "sent_ready:" + sk: "d1"}
+    out, new_state = _run_tick([_item(100, "Ready", blocked_count=0)], prev)
     roles = {n["role"] for n in out["notifications"]}
     assert "analyst" in roles, "should dispatch on dep release"
-    assert new_state.get("sent_ready:" + sk) == "d0", "sent_ready recorded"
+    assert new_state.get("sent_ready:" + sk) == "d0", "sent_ready updated to d0"
 
 
 def test_ready_dep_wait_reevaluates_each_tick():
