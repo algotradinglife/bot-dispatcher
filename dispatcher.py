@@ -296,7 +296,7 @@ def get_project_items(cfg):
             query = (
                 '{node(id:%s){... on ProjectV2{items(first:%d,after:%s){'
                 'nodes{id content{__typename ... on Issue{number title '
-                'blockedBy(first:10){nodes{... on Issue{number state}} '
+                'blockedBy(first:10){nodes{... on Issue{number state}}} '
                 'issueDependenciesSummary{blockedBy}} '
                 '... on PullRequest{number title}} fieldValues(first:20){nodes{'
                 '__typename ... on ProjectV2ItemFieldSingleSelectValue{name '
@@ -516,8 +516,11 @@ def run_status_loop(items, projects, sm, prev_state, new_state, output,
         dep_count = item.get("blocked_by_count", 0)
 
         # title 来自 GraphQL (item["title"]), 无需额外 gh view 查询 (codex P1-2)
-        title = item.get("title") or title_fetcher(issue_num, item.get("is_pr")) if title_fetcher else ""
-        if not title and not title_fetcher:
+        # (分开写避免三元/短路优先级错误 — codex P1-B)
+        title = item.get("title") or ""
+        if not title and title_fetcher:
+            title = title_fetcher(issue_num, item.get("is_pr"))
+        if not title:
             raise ControlPlaneUnavailable("Unable to read title for #%d" % issue_num)
         url = ("https://github.com/%s/pull/%d" if item.get("is_pr") else "https://github.com/%s/issues/%d") % (repo, issue_num)
         owner = resolve_owner(pn, projects, sm)
@@ -527,8 +530,22 @@ def run_status_loop(items, projects, sm, prev_state, new_state, output,
         reason = None
 
         if cur_s == "Ready":
-            # 简单推导: Ready + 无开放依赖 → wake owner
-            if dep_count == 0:
+            # 简单推导: Ready → wake owner
+            # 依赖门禁: Ready + 开放依赖 → 通知一次 (告知等待, 不派发 worker)
+            # 例外: 从 EV Review 拨回 (返工重入) → 派发 (修复缺陷不依赖上游)
+            rework = prev_state.get(sk) == "EV Review"
+            if dep_count > 0 and not rework:
+                # 依赖等待: 不 wake; 通知一次 (dedup 后静默 — 用户要求)
+                if prev_state.get("sent_ready:" + sk) != "d%d" % dep_count:
+                    notify_role = owner
+                    msg = format_goal(
+                        "Issue #%d is READY — %s (blockedBy %d open: 等待依赖, 依赖解除后自动派发)"
+                        % (issue_num, title, dep_count), url)
+                    reason = "issue_ready_dep_wait"
+                    new_state["sent_ready:" + sk] = "d%d" % dep_count
+                else:
+                    reason = None  # 已通知过, 静默
+            else:
                 # 去重: 上次通知过 (同依赖数) → 跳过
                 if prev_state.get("sent_ready:" + sk) == "d%d" % dep_count:
                     reason = None  # 已通知过, 静默
@@ -537,13 +554,6 @@ def run_status_loop(items, projects, sm, prev_state, new_state, output,
                     msg = format_goal("Issue #%d is READY — %s" % (issue_num, title), url)
                     reason = "issue_ready"
                     new_state["sent_ready:" + sk] = "d%d" % dep_count
-            else:
-                # 依赖等待: 不 wake; 记录 warning (每 tick 重算, 解除自然触发)
-                reason = None
-                new_state.pop("sent_ready:" + sk, None)  # 依赖变化 → 重置去重
-                output["warnings"].append(
-                    "dependency: Issue #%d READY but blockedBy %d open — 等待依赖, 不派发"
-                    % (issue_num, dep_count))
 
         elif cur_s == "EV Review":
             # 简单推导: EV Review → wake auditor (session_map 映射)
@@ -587,16 +597,19 @@ def run_status_loop(items, projects, sm, prev_state, new_state, output,
 
         new_state[sk] = cur_s
         # 状态变化 → 清除 stale 停留记录 + dedup + sent_* 去重标记
-        # (sent_* 必须离开状态时清除: Ready→In Progress→Ready 第二次要能唤醒 — codex P1-1)
+        # (sent_* 离开状态时清除, 基于 prev_state 旧值判断 — codex P1-A:
+        #  用 prev 判断状态变化, 但 new_state 里新写的 sent 不能清掉自己)
         if prev_state.get(sk) != cur_s:
             new_state.pop("stale_since:%d" % issue_num, None)
             new_state.pop("stale_status:%d" % issue_num, None)
             for dk in list(new_state):
                 if dk.startswith("stale_dedup:%d:" % issue_num):
                     new_state.pop(dk, None)
-            new_state.pop("sent_ready:" + sk, None)
-            new_state.pop("sent_ev:" + sk, None)
-            new_state.pop("sent_human:" + sk, None)
+            # 状态变化 → 重置 sent 去重 (prev 有旧值就清; 本轮新写的不受影响
+            # — Ready 分支在清除块之前写入, 但 prev 无旧值时不清)
+            for skey in ("sent_ready:", "sent_ev:", "sent_human:"):
+                if prev_state.get(skey + sk) is not None:
+                    new_state.pop(skey + sk, None)
 
     return output
 
@@ -762,7 +775,7 @@ def main():
     # (items 用主循环已查询的, 不重复控制面查询; dry_run 下也标记不投递)
     if not first_run:
         stale_status_check(items, projects, sm, prev_state, new_state, output,
-                           stale_minutes=5, dedup_minutes=30)
+                           stale_minutes=5, dedup_minutes=60)
     if args.dry_run:
         for n in output.get("notifications", []):
             n["dry_run"] = True
